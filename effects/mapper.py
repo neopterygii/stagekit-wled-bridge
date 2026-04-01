@@ -10,15 +10,11 @@ Each cell contains one bit position per zone:
   Cell 1: positions 12-23 → Red bit 1 @12, Green bit 1 @15, Blue bit 1 @18, Yellow bit 1 @21
   ...etc
 
-Within each cell, each zone "owns" a 3-LED segment:
-  Red:    cell_start + 0..2
-  Green:  cell_start + 3..5
-  Blue:   cell_start + 6..8
-  Yellow: cell_start + 9..11
+Within each cell, active zones expand to fill the entire cell. When
+multiple zones are active in a cell, each gets an equal share. When only
+one zone is active in a cell, it fills the whole cell (12 LEDs).
 
-When a zone's bit is ON, its 3-LED segment lights up.
-When a zone is ALL (0xFF), the entire strip region for that zone lights solid
-by also bleeding into adjacent unlit segments for maximum fill.
+Solid zones (ALL=0xFF) additionally fill any remaining dark cells.
 """
 
 from config import LED_COUNT
@@ -37,7 +33,6 @@ ZONE_NAMES = ["red", "green", "blue", "yellow"]
 LEDS_PER_ZONE = 8
 NUM_CELLS = 8
 CELL_SIZE = 12  # LEDs per cell
-ZONE_SEGMENT = 3  # LEDs per zone within a cell
 ZONE_OFFSETS = [0, 3, 6, 9]  # Starting offset for each zone within a cell
 
 MAPPED_REGION = NUM_CELLS * CELL_SIZE  # 96
@@ -55,42 +50,61 @@ class LEDMapper:
     def render(self, zone_bitmasks: list[int]) -> bytes:
         """Render pixels from 4 zone bitmasks.
 
-        Each zone bit owns a 3-LED segment within its cell. When a bit is on,
-        its segment lights up. Solid zones (ALL bits on) also fill any
-        neighboring segments that are dark, for maximum strip coverage.
+        Active zones within each cell expand to fill it evenly. If only one
+        zone is active in a cell, it gets all 12 LEDs. If two are active,
+        each gets 6. Solid zones (ALL=0xFF) also fill completely dark cells.
         """
-        # First pass: determine which color each LED position gets
-        # Start with all black
         colors = [OFF] * MAPPED_REGION
 
-        # For each cell, set zone segments based on bitmasks
         for cell in range(NUM_CELLS):
             cell_start = cell * CELL_SIZE
+            # Find which zones are active in this cell
+            active = []
             for zone_idx in range(4):
-                mask = zone_bitmasks[zone_idx]
-                bit_on = bool(mask & (1 << cell))
-                if bit_on:
-                    color = ZONE_COLORS[ZONE_NAMES[zone_idx]]
-                    seg_start = cell_start + ZONE_OFFSETS[zone_idx]
-                    for j in range(ZONE_SEGMENT):
-                        pos = seg_start + j
-                        if pos < MAPPED_REGION:
-                            colors[pos] = color
+                if zone_bitmasks[zone_idx] & (1 << cell):
+                    active.append(zone_idx)
 
-        # Second pass: solid zones (ALL=0xFF) fill remaining dark LEDs
-        # When multiple zones are solid, alternate their colors across gaps
+            if not active:
+                continue
+
+            # Divide the 12 LEDs evenly among active zones
+            n = len(active)
+            leds_per = CELL_SIZE // n
+            remainder = CELL_SIZE % n
+            pos = cell_start
+            for i, zone_idx in enumerate(active):
+                color = ZONE_COLORS[ZONE_NAMES[zone_idx]]
+                count = leds_per + (1 if i < remainder else 0)
+                for _ in range(count):
+                    if pos < MAPPED_REGION:
+                        colors[pos] = color
+                    pos += 1
+
+        # Second pass: solid zones (ALL=0xFF) fill completely dark cells
         solid_zones = []
         for zone_idx in range(4):
             if zone_bitmasks[zone_idx] == 0xFF:
                 solid_zones.append(zone_idx)
 
         if solid_zones:
-            gap_idx = 0
-            for i in range(MAPPED_REGION):
-                if colors[i] == OFF:
-                    fill_zone = solid_zones[gap_idx % len(solid_zones)]
-                    colors[i] = ZONE_COLORS[ZONE_NAMES[fill_zone]]
-                    gap_idx += 1
+            for cell in range(NUM_CELLS):
+                cell_start = cell * CELL_SIZE
+                # Check if this cell is entirely dark
+                cell_dark = all(colors[cell_start + j] == OFF
+                                for j in range(CELL_SIZE))
+                if cell_dark:
+                    # Fill with alternating solid zone colors
+                    n = len(solid_zones)
+                    leds_per = CELL_SIZE // n
+                    remainder = CELL_SIZE % n
+                    pos = cell_start
+                    for i, zone_idx in enumerate(solid_zones):
+                        color = ZONE_COLORS[ZONE_NAMES[zone_idx]]
+                        count = leds_per + (1 if i < remainder else 0)
+                        for _ in range(count):
+                            if pos < MAPPED_REGION:
+                                colors[pos] = color
+                            pos += 1
 
         # Write to pixel buffer
         for i in range(min(self.led_count, MAPPED_REGION)):
