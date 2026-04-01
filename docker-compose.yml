@@ -11,7 +11,7 @@ services:
       YARG_LISTEN_HOST: "0.0.0.0"
       YARG_LISTEN_PORT: "21070"
       # WLED controller IP
-      WLED_HOST: "192.168.1.100"
+      WLED_HOST: "192.168.0.53"
       WLED_DDP_PORT: "4048"
       # Strip config
       LED_COUNT: "120"

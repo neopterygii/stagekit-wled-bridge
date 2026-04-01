@@ -100,7 +100,7 @@ async def main():
     mapper = LEDMapper(LED_COUNT)
     sender = DDPSender(WLED_HOST, WLED_DDP_PORT)
     tracker = StatusTracker()
-    status_server = StatusServer(tracker, STATUS_HOST, STATUS_PORT)
+    status_server = StatusServer(tracker, STATUS_HOST, STATUS_PORT, engine=engine)
 
     loop = asyncio.get_running_loop()
 

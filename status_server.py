@@ -2,6 +2,7 @@
 
 Serves a live dashboard page and an SSE endpoint that streams
 bridge state (cue, zones, strobe, BPM, packets/sec) in real time.
+Includes built-in test pattern controls to trigger cues from the web UI.
 """
 
 import asyncio
@@ -9,11 +10,32 @@ import json
 import time
 from http import HTTPStatus
 
-from protocol.yarg_packet import CueByte
+from protocol.yarg_packet import CueByte, BeatByte, StrobeSpeed
 
 
 # Reverse lookup: cue byte value → name
 _CUE_NAMES = {v: k for k, v in vars(CueByte).items() if isinstance(v, int)}
+
+# Test patterns available from the web UI
+TEST_PATTERNS = {
+    "warm_automatic": CueByte.WARM_AUTOMATIC,
+    "cool_automatic": CueByte.COOL_AUTOMATIC,
+    "big_rock_ending": CueByte.BIG_ROCK_ENDING,
+    "frenzy": CueByte.FRENZY,
+    "searchlights": CueByte.SEARCHLIGHTS,
+    "sweep": CueByte.SWEEP,
+    "harmony": CueByte.HARMONY,
+    "chorus": CueByte.CHORUS,
+    "verse": CueByte.VERSE,
+    "intro": CueByte.INTRO,
+    "dischord": CueByte.DISCHORD,
+    "stomp": CueByte.STOMP,
+    "menu": CueByte.MENU,
+    "score": CueByte.SCORE,
+    "flare_slow": CueByte.FLARE_SLOW,
+    "flare_fast": CueByte.FLARE_FAST,
+    "silhouettes": CueByte.SILHOUETTES,
+}
 
 
 class StatusTracker:
@@ -30,6 +52,8 @@ class StatusTracker:
         self.ddp_frames_sent = 0
         self.last_beat = 0
         self.connected = False
+        self.test_active = False
+        self.test_pattern = ""
 
         self._pkt_count_window: list[float] = []
         self._sse_queues: list[asyncio.Queue] = []
@@ -75,6 +99,8 @@ class StatusTracker:
             "ddp_frames_sent": self.ddp_frames_sent,
             "last_beat": self.last_beat,
             "connected": self.connected,
+            "test_active": self.test_active,
+            "test_pattern": self.test_pattern,
         }
 
     def subscribe(self) -> asyncio.Queue:
@@ -112,11 +138,13 @@ STATUS_HTML = """\
 <title>Stage Kit Bridge</title>
 <style>
   :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3;
-          --dim: #8b949e; --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff; }
+          --dim: #8b949e; --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
+          --accent: #1f6feb; --accent-hover: #388bfd; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont,
          'Segoe UI', Helvetica, Arial, sans-serif; padding: 1rem; }
   h1 { font-size: 1.4rem; margin-bottom: 1rem; }
+  h3 { color: var(--dim); margin-bottom: 0.5rem; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
   .card .label { font-size: 0.75rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; }
@@ -141,10 +169,38 @@ STATUS_HTML = """\
   .log-entry .cue { color: var(--green); font-weight: 600; }
   .log-entry .strobe { color: var(--yellow); }
   .log-entry .beat { color: var(--red); }
+
+  /* Test Controls */
+  .test-panel { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+                padding: 1rem; margin-bottom: 1rem; }
+  .test-panel .section-label { font-size: 0.75rem; color: var(--dim); text-transform: uppercase;
+                                letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+  .btn-grid { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .test-btn { background: var(--card); color: var(--text); border: 1px solid var(--border);
+              border-radius: 6px; padding: 0.4rem 0.75rem; font-size: 0.8rem; cursor: pointer;
+              transition: all 0.15s; font-family: inherit; }
+  .test-btn:hover { background: var(--accent); border-color: var(--accent); }
+  .test-btn.active { background: var(--accent); border-color: var(--accent-hover);
+                     box-shadow: 0 0 8px rgba(31,111,235,0.4); }
+  .test-btn.stop { border-color: var(--red); color: var(--red); }
+  .test-btn.stop:hover { background: var(--red); color: var(--text); }
+  .test-btn.strobe-btn { border-color: var(--yellow); color: var(--yellow); }
+  .test-btn.strobe-btn:hover { background: var(--yellow); color: var(--bg); }
+  .test-btn.strobe-btn.active { background: var(--yellow); color: var(--bg); }
+
+  .bpm-control { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; }
+  .bpm-control label { font-size: 0.75rem; color: var(--dim); text-transform: uppercase; }
+  .bpm-control input[type=range] { flex: 1; accent-color: var(--accent); }
+  .bpm-control .bpm-val { font-size: 0.9rem; font-weight: 600; min-width: 3em; font-variant-numeric: tabular-nums; }
+
+  .test-indicator { display: inline-block; font-size: 0.7rem; padding: 0.15rem 0.5rem;
+                    border-radius: 4px; margin-left: 0.75rem; vertical-align: middle; }
+  .test-indicator.on { background: var(--accent); color: white; }
+  .test-indicator.off { display: none; }
 </style>
 </head>
 <body>
-<h1>&#127911; Stage Kit Bridge</h1>
+<h1>&#127911; Stage Kit Bridge <span class="test-indicator off" id="test-badge">TEST MODE</span></h1>
 
 <div class="grid">
   <div class="card">
@@ -153,11 +209,11 @@ STATUS_HTML = """\
   </div>
   <div class="card">
     <div class="label">Current Cue</div>
-    <div class="value" id="cue">—</div>
+    <div class="value" id="cue">&mdash;</div>
   </div>
   <div class="card">
     <div class="label">BPM</div>
-    <div class="value" id="bpm">—</div>
+    <div class="value" id="bpm">&mdash;</div>
   </div>
   <div class="card">
     <div class="label">Strobe</div>
@@ -173,16 +229,59 @@ STATUS_HTML = """\
   </div>
 </div>
 
-<h3 style="color:var(--dim);margin-bottom:0.5rem">Zone Bitmasks</h3>
+<h3 style="margin-bottom:0.5rem">Zone Bitmasks</h3>
 <div id="zones"></div>
 
-<h3 style="color:var(--dim);margin:1rem 0 0.5rem">Event Log</h3>
+<h3 style="margin:1rem 0 0.5rem">Test Patterns</h3>
+<div class="test-panel">
+  <div class="section-label">Cues</div>
+  <div class="btn-grid" id="cue-btns">
+    <button class="test-btn" data-pattern="warm_automatic">Warm Auto</button>
+    <button class="test-btn" data-pattern="cool_automatic">Cool Auto</button>
+    <button class="test-btn" data-pattern="big_rock_ending">Big Rock Ending</button>
+    <button class="test-btn" data-pattern="frenzy">Frenzy</button>
+    <button class="test-btn" data-pattern="searchlights">Searchlights</button>
+    <button class="test-btn" data-pattern="sweep">Sweep</button>
+    <button class="test-btn" data-pattern="harmony">Harmony</button>
+    <button class="test-btn" data-pattern="chorus">Chorus</button>
+    <button class="test-btn" data-pattern="verse">Verse</button>
+    <button class="test-btn" data-pattern="intro">Intro</button>
+    <button class="test-btn" data-pattern="dischord">Dischord</button>
+    <button class="test-btn" data-pattern="stomp">Stomp</button>
+    <button class="test-btn" data-pattern="menu">Menu</button>
+    <button class="test-btn" data-pattern="score">Score</button>
+    <button class="test-btn" data-pattern="flare_slow">Flare Slow</button>
+    <button class="test-btn" data-pattern="flare_fast">Flare Fast</button>
+    <button class="test-btn" data-pattern="silhouettes">Silhouettes</button>
+  </div>
+
+  <div class="section-label" style="margin-top:0.75rem">Strobe</div>
+  <div class="btn-grid" id="strobe-btns">
+    <button class="test-btn strobe-btn" data-strobe="slow">Slow</button>
+    <button class="test-btn strobe-btn" data-strobe="medium">Medium</button>
+    <button class="test-btn strobe-btn" data-strobe="fast">Fast</button>
+    <button class="test-btn strobe-btn" data-strobe="fastest">Fastest</button>
+    <button class="test-btn strobe-btn" data-strobe="off">Strobe Off</button>
+  </div>
+
+  <div class="bpm-control">
+    <label>BPM</label>
+    <input type="range" id="test-bpm" min="60" max="240" value="120" step="1">
+    <span class="bpm-val" id="test-bpm-val">120</span>
+  </div>
+
+  <div class="btn-grid" style="margin-top:0.75rem">
+    <button class="test-btn stop" id="btn-stop" onclick="sendTest('stop')">&#9632; Stop Test</button>
+  </div>
+</div>
+
+<h3 style="margin:1rem 0 0.5rem">Event Log</h3>
 <div class="log" id="log"></div>
 
 <script>
 const ZONE_COLORS = { red: '#f85149', green: '#3fb950', blue: '#58a6ff', yellow: '#d29922' };
 const ZONE_OFF = '#21262d';
-let lastCue = '', lastStrobe = -1, lastBeat = -1;
+let lastCue = '', lastStrobe = -1, lastBeat = -1, activePattern = '';
 
 function initZones() {
   const container = document.getElementById('zones');
@@ -212,19 +311,62 @@ function addLog(msg) {
   while (log.children.length > 200) log.removeChild(log.lastChild);
 }
 
+function sendTest(action, extra) {
+  const body = { action: action };
+  if (extra) Object.assign(body, extra);
+  body.bpm = parseInt(document.getElementById('test-bpm').value);
+  fetch('/api/test', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                       body: JSON.stringify(body) });
+}
+
+function highlightActivePattern(pattern) {
+  document.querySelectorAll('#cue-btns .test-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.pattern === pattern);
+  });
+  activePattern = pattern;
+}
+
+// Wire up cue buttons
+document.querySelectorAll('#cue-btns .test-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    sendTest('pattern', { pattern: btn.dataset.pattern });
+    highlightActivePattern(btn.dataset.pattern);
+  });
+});
+
+// Wire up strobe buttons
+document.querySelectorAll('#strobe-btns .test-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    sendTest('strobe', { level: btn.dataset.strobe });
+    document.querySelectorAll('#strobe-btns .test-btn').forEach(b => b.classList.remove('active'));
+    if (btn.dataset.strobe !== 'off') btn.classList.add('active');
+  });
+});
+
+// BPM slider
+const bpmSlider = document.getElementById('test-bpm');
+const bpmVal = document.getElementById('test-bpm-val');
+bpmSlider.addEventListener('input', () => {
+  bpmVal.textContent = bpmSlider.value;
+  sendTest('bpm', { bpm: parseInt(bpmSlider.value) });
+});
+
 function update(d) {
   const dot = document.getElementById('dot');
   const conn = document.getElementById('conn');
-  if (d.connected) { dot.className = 'status-dot on'; conn.textContent = 'Connected'; }
+  if (d.connected || d.test_active) { dot.className = 'status-dot on'; conn.textContent = d.test_active ? 'Test Mode' : 'Connected'; }
   else { dot.className = 'status-dot off'; conn.textContent = 'Disconnected'; }
 
-  document.getElementById('bpm').textContent = d.bpm || '—';
+  const badge = document.getElementById('test-badge');
+  badge.className = d.test_active ? 'test-indicator on' : 'test-indicator off';
+
+  document.getElementById('bpm').textContent = d.bpm || '\\u2014';
   document.getElementById('pps').textContent = d.packets_per_sec;
   document.getElementById('ddp').textContent = d.ddp_frames_sent.toLocaleString();
 
   if (d.cue !== lastCue) {
     document.getElementById('cue').textContent = d.cue;
-    addLog('<span class="cue">CUE → ' + d.cue + '</span>');
+    addLog('<span class="cue">CUE \\u2192 ' + d.cue + '</span>');
     lastCue = d.cue;
   }
 
@@ -249,6 +391,13 @@ function update(d) {
       document.getElementById('led-' + name + '-' + i).style.background = on ? ZONE_COLORS[name] : ZONE_OFF;
     }
   }
+
+  // Sync active button highlight with server state
+  if (!d.test_active && activePattern) {
+    highlightActivePattern('');
+  } else if (d.test_active && d.test_pattern !== activePattern) {
+    highlightActivePattern(d.test_pattern);
+  }
 }
 
 initZones();
@@ -266,26 +415,107 @@ evtSource.onerror = function() {
 
 
 class StatusServer:
-    """Async HTTP server serving the status page and SSE stream."""
+    """Async HTTP server serving the status page, SSE stream, and test controls."""
 
-    def __init__(self, tracker: StatusTracker, host: str = "0.0.0.0", port: int = 8080):
+    def __init__(self, tracker: StatusTracker, host: str = "0.0.0.0", port: int = 8080,
+                 engine=None):
         self.tracker = tracker
         self.host = host
         self.port = port
+        self.engine = engine
+        self._beat_task: asyncio.Task | None = None
 
     async def start(self):
         server = await asyncio.start_server(self._handle_connection, self.host, self.port)
         print(f"Status page: http://{self.host}:{self.port}/")
         return server
 
+    def _start_test_beats(self, bpm: float):
+        """Start a background task that fires synthetic beats at the given BPM."""
+        self._stop_test_beats()
+        self._beat_task = asyncio.ensure_future(self._run_test_beats(bpm))
+
+    def _stop_test_beats(self):
+        if self._beat_task is not None:
+            self._beat_task.cancel()
+            self._beat_task = None
+
+    async def _run_test_beats(self, bpm: float):
+        """Fires alternating MEASURE/STRONG beats at the given BPM."""
+        beat_count = 0
+        try:
+            while True:
+                beat_count += 1
+                beat_type = BeatByte.MEASURE if beat_count % 4 == 0 else BeatByte.STRONG
+                if self.engine:
+                    self.engine.on_beat(beat_type)
+                    self.tracker.on_beat(beat_type)
+                interval = 60.0 / max(bpm, 30.0) / 4  # sub-beats at 4× rate
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+
+    def _handle_test_action(self, body: dict) -> tuple[int, str]:
+        """Process a test control request. Returns (status_code, message)."""
+        if self.engine is None:
+            return 500, "Engine not connected"
+
+        action = body.get("action", "")
+        bpm = body.get("bpm", 120)
+
+        if action == "pattern":
+            pattern = body.get("pattern", "")
+            if pattern not in TEST_PATTERNS:
+                return 400, f"Unknown pattern: {pattern}"
+            cue_byte = TEST_PATTERNS[pattern]
+            self.engine.bpm = float(bpm)
+            self.engine.on_cue(cue_byte)
+            self.engine.on_strobe(StrobeSpeed.OFF)
+            self.tracker.on_cue(cue_byte)
+            self.tracker.test_active = True
+            self.tracker.test_pattern = pattern
+            self._start_test_beats(float(bpm))
+            return 200, f"Playing {pattern}"
+
+        elif action == "strobe":
+            level = body.get("level", "off")
+            strobe_map = {
+                "off": StrobeSpeed.OFF, "slow": StrobeSpeed.SLOW,
+                "medium": StrobeSpeed.MEDIUM, "fast": StrobeSpeed.FAST,
+                "fastest": StrobeSpeed.FASTEST,
+            }
+            self.engine.on_strobe(strobe_map.get(level, StrobeSpeed.OFF))
+            return 200, f"Strobe {level}"
+
+        elif action == "bpm":
+            self.engine.bpm = float(bpm)
+            if self._beat_task is not None:
+                self._start_test_beats(float(bpm))
+            return 200, f"BPM set to {bpm}"
+
+        elif action == "stop":
+            self._stop_test_beats()
+            self.engine.on_cue(CueByte.NO_CUE)
+            self.engine.on_strobe(StrobeSpeed.OFF)
+            self.tracker.on_cue(CueByte.NO_CUE)
+            self.tracker.test_active = False
+            self.tracker.test_pattern = ""
+            return 200, "Stopped"
+
+        return 400, f"Unknown action: {action}"
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            # Read remaining headers (discard)
+            # Read headers, capture Content-Length
+            content_length = 0
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=5.0)
                 if line in (b'\r\n', b'\n', b''):
                     break
+                header = line.decode('utf-8', errors='replace').strip().lower()
+                if header.startswith('content-length:'):
+                    content_length = int(header.split(':', 1)[1].strip())
 
             parts = request_line.decode('utf-8', errors='replace').strip().split()
             if len(parts) < 2:
@@ -301,6 +531,17 @@ class StatusServer:
             elif path == '/api/status' and method == 'GET':
                 body = json.dumps(self.tracker.snapshot()).encode()
                 await self._send_response(writer, 200, 'application/json', body)
+            elif path == '/api/test' and method == 'POST':
+                raw = b''
+                if content_length > 0:
+                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
+                try:
+                    req_body = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, ValueError):
+                    req_body = {}
+                status, msg = self._handle_test_action(req_body)
+                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
+                await self._send_response(writer, status, 'application/json', resp)
             else:
                 await self._send_response(writer, 404, 'text/plain', b'Not Found')
         except (asyncio.TimeoutError, ConnectionError, BrokenPipeError):

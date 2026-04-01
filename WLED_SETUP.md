@@ -1,53 +1,66 @@
 # WLED Controller Settings for Stage Kit Bridge
 
-## LED Hardware Configuration
+Your controller: **WLED 0.14.4 "Hoshi"** at `192.168.0.53`
 
-In WLED web UI → **Config** → **LED Preferences**:
+## Current LED Hardware (already configured)
 
-| Setting | Value | Notes |
-|---------|-------|-------|
-| LED Type | SK9822 (or APA102) | Your BTF-LIGHTING SK9822 strips |
-| Color Order | BGR | SK9822 typically uses BGR; verify with a single-color test |
-| Length | **120** | 2 × 60 LED strips daisy-chained |
-| GPIO Data | Your data pin | ESP32 default is typically GPIO16 |
-| GPIO Clock | Your clock pin | SK9822/APA102 needs a clock line; ESP32 default GPIO4 |
+**Config → LED Preferences → Hardware setup** — these are already correct:
 
-## Sync/Realtime Configuration
+| Setting | Current Value |
+|---------|--------------|
+| Length | **120** |
+| Data GPIO | **18** |
+| Clk GPIO | **5** |
+| Color Order | (verify — see below) |
+| Reversed | Off |
 
-In WLED web UI → **Config** → **Sync Interfaces**:
+**Config → LED Preferences → Advanced:**
 
-| Setting | Value | Notes |
-|---------|-------|-------|
-| **Receive DDP** | ✅ Enabled | This is how the bridge sends pixel data |
-| DDP port | **4048** | Default, must match `WLED_DDP_PORT` env var |
-| Realtime receive timeout | **2500** ms | How long WLED waits before reverting to normal mode |
-| Force max brightness | ❌ Off | Let the bridge control brightness |
-| Realtime override | **Always** | DDP takes priority over local effects |
+| Setting | Current Value | Notes |
+|---------|--------------|-------|
+| Target refresh rate | **42 FPS** | Good, matches our 40 FPS output |
 
-### Other Sync Settings (optional)
+### Verify Color Order
 
-| Setting | Recommended |
-|---------|------------|
-| Receive UDP Realtime | Can leave enabled, won't conflict |
-| Send WLED notifications | ❌ Off (not needed) |
-| Receive WLED notifications | ❌ Off (avoid other WLED instances interfering) |
-| E1.31 / Art-Net | Off unless you need them for other purposes |
+SK9822 strips can be BGR or RGB. To test:
+1. Open WLED web UI, set a solid **red** color
+2. If the strip shows **red** → color order is correct
+3. If it shows **blue** → change Color Order to **BGR**
 
-## Network
+## Sync Settings to Change
 
-- The WLED controller must be reachable at the IP configured in `WLED_HOST`
-- Use a **static IP** or DHCP reservation for the controller
-- The bridge sends UDP to port 4048 — no firewall rules needed on the ESP side
-- Using `network_mode: host` in Docker ensures the container can send to the WLED IP directly
+**Config → Sync Interfaces → Realtime section:**
 
-## Verifying DDP reception
+| Setting | Required Value | Why |
+|---------|---------------|-----|
+| **Receive UDP realtime** | ✅ **Checked** | This enables DDP reception on port 4048 |
+| Use main segment only | ❌ Unchecked | Let DDP address all LEDs |
+| Type | **E1.31 (sACN)** | Leave as-is, doesn't affect DDP |
+| **Timeout** | **2500** ms | Already set. How long before WLED reverts to normal mode after DDP stops |
+| **Force max brightness** | ❌ **Unchecked** | Let the bridge control brightness |
+| Disable realtime gamma correction | ❌ Unchecked | Keep gamma correction on |
+| Realtime LED offset | **0** | No offset needed |
+| Skip out-of-sequence packets | ✅ Checked | Helps with packet ordering |
 
-1. Start the bridge: `docker compose up`
-2. In a separate terminal, run: `python test_sender.py --pattern all_on`
-3. The strip should light up with all colors
-4. In WLED web UI, a small icon should appear indicating realtime mode is active
+**Everything else on that page can stay as-is.** The WLED broadcast, MQTT, Hue, and Alexa sections are not used by this bridge.
 
-## Recommended WLED Version
+### Key Point: DDP is automatic
 
-This bridge is tested against **WLED 0.14.4 "Hoshi"**. DDP support has been
-stable since 0.13.x. No special build or usermod is required.
+In WLED 0.14.4, there's no separate "Enable DDP" checkbox. DDP reception is **automatically enabled** when "Receive UDP realtime" is checked. WLED listens on **port 4048** for DDP packets alongside E1.31/Art-Net on their respective ports.
+
+## docker-compose.yml
+
+Update `WLED_HOST` to match your controller:
+
+```yaml
+environment:
+  WLED_HOST: "192.168.0.53"
+```
+
+## Verifying It Works
+
+1. Start the bridge container
+2. Run `python test_sender.py --pattern all_on` (or use the test sender inside the container)
+3. The strip should light up with all four zone colors
+4. The WLED web UI will show a small **realtime mode** indicator when DDP data is being received
+5. Open `http://<bridge-host>:8080/` for the live status dashboard
