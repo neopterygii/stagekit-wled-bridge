@@ -1,0 +1,23 @@
+services:
+  stagekit-bridge:
+    image: ghcr.io/neopterygii/stagekit-wled-bridge:latest
+    # To build locally instead, comment out 'image' and uncomment 'build':
+    # build: .
+    container_name: stagekit-wled-bridge
+    restart: unless-stopped
+    network_mode: host    # needed for UDP broadcast reception
+    environment:
+      # Where to listen for YARG packets
+      YARG_LISTEN_HOST: "0.0.0.0"
+      YARG_LISTEN_PORT: "21070"
+      # WLED controller IP
+      WLED_HOST: "192.168.1.100"
+      WLED_DDP_PORT: "4048"
+      # Strip config
+      LED_COUNT: "120"
+      # Render settings
+      TARGET_FPS: "40"
+      GLOBAL_BRIGHTNESS: "255"
+      # Status page
+      STATUS_HOST: "0.0.0.0"
+      STATUS_PORT: "8080"
