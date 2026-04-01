@@ -67,6 +67,7 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender, t
     """Main render loop: reads cue engine state, maps to pixels, sends DDP."""
     interval = 1.0 / TARGET_FPS
     brightness = GLOBAL_BRIGHTNESS / 255.0
+    last_pixel_data = b''
 
     print(f"Render loop started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → {WLED_HOST}:{WLED_DDP_PORT}")
 
@@ -82,7 +83,11 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender, t
         if brightness < 1.0:
             pixel_data = bytes(int(b * brightness) for b in pixel_data)
 
-        sender.send_pixels(pixel_data)
+        # Skip sending if frame is identical (reduces WiFi load on static cues)
+        if pixel_data != last_pixel_data:
+            sender.send_pixels(pixel_data)
+            last_pixel_data = pixel_data
+
         tracker.on_render(engine.zones, engine.strobe_rate, engine.bpm)
         await asyncio.sleep(interval)
 
