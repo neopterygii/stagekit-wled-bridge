@@ -111,7 +111,7 @@ def parse_packet(data: bytes) -> YARGPacket | None:
     if len(data) < MIN_PACKET_SIZE:
         return None
 
-    header = struct.unpack_from(">I", data, 0)[0]  # big-endian uint32
+    header = struct.unpack_from("<I", data, 0)[0]  # little-endian uint32 (C# BinaryWriter)
     if header != PACKET_HEADER:
         return None
 

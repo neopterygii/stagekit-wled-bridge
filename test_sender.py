@@ -35,8 +35,8 @@ def build_packet(
     """Build a minimal valid YARG UDP packet (44+ bytes)."""
     buf = bytearray(47)
 
-    # Header (big-endian)
-    struct.pack_into(">I", buf, 0, YARG_HEADER)
+    # Header (little-endian, matching C# BinaryWriter)
+    struct.pack_into("<I", buf, 0, YARG_HEADER)
 
     # Version, platform
     buf[4] = 3   # datagram version
