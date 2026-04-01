@@ -4,7 +4,7 @@ import os
 
 # YARG UDP intake
 YARG_LISTEN_HOST = os.environ.get("YARG_LISTEN_HOST", "0.0.0.0")
-YARG_LISTEN_PORT = int(os.environ.get("YARG_LISTEN_PORT", "21070"))
+YARG_LISTEN_PORT = int(os.environ.get("YARG_LISTEN_PORT", "36107"))
 
 # WLED target
 WLED_HOST = os.environ.get("WLED_HOST", "192.168.1.100")

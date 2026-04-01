@@ -53,7 +53,7 @@ All settings are controlled via environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `YARG_LISTEN_HOST` | `0.0.0.0` | Bind address for YARG UDP packets |
-| `YARG_LISTEN_PORT` | `21070` | UDP port for YARG lighting data |
+| `YARG_LISTEN_PORT` | `36107` | UDP port for YARG lighting data |
 | `WLED_HOST` | `192.168.1.100` | IP address of your WLED controller |
 | `WLED_DDP_PORT` | `4048` | DDP port on WLED (default is fine) |
 | `LED_COUNT` | `120` | Total number of LEDs on the strip |
@@ -65,11 +65,11 @@ All settings are controlled via environment variables:
 ## Architecture
 
 ```
-YARG / RB3E                     This Container                         WLED
-┌──────────┐   UDP :21070   ┌──────────────────────┐   DDP :4048   ┌──────────┐
-│  Stage Kit│──────────────►│  YARG Packet Parser   │              │  ESP32 + │
-│  Lighting │               │         │              │              │  SK9822  │
-│  Stream   │               │  ┌──────▼──────────┐  │              │  120 LEDs│
+YARG                            This Container                         WLED
+┌──────────┐   UDP :36107   ┌──────────────────────┐   DDP :4048   ┌──────────┐
+│  Data     │──────────────►│  YARG Packet Parser   │              │  ESP32 + │
+│  Stream   │               │         │              │              │  SK9822  │
+│           │               │  ┌──────▼──────────┐  │              │  120 LEDs│
 └──────────┘               │  │  Cue Engine      │  │──────────►  │          │
                             │  │  (beat-synced    │  │              └──────────┘
                             │  │   zone bitmasks) │  │
@@ -119,6 +119,30 @@ The dashboard includes a **Test Patterns** panel for triggering cues directly fr
 - Click **Stop Test** to return to blackout
 
 This is especially useful for verifying your WLED/LED setup without running YARG.
+
+## YARG Setup
+
+In YARG, enable the UDP data stream:
+
+1. Open **Settings → All Settings → Experimental**
+2. Enable **"UDP Data Stream"**
+
+That's it — YARG will broadcast lighting data on UDP port 36107 to all devices on the local network.
+
+> **Note:** The "Enable Stage Kit" and "Enable DMX" settings are for **USB Stage Kit hardware** and **sACN/DMX lighting** respectively. They are not needed for this bridge.
+
+### Troubleshooting
+
+If the status page shows "Disconnected" with 0 packets/sec:
+
+| Check | Details |
+|---|---|
+| **YARG setting** | "UDP Data Stream" must be enabled in Settings → Experimental |
+| **Firewall** | UDP port 36107 must not be blocked on the host running the container |
+| **Network mode** | The container must use `network_mode: host` to receive UDP broadcasts |
+| **Same subnet** | YARG PC and the container host must be on the same network/VLAN |
+| **Play a song** | Full lighting data (BPM, beats, cues) requires an active song — though YARG does send basic data from the menu screen |
+| **Test the strip first** | Use the built-in Test Patterns on the status page to verify WLED/LED connectivity independently of YARG |
 
 ## WLED Setup
 

@@ -8,7 +8,7 @@ COPY . .
 
 # No dependencies to install — pure stdlib
 
-EXPOSE 21070/udp
+EXPOSE 36107/udp
 EXPOSE 8080/tcp
 
 CMD ["python", "-u", "main.py"]

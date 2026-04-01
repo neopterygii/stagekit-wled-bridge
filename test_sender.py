@@ -20,7 +20,7 @@ from protocol.yarg_packet import CueByte, BeatByte, StrobeSpeed
 
 YARG_HEADER = 0x59415247  # "YARG"
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 21070
+DEFAULT_PORT = 36107
 DEFAULT_BPM = 120.0
 
 

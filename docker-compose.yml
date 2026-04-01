@@ -9,7 +9,7 @@ services:
     environment:
       # Where to listen for YARG packets
       YARG_LISTEN_HOST: "0.0.0.0"
-      YARG_LISTEN_PORT: "21070"
+      YARG_LISTEN_PORT: "36107"
       # WLED controller IP
       WLED_HOST: "192.168.0.53"
       WLED_DDP_PORT: "4048"
