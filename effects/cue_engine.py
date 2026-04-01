@@ -121,7 +121,14 @@ class CueEngine:
         self.zones[zone] = mask
 
     def _launch_cue(self, cue: int):
-        """Launch the appropriate pattern primitives for a cue."""
+        """Launch the appropriate pattern primitives for a cue.
+
+        Patterns match YALCY's StageKitTalker definitions (large venue variant).
+        BRE and Frenzy use smooth rotating chase instead of YALCY's ALL/NONE
+        flash to avoid seizure-inducing strobing on a full LED strip.
+        Stomp uses keyframe-triggered chase instead of ALL/NONE toggle for
+        the same reason.
+        """
         # Reset all zones
         for i in range(4):
             self.zones[i] = NONE
@@ -130,181 +137,206 @@ class CueEngine:
            cue == CueByte.BLACKOUT_SLOW or cue == CueByte.BLACKOUT_SPOTLIGHT:
             return  # All off
 
-        elif cue == CueByte.WARM_AUTOMATIC:
-            # Two-bit wide chase for more strip coverage
-            self._start_beat_pattern(RED, [
-                ZERO | ONE | FOUR | FIVE,
-                ONE | TWO | FIVE | SIX,
-                TWO | THREE | SIX | SEVEN,
-                THREE | FOUR | SEVEN | ZERO,
-            ], cycles_per_beat=0.25)
-            self._start_beat_pattern(YELLOW, [
-                TWO | THREE, ONE | TWO, ZERO | ONE, SEVEN | ZERO,
-                SIX | SEVEN, FIVE | SIX, FOUR | FIVE, THREE | FOUR,
-            ], cycles_per_beat=0.125)
+        elif cue == CueByte.DEFAULT:
+            # YALCY large: Blue/Red ALL toggle on KeyframeNext
+            # We use a 2-color chase instead of ALL/NONE toggle
+            self._start_listen_pattern(BLUE, [ALL, NONE], listen="keyframe")
+            self._start_listen_pattern(RED, [NONE, ALL], listen="keyframe")
 
-        elif cue == CueByte.COOL_AUTOMATIC:
+        elif cue == CueByte.VERSE:
+            # Not in YALCY — blue chase as ambient verse lighting
             self._start_beat_pattern(BLUE, [
-                ZERO | ONE | FOUR | FIVE,
-                ONE | TWO | FIVE | SIX,
-                TWO | THREE | SIX | SEVEN,
-                THREE | FOUR | SEVEN | ZERO,
-            ], cycles_per_beat=0.25)
-            self._start_beat_pattern(GREEN, [
-                TWO | THREE, ONE | TWO, ZERO | ONE, SEVEN | ZERO,
-                SIX | SEVEN, FIVE | SIX, FOUR | FIVE, THREE | FOUR,
-            ], cycles_per_beat=0.125)
-
-        elif cue == CueByte.BIG_ROCK_ENDING:
-            # 4 colors in rotating 2-bit segments — strip always fully lit
-            self._start_multi_zone_chase([RED, GREEN, BLUE, YELLOW],
-                                         bits_per_zone=2, cycles_per_beat=0.125)
-
-        elif cue == CueByte.FRENZY:
-            # 4 colors in rotating 2-bit segments, faster
-            self._start_multi_zone_chase([RED, BLUE, GREEN, YELLOW],
-                                         bits_per_zone=2, cycles_per_beat=0.25)
-
-        elif cue == CueByte.SEARCHLIGHTS:
-            # Two-bit wide searchlights
-            self._start_beat_pattern(RED, [
-                ZERO | ONE, ONE | TWO, TWO | THREE, THREE | FOUR,
-                FOUR | FIVE, FIVE | SIX, SIX | SEVEN, SEVEN | ZERO,
-            ], cycles_per_beat=0.125)
-            self._start_beat_pattern(BLUE, [
-                FOUR | FIVE, FIVE | SIX, SIX | SEVEN, SEVEN | ZERO,
-                ZERO | ONE, ONE | TWO, TWO | THREE, THREE | FOUR,
-            ], cycles_per_beat=0.125)
-
-        elif cue == CueByte.SWEEP:
-            # Three-bit wide sweep
-            self._start_beat_pattern(BLUE, [
-                ZERO | ONE | TWO, ONE | TWO | THREE, TWO | THREE | FOUR,
-                THREE | FOUR | FIVE, FOUR | FIVE | SIX, FIVE | SIX | SEVEN,
-                SIX | SEVEN | ZERO, SEVEN | ZERO | ONE,
-                SEVEN | ZERO | ONE, SIX | SEVEN | ZERO, FIVE | SIX | SEVEN,
-                FOUR | FIVE | SIX, THREE | FOUR | FIVE, TWO | THREE | FOUR,
-                ONE | TWO | THREE, ZERO | ONE | TWO,
-            ], cycles_per_beat=0.0625)
-            self._start_beat_pattern(GREEN, [
-                FOUR | FIVE | SIX, FIVE | SIX | SEVEN, SIX | SEVEN | ZERO,
-                SEVEN | ZERO | ONE, ZERO | ONE | TWO, ONE | TWO | THREE,
-                TWO | THREE | FOUR, THREE | FOUR | FIVE,
-                THREE | FOUR | FIVE, TWO | THREE | FOUR, ONE | TWO | THREE,
-                ZERO | ONE | TWO, SEVEN | ZERO | ONE, SIX | SEVEN | ZERO,
-                FIVE | SIX | SEVEN, FOUR | FIVE | SIX,
-            ], cycles_per_beat=0.0625)
-
-        elif cue == CueByte.HARMONY:
-            # Two-bit wide chase
-            self._start_beat_pattern(YELLOW, [
-                THREE | FOUR, TWO | THREE, ONE | TWO, ZERO | ONE,
-                SEVEN | ZERO, SIX | SEVEN, FIVE | SIX, FOUR | FIVE,
-            ], cycles_per_beat=0.125)
-            self._start_beat_pattern(RED, [
-                FOUR | FIVE, THREE | FOUR, TWO | THREE, ONE | TWO,
-                ZERO | ONE, SEVEN | ZERO, SIX | SEVEN, FIVE | SIX,
-            ], cycles_per_beat=0.125)
-
-        elif cue == CueByte.FLARE_SLOW:
-            # Outside-in collapse: edges → middle → gone
-            self._start_listen_pattern(RED, [
-                ALL,
-                ONE | TWO | THREE | FOUR | FIVE | SIX,
-                TWO | THREE | FOUR | FIVE,
-                THREE | FOUR,
-                NONE,
-            ], listen="beat_major")
-            self._set_zone(BLUE, ALL)
-
-        elif cue == CueByte.FLARE_FAST:
-            # Outside-in collapse
-            self._start_listen_pattern(YELLOW, [
-                ALL,
-                ONE | TWO | THREE | FOUR | FIVE | SIX,
-                TWO | THREE | FOUR | FIVE,
-                THREE | FOUR,
-                NONE,
-            ], listen="beat_major")
-            self._set_zone(GREEN, ALL)
-
-        elif cue == CueByte.SILHOUETTES or cue == CueByte.SILHOUETTES_SPOTLIGHT:
-            self._set_zone(BLUE, ALL)
-
-        elif cue == CueByte.DEFAULT or cue == CueByte.VERSE:
-            # Two-bit wide chase
-            self._start_beat_pattern(BLUE, [
-                ZERO | ONE | FOUR | FIVE,
-                ONE | TWO | FIVE | SIX,
-                TWO | THREE | SIX | SEVEN,
-                THREE | FOUR | SEVEN | ZERO,
+                ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
 
         elif cue == CueByte.CHORUS:
-            # Two-bit wide red chase over solid yellow
+            # Not in YALCY — energetic red+yellow
             self._start_beat_pattern(RED, [
-                ZERO | ONE | FOUR | FIVE,
-                ONE | TWO | FIVE | SIX,
-                TWO | THREE | SIX | SEVEN,
-                THREE | FOUR | SEVEN | ZERO,
+                ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
             self._set_zone(YELLOW, ALL)
 
-        elif cue == CueByte.WARM_MANUAL or cue == CueByte.COOL_MANUAL:
-            # Listen for next keyframe
-            if cue == CueByte.WARM_MANUAL:
-                self._start_listen_pattern(RED, [ALL, NONE], listen="keyframe")
-            else:
-                self._start_listen_pattern(BLUE, [ALL, NONE], listen="keyframe")
+        elif cue == CueByte.WARM_MANUAL:
+            # YALCY: same patterns as LoopWarm (Warm Automatic)
+            self._start_beat_pattern(RED, [
+                ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
+            ], cycles_per_beat=0.25)
+            self._start_beat_pattern(YELLOW, [
+                TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR, THREE,
+            ], cycles_per_beat=0.125)
 
-        elif cue == CueByte.STOMP:
-            # Red and yellow in alternating 4-bit segments, swap on beat
-            self._start_multi_zone_chase([RED, YELLOW],
-                                         bits_per_zone=4, cycles_per_beat=0.25,
-                                         listen="beat_major")
-
-        elif cue == CueByte.DISCHORD:
-            # Red and blue in alternating 4-bit segments, rotating
-            self._start_multi_zone_chase([RED, BLUE],
-                                         bits_per_zone=4, cycles_per_beat=0.25)
-
-        elif cue == CueByte.INTRO:
-            self._set_zone(BLUE, ALL)
-            self._set_zone(GREEN, ALL)
-
-        elif cue == CueByte.MENU:
-            # Three-bit wide bounce
+        elif cue == CueByte.COOL_MANUAL:
+            # YALCY: same patterns as LoopCool (Cool Automatic)
             self._start_beat_pattern(BLUE, [
-                ZERO | ONE | TWO, ONE | TWO | THREE, TWO | THREE | FOUR,
-                THREE | FOUR | FIVE, FOUR | FIVE | SIX, FIVE | SIX | SEVEN,
-                SIX | SEVEN | ZERO, SEVEN | ZERO | ONE,
-                SEVEN | ZERO | ONE, SIX | SEVEN | ZERO, FIVE | SIX | SEVEN,
-                FOUR | FIVE | SIX, THREE | FOUR | FIVE, TWO | THREE | FOUR,
-                ONE | TWO | THREE, ZERO | ONE | TWO,
-            ], cycles_per_beat=0.0625)
+                ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
+            ], cycles_per_beat=0.25)
+            self._start_beat_pattern(GREEN, [
+                TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR, THREE,
+            ], cycles_per_beat=0.125)
 
-        elif cue == CueByte.SCORE:
+        elif cue == CueByte.WARM_AUTOMATIC:
+            # YALCY: Red opposing-pair chase + Yellow CCW single
+            self._start_beat_pattern(RED, [
+                ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
+            ], cycles_per_beat=0.25)
+            self._start_beat_pattern(YELLOW, [
+                TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR, THREE,
+            ], cycles_per_beat=0.125)
+
+        elif cue == CueByte.COOL_AUTOMATIC:
+            # YALCY: Blue opposing-pair chase + Green CCW single
+            self._start_beat_pattern(BLUE, [
+                ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
+            ], cycles_per_beat=0.25)
+            self._start_beat_pattern(GREEN, [
+                TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR, THREE,
+            ], cycles_per_beat=0.125)
+
+        elif cue == CueByte.BIG_ROCK_ENDING:
+            # YALCY: 4 zones flash ALL/NONE in sequence (seizure risk)
+            # We use 4-color rotating chase — strip always fully lit
+            self._start_multi_zone_chase([RED, GREEN, BLUE, YELLOW],
+                                         bits_per_zone=2, cycles_per_beat=0.5)
+
+        elif cue == CueByte.FRENZY:
+            # YALCY large: Red/Blue/Yellow flash ALL/NONE (seizure risk)
+            # We use 3-color rotating chase — strip always fully lit
+            self._start_multi_zone_chase([RED, BLUE, YELLOW],
+                                         bits_per_zone=2, cycles_per_beat=0.5)
+
+        elif cue == CueByte.SEARCHLIGHTS:
+            # YALCY large: Yellow CW + Blue CCW single-bit, 0.5 cpb
+            self._start_beat_pattern(YELLOW, [
+                TWO, THREE, FOUR, FIVE, SIX, SEVEN, ZERO, ONE,
+            ], cycles_per_beat=0.5)
+            self._start_beat_pattern(BLUE, [
+                ZERO, SEVEN, SIX, FIVE, FOUR, THREE, TWO, ONE,
+            ], cycles_per_beat=0.5)
+
+        elif cue == CueByte.SWEEP:
+            # YALCY large: Red opposing-pair sweep
+            self._start_beat_pattern(RED, [
+                SIX | TWO, FIVE | ONE, FOUR | ZERO, THREE | SEVEN,
+            ], cycles_per_beat=0.25)
+
+        elif cue == CueByte.HARMONY:
+            # YALCY large: Yellow + Red counter-rotating single-bit
+            self._start_beat_pattern(YELLOW, [
+                THREE, TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR,
+            ], cycles_per_beat=0.125)
+            self._start_beat_pattern(RED, [
+                FOUR, THREE, TWO, ONE, ZERO, SEVEN, SIX, FIVE,
+            ], cycles_per_beat=0.125)
+
+        elif cue == CueByte.FLARE_SLOW:
+            # YALCY: ALL on every zone (static bright)
             for i in range(4):
                 self.zones[i] = ALL
 
-    def _start_beat_pattern(self, zone: int, pattern: list[int], cycles_per_beat: float):
-        """Launch a beat-synced pattern loop on a zone."""
+        elif cue == CueByte.FLARE_FAST:
+            # YALCY: Blue ALL static. Green ALL if prev was cool cue.
+            # We always set Blue ALL (no previous-cue tracking yet).
+            self._set_zone(BLUE, ALL)
+
+        elif cue == CueByte.SILHOUETTES:
+            # YALCY: Green ALL (others off)
+            self._set_zone(GREEN, ALL)
+
+        elif cue == CueByte.SILHOUETTES_SPOTLIGHT:
+            # YALCY: complex context-dependent. Simplified to green ambient.
+            self._set_zone(GREEN, ALL)
+
+        elif cue == CueByte.STOMP:
+            # YALCY: R+G+Y ALL toggle on KeyframeNext (seizure risk)
+            # We use multi-zone chase triggered by keyframe instead
+            self._start_multi_zone_chase([RED, GREEN, YELLOW],
+                                         bits_per_zone=2, cycles_per_beat=0.25,
+                                         listen="keyframe")
+
+        elif cue == CueByte.DISCHORD:
+            # YALCY large: Yellow CW beat-triggered + Green CCW spinning +
+            # Blue pattern switching + Red drum flash.
+            # Simplified: Yellow + Green counter-rotating chases
+            self._start_beat_pattern(YELLOW, [
+                ZERO, ONE, TWO, THREE, FOUR, FIVE, SIX, SEVEN,
+            ], cycles_per_beat=0.125, listen="beat_any")
+            self._start_beat_pattern(GREEN, [
+                ZERO, SEVEN, SIX, FIVE, FOUR, THREE, TWO, ONE,
+            ], cycles_per_beat=0.5)
+            self._set_zone(BLUE, TWO | SIX)
+
+        elif cue == CueByte.INTRO:
+            # YALCY: Green ALL only
+            self._set_zone(GREEN, ALL)
+
+        elif cue == CueByte.MENU:
+            # YALCY: Blue single-bit chase, TimedPattern 2.0s (not BPM)
+            self._start_timed_pattern(BLUE, [
+                ZERO, ONE, TWO, THREE, FOUR, FIVE, SIX, SEVEN,
+            ], seconds=2.0)
+
+        elif cue == CueByte.SCORE:
+            # YALCY large: Red opposing-pair + Yellow opposing-pair, timed
+            self._start_timed_pattern(RED, [
+                SIX | TWO, ONE | FIVE, ZERO | FOUR, SEVEN | THREE,
+            ], seconds=1.0)
+            self._start_timed_pattern(YELLOW, [
+                SIX | TWO, SEVEN | THREE, ZERO | FOUR, ONE | FIVE,
+            ], seconds=2.0)
+
+    def _start_beat_pattern(self, zone: int, pattern: list[int],
+                            cycles_per_beat: float, listen: str | None = None):
+        """Launch a beat-synced pattern loop on a zone.
+
+        Args:
+            listen: If "beat_any", advance on any beat (Measure or Strong)
+                    instead of timed intervals.
+        """
         task = asyncio.ensure_future(
-            self._run_beat_pattern(zone, pattern, cycles_per_beat)
+            self._run_beat_pattern(zone, pattern, cycles_per_beat, listen)
         )
         self._active_tasks.append(task)
 
-    async def _run_beat_pattern(self, zone: int, pattern: list[int], cycles_per_beat: float):
+    async def _run_beat_pattern(self, zone: int, pattern: list[int],
+                                cycles_per_beat: float, listen: str | None = None):
         """Beat-synced pattern loop."""
         idx = 0
         try:
             while True:
                 self.zones[zone] = pattern[idx]
                 idx = (idx + 1) % len(pattern)
-                steps_per_beat = len(pattern) * cycles_per_beat
-                bpm = self.bpm if self.bpm > 0 else 120.0
-                seconds_per_beat = 60.0 / bpm
-                await asyncio.sleep(seconds_per_beat / steps_per_beat)
+
+                if listen == "beat_any":
+                    # Advance on Measure or Strong beats
+                    while True:
+                        await self._beat_event.wait()
+                        self._beat_event.clear()
+                        if self._last_beat_type in (BeatByte.MEASURE, BeatByte.STRONG):
+                            break
+                else:
+                    steps_per_beat = len(pattern) * cycles_per_beat
+                    bpm = self.bpm if self.bpm > 0 else 120.0
+                    seconds_per_beat = 60.0 / bpm
+                    await asyncio.sleep(seconds_per_beat / steps_per_beat)
+        except asyncio.CancelledError:
+            pass
+
+    def _start_timed_pattern(self, zone: int, pattern: list[int], seconds: float):
+        """Launch a time-based (not BPM) pattern loop on a zone."""
+        task = asyncio.ensure_future(
+            self._run_timed_pattern(zone, pattern, seconds)
+        )
+        self._active_tasks.append(task)
+
+    async def _run_timed_pattern(self, zone: int, pattern: list[int], seconds: float):
+        """Time-based pattern loop (fixed period, independent of BPM)."""
+        idx = 0
+        interval = seconds / len(pattern)
+        try:
+            while True:
+                self.zones[zone] = pattern[idx]
+                idx = (idx + 1) % len(pattern)
+                await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass
 
@@ -320,7 +352,8 @@ class CueEngine:
             zone_order: List of zone indices to use (e.g. [RED, BLUE] for 2-color).
             bits_per_zone: How many consecutive bits per zone (8 / len(zone_order)).
             cycles_per_beat: How many full rotations per beat.
-            listen: If "beat_major", advance on beats instead of timed.
+            listen: If "beat_major", advance on major beats. If "keyframe",
+                    advance on KeyframeNext events.
         """
         # Build rotation frames: 8 steps, shifting by 1 bit each step
         num_zones = len(zone_order)
@@ -359,6 +392,11 @@ class CueEngine:
                     await self._beat_event.wait()
                     self._beat_event.clear()
                     if self._last_beat_type not in (BeatByte.MEASURE, BeatByte.STRONG):
+                        continue
+                elif listen == "keyframe":
+                    await self._keyframe_event.wait()
+                    self._keyframe_event.clear()
+                    if self._last_keyframe_type != KeyframeByte.NEXT:
                         continue
                 else:
                     steps_per_beat = len(frames) * cycles_per_beat
