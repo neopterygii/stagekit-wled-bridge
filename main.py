@@ -103,6 +103,30 @@ class WLEDPowerManager:
         else:
             print("WLED: failed to power off via API")
 
+    def power_snapshot(self) -> dict:
+        """Return current power state for the status page."""
+        if not self._enabled:
+            return {"enabled": False, "on": self._wled_on, "idle_seconds": 0, "timeout": 0, "remaining": 0}
+        elapsed = time.monotonic() - self._last_activity if self._last_activity > 0 else 0.0
+        remaining = max(0.0, self._idle_timeout - elapsed) if self._wled_on else 0.0
+        return {
+            "enabled": True,
+            "on": self._wled_on,
+            "idle_seconds": round(elapsed),
+            "timeout": self._idle_timeout,
+            "remaining": round(remaining),
+        }
+
+    def manual_power(self, on: bool):
+        """Manual power toggle from the web UI."""
+        if on:
+            self._last_activity = time.monotonic()
+            if not self._wled_on:
+                self._power_on()
+        else:
+            if self._wled_on:
+                self._power_off()
+
     async def watchdog_loop(self):
         """Background task that turns WLED off after idle timeout."""
         if not self._enabled:
@@ -127,6 +151,9 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender, t
     interval = 1.0 / TARGET_FPS
     brightness = GLOBAL_BRIGHTNESS / 255.0
     last_pixel_data = b''
+    last_send_time = 0.0
+    # WLED max timeout is 65000ms; resend well within that to prevent timeout
+    KEEPALIVE_INTERVAL = 50.0
 
     print(f"Render loop started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → {WLED_HOST}:{WLED_DDP_PORT}")
 
@@ -142,10 +169,12 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender, t
         if brightness < 1.0:
             pixel_data = bytes(int(b * brightness) for b in pixel_data)
 
-        # Skip sending if frame is identical (reduces WiFi load on static cues)
-        if pixel_data != last_pixel_data:
+        # Send if frame changed OR keepalive interval elapsed
+        now = time.monotonic()
+        if pixel_data != last_pixel_data or (now - last_send_time) >= KEEPALIVE_INTERVAL:
             sender.send_pixels(pixel_data)
             last_pixel_data = pixel_data
+            last_send_time = now
 
         tracker.on_render(engine.zones, engine.strobe_rate, engine.bpm)
         await asyncio.sleep(interval)
@@ -186,7 +215,7 @@ async def main():
     strobe_task = asyncio.create_task(engine.run_strobe())
 
     # Start status broadcast task
-    broadcast_task = asyncio.create_task(tracker.broadcast_loop())
+    broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power))
 
     # Start render loop
     render_task = asyncio.create_task(render_loop(engine, mapper, sender, tracker))

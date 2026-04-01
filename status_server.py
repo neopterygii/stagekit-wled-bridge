@@ -81,8 +81,8 @@ class StatusTracker:
     def on_beat(self, beat: int):
         self.last_beat = beat
 
-    def snapshot(self) -> dict:
-        return {
+    def snapshot(self, wled_power=None) -> dict:
+        d = {
             "cue": self.current_cue_name,
             "cue_id": self.current_cue,
             "bpm": round(self.bpm, 1),
@@ -102,6 +102,9 @@ class StatusTracker:
             "test_active": self.test_active,
             "test_pattern": self.test_pattern,
         }
+        if wled_power:
+            d["wled_power"] = wled_power.power_snapshot()
+        return d
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=20)
@@ -112,10 +115,10 @@ class StatusTracker:
         if q in self._sse_queues:
             self._sse_queues.remove(q)
 
-    async def broadcast_loop(self):
+    async def broadcast_loop(self, wled_power=None):
         """Pushes snapshots to all SSE subscribers at ~10Hz."""
         while True:
-            data = self.snapshot()
+            data = self.snapshot(wled_power=wled_power)
             dead = []
             for q in self._sse_queues:
                 try:
@@ -227,6 +230,12 @@ STATUS_HTML = """\
     <div class="label">DDP Frames</div>
     <div class="value" id="ddp">0</div>
   </div>
+  <div class="card" id="power-card">
+    <div class="label">WLED Power</div>
+    <div class="value"><span class="status-dot off" id="power-dot"></span><span id="power-state">Unknown</span></div>
+    <div id="power-timer" style="font-size:0.8rem;color:var(--dim);margin-top:0.35rem;font-variant-numeric:tabular-nums"></div>
+    <button class="test-btn" id="btn-power" onclick="togglePower()" style="margin-top:0.5rem;font-size:0.75rem">Toggle</button>
+  </div>
 </div>
 
 <h3 style="margin-bottom:0.5rem">Zone Bitmasks</h3>
@@ -309,6 +318,41 @@ function addLog(msg) {
   el.innerHTML = '<span class="ts">[' + now + ']</span> ' + msg;
   log.prepend(el);
   while (log.children.length > 200) log.removeChild(log.lastChild);
+}
+
+function togglePower() {
+  fetch('/api/power', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'toggle' }) });
+}
+
+function fmtTime(s) {
+  if (s <= 0) return '';
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? m + 'm ' + sec + 's' : sec + 's';
+}
+
+function updatePower(p) {
+  if (!p) return;
+  const dot = document.getElementById('power-dot');
+  const state = document.getElementById('power-state');
+  const timer = document.getElementById('power-timer');
+  const btn = document.getElementById('btn-power');
+  if (p.on) {
+    dot.className = 'status-dot on';
+    state.textContent = 'On';
+    btn.textContent = 'Turn Off';
+    if (p.enabled && p.remaining > 0) {
+      timer.textContent = 'Auto-off in ' + fmtTime(p.remaining);
+    } else {
+      timer.textContent = p.enabled ? 'Waiting for timeout...' : 'Auto-off disabled';
+    }
+  } else {
+    dot.className = 'status-dot off';
+    state.textContent = 'Off';
+    btn.textContent = 'Turn On';
+    timer.textContent = p.enabled ? 'Will auto-on when YARG starts' : 'Auto-off disabled';
+  }
 }
 
 function sendTest(action, extra) {
@@ -398,6 +442,9 @@ function update(d) {
   } else if (d.test_active && d.test_pattern !== activePattern) {
     highlightActivePattern(d.test_pattern);
   }
+
+  // Update WLED power info
+  updatePower(d.wled_power);
 }
 
 initZones();
@@ -507,6 +554,23 @@ class StatusServer:
 
         return 400, f"Unknown action: {action}"
 
+    def _handle_power_action(self, body: dict) -> tuple[int, str]:
+        """Process a WLED power control request."""
+        if self.wled_power is None:
+            return 500, "Power manager not connected"
+        action = body.get("action", "")
+        if action == "on":
+            self.wled_power.manual_power(True)
+            return 200, "WLED powered on"
+        elif action == "off":
+            self.wled_power.manual_power(False)
+            return 200, "WLED powered off"
+        elif action == "toggle":
+            is_on = self.wled_power._wled_on
+            self.wled_power.manual_power(not is_on)
+            return 200, f"WLED powered {'off' if is_on else 'on'}"
+        return 400, f"Unknown power action: {action}"
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -543,6 +607,17 @@ class StatusServer:
                 except (json.JSONDecodeError, ValueError):
                     req_body = {}
                 status, msg = self._handle_test_action(req_body)
+                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
+                await self._send_response(writer, status, 'application/json', resp)
+            elif path == '/api/power' and method == 'POST':
+                raw = b''
+                if content_length > 0:
+                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
+                try:
+                    req_body = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, ValueError):
+                    req_body = {}
+                status, msg = self._handle_power_action(req_body)
                 resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
                 await self._send_response(writer, status, 'application/json', resp)
             else:
