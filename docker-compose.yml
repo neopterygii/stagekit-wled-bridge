@@ -21,3 +21,5 @@ services:
       # Status page
       STATUS_HOST: "0.0.0.0"
       STATUS_PORT: "8080"
+      # Auto power-off WLED after idle (seconds, 0 = disabled)
+      IDLE_TIMEOUT: "1800"

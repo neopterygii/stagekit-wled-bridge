@@ -30,6 +30,7 @@ services:
       WLED_HOST: "192.168.0.53"      # Your WLED controller IP
       LED_COUNT: "120"                # Number of LEDs on your strip
       GLOBAL_BRIGHTNESS: "255"        # 0-255
+      IDLE_TIMEOUT: "1800"            # Auto-off after 30 min idle (0 = disabled)
 ```
 
 ```bash
@@ -61,6 +62,15 @@ All settings are controlled via environment variables:
 | `GLOBAL_BRIGHTNESS` | `255` | Master brightness (0–255) |
 | `STATUS_HOST` | `0.0.0.0` | Bind address for the web status page |
 | `STATUS_PORT` | `8080` | HTTP port for the status page |
+| `IDLE_TIMEOUT` | `1800` | Seconds of no YARG packets before WLED is powered off (0 = disabled) |
+
+### WLED Power Management
+
+The bridge automatically manages your WLED controller's power state:
+
+- **Auto-on**: WLED is turned on as soon as a YARG packet (or web UI test pattern) is received.
+- **Auto-off**: After `IDLE_TIMEOUT` seconds with no activity, WLED is powered off via the JSON API.
+- Set `IDLE_TIMEOUT=0` to disable automatic power management entirely.
 
 ## Architecture
 

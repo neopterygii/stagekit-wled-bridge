@@ -22,3 +22,6 @@ GLOBAL_BRIGHTNESS = int(os.environ.get("GLOBAL_BRIGHTNESS", "255"))
 # Status page
 STATUS_HOST = os.environ.get("STATUS_HOST", "0.0.0.0")
 STATUS_PORT = int(os.environ.get("STATUS_PORT", "8080"))
+
+# Idle timeout — seconds without YARG packets before turning WLED off (0 = disabled)
+IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "1800"))

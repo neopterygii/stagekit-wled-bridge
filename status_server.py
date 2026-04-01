@@ -418,11 +418,12 @@ class StatusServer:
     """Async HTTP server serving the status page, SSE stream, and test controls."""
 
     def __init__(self, tracker: StatusTracker, host: str = "0.0.0.0", port: int = 8080,
-                 engine=None):
+                 engine=None, wled_power=None):
         self.tracker = tracker
         self.host = host
         self.port = port
         self.engine = engine
+        self.wled_power = wled_power
         self._beat_task: asyncio.Task | None = None
 
     async def start(self):
@@ -475,6 +476,8 @@ class StatusServer:
             self.tracker.test_active = True
             self.tracker.test_pattern = pattern
             self._start_test_beats(float(bpm))
+            if self.wled_power:
+                self.wled_power.on_test_activity()
             return 200, f"Playing {pattern}"
 
         elif action == "strobe":
