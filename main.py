@@ -116,12 +116,13 @@ class WLEDPowerManager:
     def power_snapshot(self) -> dict:
         """Return current power state for the status page."""
         if not self._enabled:
-            return {"enabled": False, "on": self._wled_on, "idle_seconds": 0, "timeout": 0, "remaining": 0}
+            return {"enabled": False, "on": self._wled_on, "reachable": self._api.reachable, "idle_seconds": 0, "timeout": 0, "remaining": 0}
         elapsed = time.monotonic() - self._last_activity if self._last_activity > 0 else 0.0
         remaining = max(0.0, self._idle_timeout - elapsed) if self._wled_on else 0.0
         return {
             "enabled": True,
             "on": self._wled_on,
+            "reachable": self._api.reachable,
             "idle_seconds": round(elapsed),
             "timeout": self._idle_timeout,
             "remaining": round(remaining),
@@ -138,15 +139,30 @@ class WLEDPowerManager:
                 self._power_off()
 
     async def watchdog_loop(self):
-        """Background task that turns WLED off after idle timeout."""
+        """Background task that turns WLED off after idle timeout and checks reachability."""
+        # Initial reachability check
+        self._api.is_on()
+
         if not self._enabled:
             print(f"WLED power management: disabled (IDLE_TIMEOUT=0)")
+            # Still check reachability periodically
+            while True:
+                await asyncio.sleep(30)
+                self._api.is_on()
             return
 
         print(f"WLED power management: enabled ({self._idle_timeout}s idle timeout)")
 
+        check_counter = 0
         while True:
             await asyncio.sleep(5)
+            check_counter += 1
+
+            # Reachability check every ~30s (6 × 5s)
+            if check_counter >= 6:
+                check_counter = 0
+                if not self._wled_on:
+                    self._api.is_on()
 
             if not self._wled_on:
                 continue

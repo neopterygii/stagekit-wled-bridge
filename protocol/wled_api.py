@@ -14,6 +14,7 @@ class WLEDApi:
 
     def __init__(self, host: str):
         self._base_url = f"http://{host}/json"
+        self.reachable: bool = False
 
     def set_power(self, on: bool) -> bool:
         """Turn WLED on or off. Returns True on success."""
@@ -26,8 +27,10 @@ class WLEDApi:
         )
         try:
             with urllib.request.urlopen(req, timeout=3) as resp:
-                return resp.status == 200
+                self.reachable = resp.status == 200
+                return self.reachable
         except (urllib.error.URLError, OSError):
+            self.reachable = False
             return False
 
     def is_on(self) -> bool | None:
@@ -35,6 +38,8 @@ class WLEDApi:
         try:
             with urllib.request.urlopen(f"{self._base_url}/state", timeout=3) as resp:
                 data = json.loads(resp.read())
+                self.reachable = True
                 return data.get("on", False)
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            self.reachable = False
             return None

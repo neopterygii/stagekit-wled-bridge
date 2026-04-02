@@ -217,7 +217,7 @@ STATUS_HTML = """\
 
 <div class="grid">
   <div class="card">
-    <div class="label">Status</div>
+    <div class="label">YARG Connection</div>
     <div class="value"><span class="status-dot off" id="dot"></span><span id="conn">Disconnected</span></div>
   </div>
   <div class="card">
@@ -241,7 +241,7 @@ STATUS_HTML = """\
     <div class="value" id="ddp">0</div>
   </div>
   <div class="card" id="power-card">
-    <div class="label">WLED Power</div>
+    <div class="label">WLED Connection</div>
     <div class="value"><span class="status-dot off" id="power-dot"></span><span id="power-state">Unknown</span></div>
     <div id="power-timer" style="font-size:0.8rem;color:var(--dim);margin-top:0.35rem;font-variant-numeric:tabular-nums"></div>
     <button class="test-btn" id="btn-power" onclick="togglePower()" style="margin-top:0.5rem;font-size:0.75rem">Toggle</button>
@@ -460,6 +460,13 @@ function updatePower(p) {
   const state = document.getElementById('power-state');
   const timer = document.getElementById('power-timer');
   const btn = document.getElementById('btn-power');
+  if (!p.reachable) {
+    dot.className = 'status-dot off';
+    state.textContent = 'Unreachable';
+    btn.textContent = 'Turn On';
+    timer.textContent = 'WLED device not responding';
+    return;
+  }
   if (p.on) {
     dot.className = 'status-dot on';
     state.textContent = 'On';
