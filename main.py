@@ -104,6 +104,10 @@ class WLEDPowerManager:
         else:
             print("WLED: failed to power off via API")
 
+    @property
+    def is_on(self) -> bool:
+        return self._wled_on
+
     def power_snapshot(self) -> dict:
         """Return current power state for the status page."""
         if not self._enabled:
@@ -148,8 +152,14 @@ class WLEDPowerManager:
 
 
 async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender,
-                      tracker: StatusTracker, settings: BridgeSettings):
-    """Main render loop: reads cue engine state, maps to pixels, sends DDP."""
+                      tracker: StatusTracker, settings: BridgeSettings,
+                      wled_power: 'WLEDPowerManager'):
+    """Main render loop: reads cue engine state, maps to pixels, sends DDP.
+
+    Uses adaptive timing (perf_counter compensation) to minimise frame jitter.
+    Skips DDP sends entirely when WLED is powered off to avoid unnecessary
+    network traffic and let WLED run its own effects when idle.
+    """
     interval = 1.0 / TARGET_FPS
     last_pixel_data = b''
     last_send_time = 0.0
@@ -158,7 +168,12 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender,
 
     print(f"Render loop started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → {WLED_HOST}:{WLED_DDP_PORT}")
 
+    next_frame = time.perf_counter()
+
     while True:
+        next_frame += interval
+        frame_start = time.perf_counter()
+
         # Get current effects config (consumes and clears transient flags)
         effects = engine.get_effects()
 
@@ -175,15 +190,32 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender,
         if brightness < 1.0:
             pixel_data = bytes(int(b * brightness) for b in pixel_data)
 
-        # Send if frame changed OR keepalive interval elapsed
-        now = time.monotonic()
-        if pixel_data != last_pixel_data or (now - last_send_time) >= KEEPALIVE_INTERVAL:
-            sender.send_pixels(pixel_data)
-            last_pixel_data = pixel_data
-            last_send_time = now
+        # Only send DDP when WLED is powered on
+        if wled_power.is_on:
+            # Send if frame changed OR keepalive interval elapsed
+            now = time.monotonic()
+            if pixel_data != last_pixel_data or (now - last_send_time) >= KEEPALIVE_INTERVAL:
+                sender.send_pixels(pixel_data)
+                last_pixel_data = pixel_data
+                last_send_time = now
+        else:
+            # Reset so we send immediately when WLED powers back on
+            last_pixel_data = b''
 
         tracker.on_render(engine.zones, engine.strobe_rate, engine.bpm)
-        await asyncio.sleep(interval)
+
+        # Adaptive sleep: subtract elapsed work time from the target interval.
+        # If we overshot (e.g. event loop contention), next_frame is already
+        # in the past, so we clamp to a short sleep to yield the event loop
+        # without accumulating drift — the next iteration's next_frame will
+        # naturally catch up.
+        sleep_time = next_frame - time.perf_counter()
+        if sleep_time < 0:
+            # We're behind — reset deadline so we don't try to "catch up" by
+            # rapid-firing frames, which would look worse than dropping one.
+            next_frame = time.perf_counter()
+            sleep_time = 0.001
+        await asyncio.sleep(sleep_time)
 
 
 async def main():
@@ -225,7 +257,7 @@ async def main():
     broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power, settings=settings))
 
     # Start render loop
-    render_task = asyncio.create_task(render_loop(engine, mapper, sender, tracker, settings))
+    render_task = asyncio.create_task(render_loop(engine, mapper, sender, tracker, settings, wled_power))
 
     # Start WLED idle watchdog
     watchdog_task = asyncio.create_task(wled_power.watchdog_loop())
