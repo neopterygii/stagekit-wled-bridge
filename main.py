@@ -23,6 +23,7 @@ from protocol.wled_api import WLEDApi
 from effects.cue_engine import CueEngine
 from effects.mapper import LEDMapper
 from status_server import StatusTracker, StatusServer
+from settings import BridgeSettings
 
 
 class YARGProtocol(asyncio.DatagramProtocol):
@@ -146,10 +147,10 @@ class WLEDPowerManager:
                 self._power_off()
 
 
-async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender, tracker: StatusTracker):
+async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender,
+                      tracker: StatusTracker, settings: BridgeSettings):
     """Main render loop: reads cue engine state, maps to pixels, sends DDP."""
     interval = 1.0 / TARGET_FPS
-    brightness = GLOBAL_BRIGHTNESS / 255.0
     last_pixel_data = b''
     last_send_time = 0.0
     # WLED max timeout is 65000ms; resend well within that to prevent timeout
@@ -158,14 +159,15 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender, t
     print(f"Render loop started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → {WLED_HOST}:{WLED_DDP_PORT}")
 
     while True:
-        # Get current pixel data from zone bitmasks
-        pixel_data = mapper.render(engine.zones)
+        # Get current pixel data from zone bitmasks using active palette colors
+        pixel_data = mapper.render(engine.zones, zone_colors=settings.zone_colors)
 
         # Apply strobe
         if not engine.get_strobe_visible():
             pixel_data = b'\x00' * len(pixel_data)
 
-        # Apply global brightness
+        # Apply dynamic brightness from settings
+        brightness = settings.brightness / 255.0
         if brightness < 1.0:
             pixel_data = bytes(int(b * brightness) for b in pixel_data)
 
@@ -197,8 +199,9 @@ async def main():
     wled_api = WLEDApi(WLED_HOST)
     wled_power = WLEDPowerManager(wled_api, IDLE_TIMEOUT)
     tracker = StatusTracker()
+    settings = BridgeSettings()
     status_server = StatusServer(tracker, STATUS_HOST, STATUS_PORT, engine=engine,
-                                 wled_power=wled_power)
+                                 wled_power=wled_power, settings=settings)
 
     loop = asyncio.get_running_loop()
 
@@ -215,10 +218,10 @@ async def main():
     strobe_task = asyncio.create_task(engine.run_strobe())
 
     # Start status broadcast task
-    broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power))
+    broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power, settings=settings))
 
     # Start render loop
-    render_task = asyncio.create_task(render_loop(engine, mapper, sender, tracker))
+    render_task = asyncio.create_task(render_loop(engine, mapper, sender, tracker, settings))
 
     # Start WLED idle watchdog
     watchdog_task = asyncio.create_task(wled_power.watchdog_loop())

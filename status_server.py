@@ -81,7 +81,7 @@ class StatusTracker:
     def on_beat(self, beat: int):
         self.last_beat = beat
 
-    def snapshot(self, wled_power=None) -> dict:
+    def snapshot(self, wled_power=None, settings=None) -> dict:
         d = {
             "cue": self.current_cue_name,
             "cue_id": self.current_cue,
@@ -104,6 +104,8 @@ class StatusTracker:
         }
         if wled_power:
             d["wled_power"] = wled_power.power_snapshot()
+        if settings:
+            d["settings"] = settings.snapshot()
         return d
 
     def subscribe(self) -> asyncio.Queue:
@@ -115,10 +117,10 @@ class StatusTracker:
         if q in self._sse_queues:
             self._sse_queues.remove(q)
 
-    async def broadcast_loop(self, wled_power=None):
+    async def broadcast_loop(self, wled_power=None, settings=None):
         """Pushes snapshots to all SSE subscribers at ~10Hz."""
         while True:
-            data = self.snapshot(wled_power=wled_power)
+            data = self.snapshot(wled_power=wled_power, settings=settings)
             dead = []
             for q in self._sse_queues:
                 try:
@@ -236,6 +238,21 @@ STATUS_HTML = """\
     <div id="power-timer" style="font-size:0.8rem;color:var(--dim);margin-top:0.35rem;font-variant-numeric:tabular-nums"></div>
     <button class="test-btn" id="btn-power" onclick="togglePower()" style="margin-top:0.5rem;font-size:0.75rem">Toggle</button>
   </div>
+  <div class="card" id="brightness-card">
+    <div class="label">Brightness</div>
+    <div class="value" id="brightness-val">255</div>
+    <input type="range" id="brightness-slider" min="0" max="255" value="255" step="1"
+           style="width:100%;accent-color:var(--accent);margin-top:0.4rem">
+  </div>
+  <div class="card" id="palette-card">
+    <div class="label">Color Palette</div>
+    <select id="palette-select" style="width:100%;margin-top:0.5rem;padding:0.4rem;border-radius:6px;
+            border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.85rem;
+            font-family:inherit;cursor:pointer">
+      <option value="default">Default (RGBY)</option>
+    </select>
+    <div id="palette-preview" style="display:flex;gap:2px;margin-top:0.5rem;height:16px;border-radius:4px;overflow:hidden"></div>
+  </div>
 </div>
 
 <h3 style="margin-bottom:0.5rem">Zone Bitmasks</h3>
@@ -323,6 +340,66 @@ function addLog(msg) {
 function togglePower() {
   fetch('/api/power', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ action: 'toggle' }) });
+}
+
+// Brightness slider
+const brightnessSlider = document.getElementById('brightness-slider');
+const brightnessVal = document.getElementById('brightness-val');
+let brightnessDebounce = null;
+brightnessSlider.addEventListener('input', () => {
+  brightnessVal.textContent = brightnessSlider.value;
+  clearTimeout(brightnessDebounce);
+  brightnessDebounce = setTimeout(() => {
+    fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify({ brightness: parseInt(brightnessSlider.value) }) });
+  }, 100);
+});
+
+// Palette select
+const paletteSelect = document.getElementById('palette-select');
+let palettesPopulated = false;
+paletteSelect.addEventListener('change', () => {
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ palette: paletteSelect.value }) });
+});
+
+function updatePalettePreview(colors) {
+  const preview = document.getElementById('palette-preview');
+  preview.innerHTML = '';
+  if (!colors) return;
+  for (const [name, rgb] of Object.entries(colors)) {
+    const swatch = document.createElement('div');
+    swatch.style.cssText = 'flex:1;background:rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
+    swatch.title = name;
+    preview.appendChild(swatch);
+  }
+}
+
+function updateSettings(s) {
+  if (!s) return;
+  // Sync brightness slider if not actively dragging
+  if (document.activeElement !== brightnessSlider) {
+    brightnessSlider.value = s.brightness;
+    brightnessVal.textContent = s.brightness;
+  }
+  // Populate palette dropdown once
+  if (!palettesPopulated && s.palettes) {
+    paletteSelect.innerHTML = '';
+    for (const [key, label] of Object.entries(s.palettes)) {
+      const opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = label;
+      paletteSelect.appendChild(opt);
+    }
+    palettesPopulated = true;
+  }
+  if (paletteSelect.value !== s.palette) {
+    paletteSelect.value = s.palette;
+  }
+  // Update color preview from palette colors
+  if (s.colors) {
+    updatePalettePreview(s.colors);
+  }
 }
 
 function fmtTime(s) {
@@ -445,6 +522,9 @@ function update(d) {
 
   // Update WLED power info
   updatePower(d.wled_power);
+
+  // Update settings (brightness, palette)
+  updateSettings(d.settings);
 }
 
 initZones();
@@ -465,12 +545,13 @@ class StatusServer:
     """Async HTTP server serving the status page, SSE stream, and test controls."""
 
     def __init__(self, tracker: StatusTracker, host: str = "0.0.0.0", port: int = 8080,
-                 engine=None, wled_power=None):
+                 engine=None, wled_power=None, settings=None):
         self.tracker = tracker
         self.host = host
         self.port = port
         self.engine = engine
         self.wled_power = wled_power
+        self.settings = settings
         self._beat_task: asyncio.Task | None = None
 
     async def start(self):
@@ -571,6 +652,28 @@ class StatusServer:
             return 200, f"WLED powered {'off' if is_on else 'on'}"
         return 400, f"Unknown power action: {action}"
 
+    def _handle_settings_action(self, body: dict) -> tuple[int, str]:
+        """Process a settings update request."""
+        if self.settings is None:
+            return 500, "Settings not connected"
+        changed = []
+        if "brightness" in body:
+            try:
+                self.settings.brightness = int(body["brightness"])
+                changed.append(f"brightness={self.settings.brightness}")
+            except (ValueError, TypeError):
+                return 400, "Invalid brightness value"
+        if "palette" in body:
+            old = self.settings.palette_name
+            self.settings.palette_name = str(body["palette"])
+            if self.settings.palette_name != old:
+                changed.append(f"palette={self.settings.palette_name}")
+            elif str(body["palette"]) != old:
+                return 400, f"Unknown palette: {body['palette']}"
+        if not changed:
+            return 400, "No valid settings provided"
+        return 200, "Updated: " + ", ".join(changed)
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -620,6 +723,20 @@ class StatusServer:
                 status, msg = self._handle_power_action(req_body)
                 resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
                 await self._send_response(writer, status, 'application/json', resp)
+            elif path == '/api/settings' and method == 'POST':
+                raw = b''
+                if content_length > 0:
+                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
+                try:
+                    req_body = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, ValueError):
+                    req_body = {}
+                status, msg = self._handle_settings_action(req_body)
+                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
+                await self._send_response(writer, status, 'application/json', resp)
+            elif path == '/api/settings' and method == 'GET':
+                body = json.dumps(self.settings.snapshot() if self.settings else {}).encode()
+                await self._send_response(writer, 200, 'application/json', body)
             else:
                 await self._send_response(writer, 404, 'text/plain', b'Not Found')
         except (asyncio.TimeoutError, ConnectionError, BrokenPipeError):
