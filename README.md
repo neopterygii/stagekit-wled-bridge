@@ -279,6 +279,11 @@ Built for and tested with:
 - **Controller:** ESP32 running WLED 0.14.4 "Hoshi"
 - **Protocol:** DDP over WiFi (UDP port 4048)
 
+## Acknowledgments
+
+- **YARG icon** from [YARC-Official/OpenSource](https://github.com/YARC-Official/OpenSource) — public domain ([Unlicense](https://github.com/YARC-Official/OpenSource/blob/master/LICENSE))
+- **YARG** (Yet Another Rhythm Game) — [yarg.in](https://yarg.in/)
+
 ## License
 
 MIT

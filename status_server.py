@@ -146,6 +146,7 @@ STATUS_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stage Kit Bridge</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
 <style>
   :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3;
           --dim: #8b949e; --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
@@ -169,7 +170,9 @@ STATUS_HTML = """\
   .led { width: 28px; height: 28px; border-radius: 4px; border: 1px solid var(--border);
          transition: background 0.08s; }
   .zone-section { margin-bottom: 0.75rem; }
-  .zone-label { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; margin-bottom: 4px; }
+  .zone-label { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; margin-bottom: 4px;
+               display: flex; align-items: center; gap: 6px; }
+  .zone-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
 
   .log { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
          padding: 0.75rem; max-height: 300px; overflow-y: auto; font-family: 'SF Mono', Monaco,
@@ -210,7 +213,7 @@ STATUS_HTML = """\
 </style>
 </head>
 <body>
-<h1>&#127911; Stage Kit Bridge <span class="test-indicator off" id="test-badge">TEST MODE</span></h1>
+<h1><img src="data:image/png;base64,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" alt="YARG" style="width:24px;height:24px;vertical-align:middle;margin-right:6px"> Stage Kit Bridge <span class="test-indicator off" id="test-badge">TEST MODE</span></h1>
 
 <div class="grid">
   <div class="card">
@@ -335,12 +338,14 @@ function updateZoneColors(colors) {
       ZONE_COLORS[name] = rgbToHex(colors[name][0], colors[name][1], colors[name][2]);
     }
   }
-  // Update zone label colors to match
+  // Update zone swatches to match palette
   document.querySelectorAll('.zone-section').forEach(sec => {
     const label = sec.querySelector('.zone-label');
-    if (label) {
-      const name = label.textContent.trim().toLowerCase();
-      if (ZONE_COLORS[name]) label.style.color = ZONE_COLORS[name];
+    if (!label) return;
+    const zone = label.dataset.zone;
+    if (zone && ZONE_COLORS[zone]) {
+      const swatch = label.querySelector('.zone-swatch');
+      if (swatch) swatch.style.background = ZONE_COLORS[zone];
     }
   });
 }
@@ -350,7 +355,8 @@ function initZones() {
   for (const name of ['red','green','blue','yellow']) {
     const sec = document.createElement('div');
     sec.className = 'zone-section';
-    sec.innerHTML = '<div class="zone-label">' + name + '</div><div class="led-row" id="zone-' + name + '"></div>';
+    const idx = ZONE_NAMES.indexOf(name) + 1;
+    sec.innerHTML = '<div class="zone-label" data-zone="' + name + '"><span class="zone-swatch" style="background:' + ZONE_COLORS[name] + '"></span>Zone ' + idx + '</div><div class="led-row" id="zone-' + name + '"></div>';
     const row = sec.querySelector('.led-row');
     for (let i = 0; i < 8; i++) {
       const led = document.createElement('div');
