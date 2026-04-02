@@ -3,11 +3,16 @@
 Listens for YARG UDP lighting packets, runs the Stage Kit cue engine,
 renders 120 pixels, and sends them to WLED via DDP.
 Automatically turns WLED on/off based on YARG activity.
+
+The render loop runs on a dedicated thread (isolated from the asyncio
+event loop) with adaptive perf_counter timing — inspired by LedFx's
+Virtual.thread_function pattern.
 """
 
 import asyncio
 import signal
 import sys
+import threading
 import time
 
 from config import (
@@ -151,71 +156,150 @@ class WLEDPowerManager:
                 self._power_off()
 
 
-async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender,
-                      tracker: StatusTracker, settings: BridgeSettings,
-                      wled_power: 'WLEDPowerManager'):
-    """Main render loop: reads cue engine state, maps to pixels, sends DDP.
+class RenderThread(threading.Thread):
+    """Dedicated render thread — completely isolated from the asyncio event loop.
 
-    Uses adaptive timing (perf_counter compensation) to minimise frame jitter.
-    Skips DDP sends entirely when WLED is powered off to avoid unnecessary
-    network traffic and let WLED run its own effects when idle.
+    Reads engine state, runs the mapper, sends DDP packets, all on its own
+    OS thread with time.sleep() + perf_counter adaptive timing.  This
+    eliminates event-loop contention from SSE broadcasts, HTTP handlers,
+    strobe toggles, and beat-pattern coroutines.
+
+    Communication with the asyncio world:
+      - engine.zones / engine.get_effects() are read directly (list/dict
+        copies are naturally atomic for CPython due to the GIL)
+      - settings.brightness / settings.zone_colors go through BridgeSettings'
+        own threading.Lock
+      - wled_power.is_on is a simple bool read (GIL-safe)
+      - tracker.on_render() writes to plain ints (GIL-safe)
     """
-    interval = 1.0 / TARGET_FPS
-    last_pixel_data = b''
-    last_send_time = 0.0
-    # WLED max timeout is 65000ms; resend well within that to prevent timeout
-    KEEPALIVE_INTERVAL = 50.0
 
-    print(f"Render loop started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → {WLED_HOST}:{WLED_DDP_PORT}")
+    def __init__(self, engine: CueEngine, mapper: LEDMapper, sender: DDPSender,
+                 tracker: StatusTracker, settings: BridgeSettings,
+                 wled_power: 'WLEDPowerManager'):
+        super().__init__(name="render", daemon=True)
+        self._engine = engine
+        self._mapper = mapper
+        self._sender = sender
+        self._tracker = tracker
+        self._settings = settings
+        self._wled_power = wled_power
+        self._active = False
 
-    next_frame = time.perf_counter()
+        # Timing
+        self._interval = 1.0 / TARGET_FPS
+        self._keepalive = 50.0  # seconds — well under WLED's 65s DDP timeout
 
-    while True:
-        next_frame += interval
-        frame_start = time.perf_counter()
+        # Frame-skip tracking
+        self._frames_rendered = 0
+        self._frames_skipped = 0
 
-        # Get current effects config (consumes and clears transient flags)
-        effects = engine.get_effects()
+        # Rolling jitter stats (last N frames)
+        self._STATS_WINDOW = 200
+        self._jitters: list[float] = []
 
-        # Get current pixel data from zone bitmasks using active palette colors
-        pixel_data = mapper.render(engine.zones, zone_colors=settings.zone_colors,
-                                   effects=effects)
+        # Strobe black frame (pre-allocated, never changes)
+        self._black = b'\x00' * (LED_COUNT * 3)
 
-        # Apply strobe
-        if not engine.get_strobe_visible():
-            pixel_data = b'\x00' * len(pixel_data)
+        # Cached palette colours — refreshed when palette name changes
+        self._cached_palette = ""
+        self._cached_colors: dict = {}
 
-        # Apply dynamic brightness from settings
-        brightness = settings.brightness / 255.0
-        if brightness < 1.0:
-            pixel_data = bytes(int(b * brightness) for b in pixel_data)
+    def run(self):
+        self._active = True
+        last_pixel_data = b''
+        last_send_time = 0.0
+        interval = self._interval
+        skip_threshold = interval * 2.0
 
-        # Only send DDP when WLED is powered on
-        if wled_power.is_on:
-            # Send if frame changed OR keepalive interval elapsed
-            now = time.monotonic()
-            if pixel_data != last_pixel_data or (now - last_send_time) >= KEEPALIVE_INTERVAL:
-                sender.send_pixels(pixel_data)
-                last_pixel_data = pixel_data
-                last_send_time = now
-        else:
-            # Reset so we send immediately when WLED powers back on
-            last_pixel_data = b''
+        print(f"Render thread started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → "
+              f"{WLED_HOST}:{WLED_DDP_PORT}")
 
-        tracker.on_render(engine.zones, engine.strobe_rate, engine.bpm)
+        next_frame = time.perf_counter()
 
-        # Adaptive sleep: subtract elapsed work time from the target interval.
-        # If we overshot (e.g. event loop contention), next_frame is already
-        # in the past, so we clamp to a short sleep to yield the event loop
-        # without accumulating drift — the next iteration's next_frame will
-        # naturally catch up.
-        sleep_time = next_frame - time.perf_counter()
-        if sleep_time < 0:
-            # We're behind — reset deadline so we don't try to "catch up" by
-            # rapid-firing frames, which would look worse than dropping one.
-            next_frame = time.perf_counter()
-            sleep_time = 0.001
-        await asyncio.sleep(sleep_time)
+        while self._active:
+            next_frame += interval
+            frame_start = time.perf_counter()
+
+            # Frame-skip detection: if we're >2 frame periods behind,
+            # drop this frame and reset the deadline
+            drift = frame_start - (next_frame - interval)
+            if drift > skip_threshold:
+                self._frames_skipped += 1
+                next_frame = time.perf_counter() + interval
+                time.sleep(0.001)
+                continue
+
+            # Cache zone colours — only re-read when palette changes
+            palette_name = self._settings.palette_name
+            if palette_name != self._cached_palette:
+                self._cached_colors = self._settings.zone_colors
+                self._cached_palette = palette_name
+
+            # Get effects (consumes and clears transient flags)
+            effects = self._engine.get_effects()
+
+            # Brightness baked into mapper output (Phase 2)
+            brightness = self._settings.brightness / 255.0
+
+            # Render pixels
+            pixel_data = self._mapper.render(
+                self._engine.zones,
+                zone_colors=self._cached_colors,
+                effects=effects,
+                brightness=brightness,
+            )
+
+            # Apply strobe (replace with pre-allocated black)
+            if not self._engine.get_strobe_visible():
+                pixel_data = self._black
+
+            # Send DDP only when WLED is powered on
+            if self._wled_power.is_on:
+                now = time.monotonic()
+                if pixel_data != last_pixel_data or (now - last_send_time) >= self._keepalive:
+                    self._sender.send_pixels(pixel_data)
+                    last_pixel_data = pixel_data
+                    last_send_time = now
+            else:
+                last_pixel_data = b''
+
+            self._tracker.on_render(self._engine.zones,
+                                    self._engine.strobe_rate,
+                                    self._engine.bpm)
+            self._frames_rendered += 1
+
+            # Rolling work-time stats
+            work_ms = (time.perf_counter() - frame_start) * 1000.0
+            if len(self._jitters) >= self._STATS_WINDOW:
+                self._jitters[self._frames_rendered % self._STATS_WINDOW] = work_ms
+            else:
+                self._jitters.append(work_ms)
+
+            # Adaptive sleep: subtract elapsed work from target interval
+            sleep_time = next_frame - time.perf_counter()
+            if sleep_time < 0:
+                next_frame = time.perf_counter()
+                sleep_time = 0.001
+            time.sleep(sleep_time)
+
+        print("Render thread stopped")
+
+    def stop(self):
+        self._active = False
+
+    def render_stats(self) -> dict:
+        """Rolling timing stats for diagnostics / status page."""
+        jitters = self._jitters
+        if not jitters:
+            return {"fps": 0, "rendered": 0, "skipped": 0,
+                    "work_ms_avg": 0.0, "work_ms_max": 0.0}
+        return {
+            "fps": TARGET_FPS,
+            "rendered": self._frames_rendered,
+            "skipped": self._frames_skipped,
+            "work_ms_avg": round(sum(jitters) / len(jitters), 2),
+            "work_ms_max": round(max(jitters), 2),
+        }
 
 
 async def main():
@@ -256,8 +340,9 @@ async def main():
     # Start status broadcast task
     broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power, settings=settings))
 
-    # Start render loop
-    render_task = asyncio.create_task(render_loop(engine, mapper, sender, tracker, settings, wled_power))
+    # Start render thread (Phase 3: isolated from asyncio event loop)
+    render_thread = RenderThread(engine, mapper, sender, tracker, settings, wled_power)
+    render_thread.start()
 
     # Start WLED idle watchdog
     watchdog_task = asyncio.create_task(wled_power.watchdog_loop())
@@ -275,7 +360,8 @@ async def main():
     await stop.wait()
 
     # Cleanup
-    render_task.cancel()
+    render_thread.stop()
+    render_thread.join(timeout=2.0)
     strobe_task.cancel()
     broadcast_task.cancel()
     watchdog_task.cancel()
