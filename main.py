@@ -159,8 +159,12 @@ async def render_loop(engine: CueEngine, mapper: LEDMapper, sender: DDPSender,
     print(f"Render loop started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → {WLED_HOST}:{WLED_DDP_PORT}")
 
     while True:
+        # Get current effects config (consumes and clears transient flags)
+        effects = engine.get_effects()
+
         # Get current pixel data from zone bitmasks using active palette colors
-        pixel_data = mapper.render(engine.zones, zone_colors=settings.zone_colors)
+        pixel_data = mapper.render(engine.zones, zone_colors=settings.zone_colors,
+                                   effects=effects)
 
         # Apply strobe
         if not engine.get_strobe_visible():

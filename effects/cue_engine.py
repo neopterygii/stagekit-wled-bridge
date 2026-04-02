@@ -1,9 +1,11 @@
-"""Stage Kit cue engine.
+"""Stage Kit cue engine with per-pixel effects.
 
-Translates YARG lighting cues + beat events into per-zone bitmask state,
-mirroring YALCY's StageKitTalker behavior. Each cue launches one or more
-pattern primitives (beat-synced loops, listen-triggered patterns, etc.)
-that set zone bitmask values over time.
+Translates YARG lighting cues + beat events into per-zone bitmask state
+and an effects configuration dict that the mapper uses for per-pixel
+post-processing (decay trails, breathing, sparkle, etc.).
+
+Based on YALCY's StageKitTalker behavior, enhanced with LedFx/WLED-inspired
+effects for a modern LED strip look.
 """
 
 import asyncio
@@ -40,11 +42,14 @@ STROBE_RATES = {
 
 
 class CueEngine:
-    """Manages active lighting cue and produces zone bitmask state."""
+    """Manages active lighting cue and produces zone bitmask state + effects."""
 
     def __init__(self):
         # Current zone bitmasks [red, green, blue, yellow]
         self.zones = [NONE, NONE, NONE, NONE]
+
+        # Effects config dict consumed by the mapper each frame
+        self.effects: dict = {}
 
         # Strobe state
         self.strobe_rate = 0  # Hz, 0 = off
@@ -66,11 +71,32 @@ class CueEngine:
         # Current cue ID
         self._current_cue = CueByte.NO_CUE
 
+        # Frame-level flags (set per-beat, consumed by mapper, cleared by engine)
+        self._beat_flash = False
+        self._glitch_trigger = False
+        self._initial_flash_frames = 0
+
     def get_strobe_visible(self) -> bool:
         """Returns whether pixels should be visible (considering strobe)."""
         if self.strobe_rate == 0:
             return True
         return self._strobe_on
+
+    def get_effects(self) -> dict:
+        """Return current effects dict with transient flags, then clear them."""
+        fx = dict(self.effects)
+        fx["bpm"] = self.bpm
+        fx["beat_flash"] = self._beat_flash
+        fx["glitch_trigger"] = self._glitch_trigger
+        fx["initial_flash"] = self._initial_flash_frames
+
+        # Clear transient flags after consumption
+        self._beat_flash = False
+        self._glitch_trigger = False
+        if self._initial_flash_frames > 0:
+            self._initial_flash_frames -= 1
+
+        return fx
 
     async def run_strobe(self):
         """Background task that toggles strobe phase."""
@@ -88,6 +114,10 @@ class CueEngine:
         self._last_beat_type = beat_type
         if beat_type != BeatByte.OFF:
             self._beat_event.set()
+            # Set transient flags for sparkle/glitch effects
+            if beat_type in (BeatByte.MEASURE, BeatByte.STRONG):
+                self._beat_flash = True
+                self._glitch_trigger = True
 
     def on_keyframe(self, keyframe_type: int):
         """Called when a keyframe event arrives from YARG."""
@@ -120,44 +150,58 @@ class CueEngine:
         """Set a zone's bitmask."""
         self.zones[zone] = mask
 
+    def _set_effects(self, **kwargs):
+        """Set the effects dict for the current cue."""
+        self.effects = dict(kwargs)
+
     def _launch_cue(self, cue: int):
         """Launch the appropriate pattern primitives for a cue.
 
-        Patterns match YALCY's StageKitTalker definitions (large venue variant).
-        BRE and Frenzy use smooth rotating chase instead of YALCY's ALL/NONE
-        flash to avoid seizure-inducing strobing on a full LED strip.
-        Stomp uses keyframe-triggered chase instead of ALL/NONE toggle for
-        the same reason.
+        Each cue sets both zone bitmask patterns and an effects configuration
+        that tells the mapper how to render the pixels. Effects include:
+          - trails: decay trail length in frames
+          - breathing: sine breathing rate (fraction of BPM)
+          - sparkle: random white pixel density 0.0-1.0
+          - sparkle_continuous: sparkle every frame vs beat-triggered
+          - additive: use additive color blending for overlapping zones
+          - glitch: probability of per-cell color inversion on beat
+          - initial_flash: frames of white flash on cue activation
         """
-        # Reset all zones
+        # Reset all zones and effects
         for i in range(4):
             self.zones[i] = NONE
+        self.effects = {}
+        self._initial_flash_frames = 0
 
         if cue == CueByte.NO_CUE or cue == CueByte.BLACKOUT_FAST or \
            cue == CueByte.BLACKOUT_SLOW or cue == CueByte.BLACKOUT_SPOTLIGHT:
             return  # All off
 
         elif cue == CueByte.DEFAULT:
-            # YALCY large: Blue/Red ALL toggle on KeyframeNext
-            # We use a 2-color chase instead of ALL/NONE toggle
+            # Blue/Red ALL toggle on KeyframeNext
+            # Additive blending so overlap shows purple
+            self._set_effects(additive=True, trails=6)
             self._start_listen_pattern(BLUE, [ALL, NONE], listen="keyframe")
             self._start_listen_pattern(RED, [NONE, ALL], listen="keyframe")
 
         elif cue == CueByte.VERSE:
-            # Not in YALCY — blue chase as ambient verse lighting
-            self._start_beat_pattern(BLUE, [
-                ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
-            ], cycles_per_beat=0.25)
+            # Ambient breathing wash — "settle in" moment
+            # Full blue wash with slow sine breathing like WLED Breathe
+            self._set_effects(breathing=0.25, trails=10)
+            self._set_zone(BLUE, ALL)
 
         elif cue == CueByte.CHORUS:
-            # Not in YALCY — energetic red+yellow
+            # Peak energy — BPM-synced chase with beat sparkles
+            # Red chase + yellow solid base + sparkle on downbeats
+            self._set_effects(trails=5, sparkle=0.10)
             self._start_beat_pattern(RED, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
             self._set_zone(YELLOW, ALL)
 
         elif cue == CueByte.WARM_MANUAL:
-            # YALCY: same patterns as LoopWarm (Warm Automatic)
+            # Warm mood — smooth scanner trails
+            self._set_effects(trails=8)
             self._start_beat_pattern(RED, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
@@ -166,7 +210,8 @@ class CueEngine:
             ], cycles_per_beat=0.125)
 
         elif cue == CueByte.COOL_MANUAL:
-            # YALCY: same patterns as LoopCool (Cool Automatic)
+            # Cool mood — smooth scanner trails
+            self._set_effects(trails=8)
             self._start_beat_pattern(BLUE, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
@@ -175,7 +220,8 @@ class CueEngine:
             ], cycles_per_beat=0.125)
 
         elif cue == CueByte.WARM_AUTOMATIC:
-            # YALCY: Red opposing-pair chase + Yellow CCW single
+            # Red opposing-pair chase + Yellow CCW accent with scanner trails
+            self._set_effects(trails=8)
             self._start_beat_pattern(RED, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
@@ -184,7 +230,8 @@ class CueEngine:
             ], cycles_per_beat=0.125)
 
         elif cue == CueByte.COOL_AUTOMATIC:
-            # YALCY: Blue opposing-pair chase + Green CCW single
+            # Blue opposing-pair chase + Green CCW accent with scanner trails
+            self._set_effects(trails=8)
             self._start_beat_pattern(BLUE, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
@@ -193,19 +240,24 @@ class CueEngine:
             ], cycles_per_beat=0.125)
 
         elif cue == CueByte.BIG_ROCK_ENDING:
-            # YALCY: 4 zones flash ALL/NONE in sequence (seizure risk)
-            # We use 4-color rotating chase — strip always fully lit
+            # Chaotic climax — fast rotating chase + beat sparkles
+            # 4-color rotating chase with 10% sparkle on downbeats
+            self._set_effects(trails=4, sparkle=0.10)
             self._start_multi_zone_chase([RED, GREEN, BLUE, YELLOW],
                                          bits_per_zone=2, cycles_per_beat=0.5)
 
         elif cue == CueByte.FRENZY:
-            # YALCY large: Red/Blue/Yellow flash ALL/NONE (seizure risk)
-            # We use 3-color rotating chase — strip always fully lit
+            # Barely controlled chaos — fast chase + dense sparkles +
+            # random direction reversals
+            self._set_effects(trails=3, sparkle=0.20)
             self._start_multi_zone_chase([RED, BLUE, YELLOW],
-                                         bits_per_zone=2, cycles_per_beat=0.5)
+                                         bits_per_zone=2, cycles_per_beat=1.0,
+                                         reverse_on_beat=True)
 
         elif cue == CueByte.SEARCHLIGHTS:
-            # YALCY large: Yellow CW + Blue CCW single-bit, 0.5 cpb
+            # Searchlight beams — single-bit chase with comet trails
+            # Yellow CW + Blue CCW, long trailing decay
+            self._set_effects(trails=12, additive=True)
             self._start_beat_pattern(YELLOW, [
                 TWO, THREE, FOUR, FIVE, SIX, SEVEN, ZERO, ONE,
             ], cycles_per_beat=0.5)
@@ -214,13 +266,16 @@ class CueEngine:
             ], cycles_per_beat=0.5)
 
         elif cue == CueByte.SWEEP:
-            # YALCY large: Red opposing-pair sweep
+            # Smooth red sweep with trailing decay
+            self._set_effects(trails=10)
             self._start_beat_pattern(RED, [
                 SIX | TWO, FIVE | ONE, FOUR | ZERO, THREE | SEVEN,
             ], cycles_per_beat=0.25)
 
         elif cue == CueByte.HARMONY:
-            # YALCY large: Yellow + Red counter-rotating single-bit
+            # Blending counter-rotation — additive overlap = color mixing
+            # Yellow + Red counter-rotating with additive blend and trails
+            self._set_effects(trails=10, additive=True)
             self._start_beat_pattern(YELLOW, [
                 THREE, TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR,
             ], cycles_per_beat=0.125)
@@ -229,34 +284,39 @@ class CueEngine:
             ], cycles_per_beat=0.125)
 
         elif cue == CueByte.FLARE_SLOW:
-            # YALCY: ALL on every zone (static bright)
+            # Explosion settling into gentle pulse — initial white flash
+            # then all 4 zones breathing slowly
+            self._set_effects(breathing=0.10)
+            self._initial_flash_frames = 4
             for i in range(4):
                 self.zones[i] = ALL
 
         elif cue == CueByte.FLARE_FAST:
-            # YALCY: Blue ALL static. Green ALL if prev was cool cue.
-            # We always set Blue ALL (no previous-cue tracking yet).
+            # Quick blue flare with faster breathing
+            self._set_effects(breathing=0.5)
+            self._initial_flash_frames = 3
             self._set_zone(BLUE, ALL)
 
         elif cue == CueByte.SILHOUETTES:
-            # YALCY: Green ALL (others off)
+            # Slow ambient green breathing
+            self._set_effects(breathing=0.05)
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.SILHOUETTES_SPOTLIGHT:
-            # YALCY: complex context-dependent. Simplified to green ambient.
+            # Slightly faster green breathing for spotlight variant
+            self._set_effects(breathing=0.08)
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.STOMP:
-            # YALCY: R+G+Y ALL toggle on KeyframeNext (seizure risk)
-            # We use multi-zone chase triggered by keyframe instead
+            # Percussive hits — keyframe-triggered chase + beat flash overlay
+            self._set_effects(trails=4, sparkle=0.15)
             self._start_multi_zone_chase([RED, GREEN, YELLOW],
                                          bits_per_zone=2, cycles_per_beat=0.25,
                                          listen="keyframe")
 
         elif cue == CueByte.DISCHORD:
-            # YALCY large: Yellow CW beat-triggered + Green CCW spinning +
-            # Blue pattern switching + Red drum flash.
-            # Simplified: Yellow + Green counter-rotating chases
+            # Tension/chaos — counter-rotating chases + random glitches
+            self._set_effects(trails=6, glitch=0.25)
             self._start_beat_pattern(YELLOW, [
                 ZERO, ONE, TWO, THREE, FOUR, FIVE, SIX, SEVEN,
             ], cycles_per_beat=0.125, listen="beat_any")
@@ -266,17 +326,20 @@ class CueEngine:
             self._set_zone(BLUE, TWO | SIX)
 
         elif cue == CueByte.INTRO:
-            # YALCY: Green ALL only
+            # Green ambient breathing (same as Silhouettes but distinct cue)
+            self._set_effects(breathing=0.05)
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.MENU:
-            # YALCY: Blue single-bit chase, TimedPattern 2.0s (not BPM)
+            # Polished idle — blue scanner with long comet trail
+            self._set_effects(trails=14)
             self._start_timed_pattern(BLUE, [
                 ZERO, ONE, TWO, THREE, FOUR, FIVE, SIX, SEVEN,
             ], seconds=2.0)
 
         elif cue == CueByte.SCORE:
-            # YALCY large: Red opposing-pair + Yellow opposing-pair, timed
+            # Victory celebration — timed chase + continuous confetti sparkle
+            self._set_effects(trails=6, sparkle=0.05, sparkle_continuous=True)
             self._start_timed_pattern(RED, [
                 SIX | TWO, ONE | FIVE, ZERO | FOUR, SEVEN | THREE,
             ], seconds=1.0)
@@ -286,12 +349,7 @@ class CueEngine:
 
     def _start_beat_pattern(self, zone: int, pattern: list[int],
                             cycles_per_beat: float, listen: str | None = None):
-        """Launch a beat-synced pattern loop on a zone.
-
-        Args:
-            listen: If "beat_any", advance on any beat (Measure or Strong)
-                    instead of timed intervals.
-        """
+        """Launch a beat-synced pattern loop on a zone."""
         task = asyncio.ensure_future(
             self._run_beat_pattern(zone, pattern, cycles_per_beat, listen)
         )
@@ -307,7 +365,6 @@ class CueEngine:
                 idx = (idx + 1) % len(pattern)
 
                 if listen == "beat_any":
-                    # Advance on Measure or Strong beats
                     while True:
                         await self._beat_event.wait()
                         self._beat_event.clear()
@@ -341,23 +398,19 @@ class CueEngine:
             pass
 
     def _start_multi_zone_chase(self, zone_order: list[int], bits_per_zone: int,
-                                 cycles_per_beat: float, listen: str | None = None):
+                                 cycles_per_beat: float, listen: str | None = None,
+                                 reverse_on_beat: bool = False):
         """Launch a rotating multi-zone chase where all zones fill the strip.
 
-        Divides the 8 bits into segments assigned to each zone, then rotates
-        the assignment so colors chase around the strip. Strip is always fully
-        lit — no flashing.
-
         Args:
-            zone_order: List of zone indices to use (e.g. [RED, BLUE] for 2-color).
-            bits_per_zone: How many consecutive bits per zone (8 / len(zone_order)).
-            cycles_per_beat: How many full rotations per beat.
-            listen: If "beat_major", advance on major beats. If "keyframe",
-                    advance on KeyframeNext events.
+            zone_order: Zone indices to use.
+            bits_per_zone: Consecutive bits per zone.
+            cycles_per_beat: Full rotations per beat.
+            listen: Event trigger mode.
+            reverse_on_beat: If True, randomly reverse direction on every 4th beat.
         """
-        # Build rotation frames: 8 steps, shifting by 1 bit each step
         num_zones = len(zone_order)
-        bit_values = [1 << i for i in range(8)]  # ZERO through SEVEN
+        bit_values = [1 << i for i in range(8)]
         frames = []
         for shift in range(8):
             masks = {z: 0 for z in zone_order}
@@ -367,15 +420,19 @@ class CueEngine:
             frames.append(masks)
 
         task = asyncio.ensure_future(
-            self._run_multi_zone_chase(zone_order, frames, cycles_per_beat, listen)
+            self._run_multi_zone_chase(zone_order, frames, cycles_per_beat,
+                                       listen, reverse_on_beat)
         )
         self._active_tasks.append(task)
 
     async def _run_multi_zone_chase(self, zone_order: list[int], frames: list[dict],
-                                     cycles_per_beat: float, listen: str | None):
+                                     cycles_per_beat: float, listen: str | None,
+                                     reverse_on_beat: bool):
         """Run the multi-zone rotating chase."""
         idx = 0
-        # Clear unused zones
+        direction = 1
+        beat_count = 0
+
         used = set(zone_order)
         for z in range(4):
             if z not in used:
@@ -386,7 +443,7 @@ class CueEngine:
                 frame = frames[idx]
                 for zone, mask in frame.items():
                     self.zones[zone] = mask
-                idx = (idx + 1) % len(frames)
+                idx = (idx + direction) % len(frames)
 
                 if listen == "beat_major":
                     await self._beat_event.wait()
@@ -402,6 +459,12 @@ class CueEngine:
                     steps_per_beat = len(frames) * cycles_per_beat
                     bpm = self.bpm if self.bpm > 0 else 120.0
                     await asyncio.sleep(60.0 / bpm / steps_per_beat)
+
+                # Random direction reversal for Frenzy-style chaos
+                if reverse_on_beat:
+                    beat_count += 1
+                    if beat_count % 4 == 0:
+                        direction = -direction
         except asyncio.CancelledError:
             pass
 

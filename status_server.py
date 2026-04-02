@@ -18,23 +18,27 @@ _CUE_NAMES = {v: k for k, v in vars(CueByte).items() if isinstance(v, int)}
 
 # Test patterns available from the web UI
 TEST_PATTERNS = {
+    "default": CueByte.DEFAULT,
+    "verse": CueByte.VERSE,
+    "chorus": CueByte.CHORUS,
+    "intro": CueByte.INTRO,
     "warm_automatic": CueByte.WARM_AUTOMATIC,
+    "warm_manual": CueByte.WARM_MANUAL,
     "cool_automatic": CueByte.COOL_AUTOMATIC,
+    "cool_manual": CueByte.COOL_MANUAL,
     "big_rock_ending": CueByte.BIG_ROCK_ENDING,
     "frenzy": CueByte.FRENZY,
     "searchlights": CueByte.SEARCHLIGHTS,
     "sweep": CueByte.SWEEP,
     "harmony": CueByte.HARMONY,
-    "chorus": CueByte.CHORUS,
-    "verse": CueByte.VERSE,
-    "intro": CueByte.INTRO,
     "dischord": CueByte.DISCHORD,
     "stomp": CueByte.STOMP,
-    "menu": CueByte.MENU,
-    "score": CueByte.SCORE,
     "flare_slow": CueByte.FLARE_SLOW,
     "flare_fast": CueByte.FLARE_FAST,
     "silhouettes": CueByte.SILHOUETTES,
+    "silhouettes_spotlight": CueByte.SILHOUETTES_SPOTLIGHT,
+    "menu": CueByte.MENU,
+    "score": CueByte.SCORE,
 }
 
 
@@ -240,9 +244,13 @@ STATUS_HTML = """\
   </div>
   <div class="card" id="brightness-card">
     <div class="label">Brightness</div>
-    <div class="value" id="brightness-val">255</div>
-    <input type="range" id="brightness-slider" min="0" max="255" value="255" step="1"
-           style="width:100%;accent-color:var(--accent);margin-top:0.4rem">
+    <div class="value" id="brightness-pct">100%</div>
+    <div class="btn-grid" id="brightness-btns" style="margin-top:0.4rem">
+      <button class="test-btn" data-brightness="25" onclick="setBrightness(25)">25%</button>
+      <button class="test-btn" data-brightness="50" onclick="setBrightness(50)">50%</button>
+      <button class="test-btn" data-brightness="75" onclick="setBrightness(75)">75%</button>
+      <button class="test-btn active" data-brightness="100" onclick="setBrightness(100)">100%</button>
+    </div>
   </div>
   <div class="card" id="palette-card">
     <div class="label">Color Palette</div>
@@ -262,23 +270,27 @@ STATUS_HTML = """\
 <div class="test-panel">
   <div class="section-label">Cues</div>
   <div class="btn-grid" id="cue-btns">
+    <button class="test-btn" data-pattern="default">Default</button>
+    <button class="test-btn" data-pattern="verse">Verse</button>
+    <button class="test-btn" data-pattern="chorus">Chorus</button>
+    <button class="test-btn" data-pattern="intro">Intro</button>
     <button class="test-btn" data-pattern="warm_automatic">Warm Auto</button>
+    <button class="test-btn" data-pattern="warm_manual">Warm Manual</button>
     <button class="test-btn" data-pattern="cool_automatic">Cool Auto</button>
+    <button class="test-btn" data-pattern="cool_manual">Cool Manual</button>
     <button class="test-btn" data-pattern="big_rock_ending">Big Rock Ending</button>
     <button class="test-btn" data-pattern="frenzy">Frenzy</button>
     <button class="test-btn" data-pattern="searchlights">Searchlights</button>
     <button class="test-btn" data-pattern="sweep">Sweep</button>
     <button class="test-btn" data-pattern="harmony">Harmony</button>
-    <button class="test-btn" data-pattern="chorus">Chorus</button>
-    <button class="test-btn" data-pattern="verse">Verse</button>
-    <button class="test-btn" data-pattern="intro">Intro</button>
     <button class="test-btn" data-pattern="dischord">Dischord</button>
     <button class="test-btn" data-pattern="stomp">Stomp</button>
-    <button class="test-btn" data-pattern="menu">Menu</button>
-    <button class="test-btn" data-pattern="score">Score</button>
     <button class="test-btn" data-pattern="flare_slow">Flare Slow</button>
     <button class="test-btn" data-pattern="flare_fast">Flare Fast</button>
     <button class="test-btn" data-pattern="silhouettes">Silhouettes</button>
+    <button class="test-btn" data-pattern="silhouettes_spotlight">Silhouettes Spot</button>
+    <button class="test-btn" data-pattern="menu">Menu</button>
+    <button class="test-btn" data-pattern="score">Score</button>
   </div>
 
   <div class="section-label" style="margin-top:0.75rem">Strobe</div>
@@ -342,18 +354,19 @@ function togglePower() {
                         body: JSON.stringify({ action: 'toggle' }) });
 }
 
-// Brightness slider
-const brightnessSlider = document.getElementById('brightness-slider');
-const brightnessVal = document.getElementById('brightness-val');
-let brightnessDebounce = null;
-brightnessSlider.addEventListener('input', () => {
-  brightnessVal.textContent = brightnessSlider.value;
-  clearTimeout(brightnessDebounce);
-  brightnessDebounce = setTimeout(() => {
-    fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                             body: JSON.stringify({ brightness: parseInt(brightnessSlider.value) }) });
-  }, 100);
-});
+// Brightness step buttons
+function setBrightness(pct) {
+  const raw = Math.round(pct / 100 * 255);
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ brightness: raw }) });
+  highlightBrightness(pct);
+}
+function highlightBrightness(pct) {
+  document.querySelectorAll('#brightness-btns .test-btn').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.brightness) === pct);
+  });
+  document.getElementById('brightness-pct').textContent = pct + '%';
+}
 
 // Palette select
 const paletteSelect = document.getElementById('palette-select');
@@ -377,11 +390,11 @@ function updatePalettePreview(colors) {
 
 function updateSettings(s) {
   if (!s) return;
-  // Sync brightness slider if not actively dragging
-  if (document.activeElement !== brightnessSlider) {
-    brightnessSlider.value = s.brightness;
-    brightnessVal.textContent = s.brightness;
-  }
+  // Sync brightness buttons from server value
+  const pct = Math.round(s.brightness / 255 * 100);
+  // Snap to nearest 25% step for display
+  const snapped = Math.round(pct / 25) * 25 || 25;
+  highlightBrightness(snapped);
   // Populate palette dropdown once
   if (!palettesPopulated && s.palettes) {
     paletteSelect.innerHTML = '';
