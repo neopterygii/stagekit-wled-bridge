@@ -2,16 +2,21 @@
 
 A Docker container that receives **YARG / RB3E** Stage Kit lighting data over UDP and outputs it as DDP pixel data to a **WLED** controller driving an APA102/SK9822 LED strip.
 
-Translates all Stage Kit cues (Warm Auto, Cool Auto, Frenzy, Sweep, Big Rock Ending, etc.) into beat-synced color patterns across 120 LEDs with strobe overlay support. Includes a live web dashboard with built-in test pattern controls.
+Translates all Stage Kit cues (Warm Auto, Cool Auto, Frenzy, Sweep, Big Rock Ending, etc.) into beat-synced color patterns across 120 LEDs with per-pixel effects, strobe overlay, and 12 color palettes. Includes a live web dashboard with built-in test pattern controls.
 
 ## Features
 
-- **Full Stage Kit cue engine** — 17+ cues with beat-synced patterns, event-triggered flares, and static presets
+- **Full Stage Kit cue engine** — 21 cues with beat-synced patterns, event-triggered flares, and static presets
+- **Per-pixel effects** — decay trails, sine breathing, sparkle overlay, gradient blending, glitch overlay, initial flash
+- **12 color palettes** — Default RGBY, Party, Dancefloor, Plasma, Lava, Ocean, Forest, Sunset, Borealis, Frost, Sakura, Neon
 - **DDP output** — sends raw RGB pixels directly to WLED (no segment config needed)
-- **Interleaved zone layout** — 4 color zones (Red, Green, Blue, Yellow) spread across the strip for chase/sweep effects
+- **Dedicated render thread** — pixel rendering and DDP output run on an isolated OS thread with adaptive perf_counter timing, independent of the asyncio event loop
+- **Interleaved zone layout** — 4 color zones spread across 8 cells of 12 LEDs each for smooth chase/sweep effects
 - **Strobe overlay** — global brightness modulation at 2/4/8/16 Hz
-- **Live web dashboard** — real-time zone visualization, event log, and SSE streaming
-- **Built-in test controls** — trigger any cue from the web UI with adjustable BPM, no need to run YARG
+- **Live web dashboard** — real-time zone visualization, event log, SSE streaming, palette preview
+- **Built-in test controls** — trigger any of 21 cues from the web UI with adjustable BPM and strobe, no need to run YARG
+- **Persistent settings** — brightness and palette stored in JSON, survive restarts
+- **WLED power management** — auto-on when YARG starts, auto-off after idle timeout
 - **Pure Python stdlib** — zero external dependencies, runs on Python 3.12+
 - **Multi-arch Docker image** — builds for both `amd64` and `arm64`
 
@@ -74,40 +79,67 @@ The bridge automatically manages your WLED controller's power state:
 
 ## Architecture
 
+```mermaid
+graph LR
+    YARG["YARG<br/>UDP Data Stream"] -->|UDP :36107| Parser["YARG Packet Parser"]
+
+    subgraph Container["Stage Kit Bridge Container"]
+        direction TB
+        Parser --> Engine["Cue Engine<br/>(beat-synced zone bitmasks)"]
+
+        subgraph AsyncLoop["Asyncio Event Loop"]
+            Parser
+            Engine
+            Strobe["Strobe Toggle"]
+            Status["Status Server :8080<br/>(SSE + Dashboard)"]
+            Watchdog["WLED Power Watchdog"]
+        end
+
+        subgraph RenderThread["Render Thread (dedicated OS thread)"]
+            Mapper["LED Mapper<br/>(zones → 120 RGB pixels)<br/>+ per-pixel effects"]
+            DDP["DDP Sender"]
+        end
+
+        Engine --> Mapper
+        Settings["Settings<br/>(brightness, palette)"] --> Mapper
+        Mapper --> DDP
+    end
+
+    DDP -->|DDP :4048| WLED["WLED ESP32<br/>SK9822 120 LEDs"]
+    Status -->|HTTP/SSE| Browser["Web Browser"]
 ```
-YARG                            This Container                         WLED
-┌──────────┐   UDP :36107   ┌──────────────────────┐   DDP :4048   ┌──────────┐
-│  Data     │──────────────►│  YARG Packet Parser   │              │  ESP32 + │
-│  Stream   │               │         │              │              │  SK9822  │
-│           │               │  ┌──────▼──────────┐  │              │  120 LEDs│
-└──────────┘               │  │  Cue Engine      │  │──────────►  │          │
-                            │  │  (beat-synced    │  │              └──────────┘
-                            │  │   zone bitmasks) │  │
-                            │  └──────┬──────────┘  │
-                            │  ┌──────▼──────────┐  │
-                            │  │  LED Mapper      │  │
-                            │  │  (zones→120 RGB) │  │
-                            │  └──────┬──────────┘  │
-                            │  ┌──────▼──────────┐  │
-                            │  │  DDP Sender      │  │
-                            │  └─────────────────┘  │
-                            │                        │
-                            │  Status Page :8080     │
-                            └──────────────────────┘
+
+### Render Pipeline
+
+```mermaid
+graph TD
+    A["Zone Bitmasks (4×8 bits)"] --> B["Base Mapping<br/>(cell-based or additive)"]
+    B --> C["Gradient Blending"]
+    C --> D["Decay Trails"]
+    D --> E["Sine Breathing"]
+    E --> F["Sparkle Overlay"]
+    F --> G["Glitch Overlay"]
+    G --> H["Initial Flash"]
+    H --> I["Brightness Scaling"]
+    I --> J["Mirror (96-119 = 0-23)"]
+    J --> K["DDP Output (360 bytes)"]
 ```
 
 ### LED Layout
 
-The 120-LED strip uses an **interleaved** zone layout for smooth spatial effects:
+The 120-LED strip uses a **cell-based** zone layout for smooth spatial effects:
 
-| Position | Zone |
-|---|---|
-| 0, 12, 24, 36, 48, 60, 72, 84 | Red (zone 1) |
-| 3, 15, 27, 39, 51, 63, 75, 87 | Green (zone 2) |
-| 6, 18, 30, 42, 54, 66, 78, 90 | Blue (zone 3) |
-| 9, 21, 33, 45, 57, 69, 81, 93 | Yellow (zone 4) |
-| All other positions 0–95 | Fill (nearest zone color) |
-| 96–119 | Mirror of positions 0–23 |
+```mermaid
+graph LR
+    subgraph Strip["120 LED Strip"]
+        direction LR
+        C0["Cell 0<br/>LEDs 0-11"] --> C1["Cell 1<br/>LEDs 12-23"] --> C2["Cell 2<br/>LEDs 24-35"] --> C3["Cell 3<br/>LEDs 36-47"]
+        C3 --> C4["Cell 4<br/>LEDs 48-59"] --> C5["Cell 5<br/>LEDs 60-71"] --> C6["Cell 6<br/>LEDs 72-83"] --> C7["Cell 7<br/>LEDs 84-95"]
+        C7 --> Mirror["Mirror<br/>LEDs 96-119<br/>= LEDs 0-23"]
+    end
+```
+
+Each zone bitmask bit controls one 12-LED cell. When multiple zones share a cell, the cell is subdivided (or additively blended, depending on the cue's effects config). Positions 96–119 mirror positions 0–23 for visual wrap-around.
 
 ## Status Page
 
@@ -116,17 +148,21 @@ The built-in web dashboard at port 8080 shows:
 - **Connection status** — whether YARG packets are being received
 - **Current cue** — active Stage Kit lighting cue name
 - **BPM / Strobe / Packets/sec / DDP frames** — real-time metrics
-- **Zone bitmask visualization** — 4×8 LED grid showing which zone LEDs are on
-- **Event log** — scrolling log of cue changes, beats, and strobe events
+- **WLED power** — on/off state with idle countdown timer and manual toggle
+- **Brightness** — 5 step controls (10%, 25%, 50%, 75%, 100%)
+- **Color palette** — dropdown to switch between 12 palettes with live preview swatches
+- **Zone bitmask visualization** — 4×8 LED grid with colors matching the active palette
+- **Event log** — scrolling log of cue changes, beats, and strobe events (capped at 200 entries)
 
 ### Test Controls
 
 The dashboard includes a **Test Patterns** panel for triggering cues directly from the browser:
 
-- Click any cue button to activate it with simulated beats
+- Click any of the **21 cue buttons** to activate it with simulated beats and keyframes
 - Adjust **BPM** with the slider (60–240)
-- Toggle **strobe** at different speeds
-- Click **Stop Test** to return to blackout
+- Toggle **strobe** at different speeds (Slow, Medium, Fast, Fastest)
+- **Stop Test** button appears only when a test pattern is running
+- WLED is automatically powered on when a test pattern is triggered
 
 This is especially useful for verifying your WLED/LED setup without running YARG.
 
@@ -165,25 +201,30 @@ See [WLED_SETUP.md](WLED_SETUP.md) for detailed WLED configuration instructions.
 
 ## Supported Cues
 
-| Cue | Description |
-|---|---|
-| Warm Automatic | Red + Yellow chase patterns |
-| Cool Automatic | Blue + Green chase patterns |
-| Big Rock Ending | All zones, rotating full-on flashes |
-| Frenzy | Fast alternating all zones |
-| Searchlights | Single-LED sweep on Red + Blue |
-| Sweep | Bidirectional sweep on Blue + Green |
-| Harmony | Yellow + Red rotating single LEDs |
-| Flare Slow/Fast | Beat-triggered red/yellow burst, blue/green static |
-| Silhouettes | Static blue |
-| Default / Verse | Blue rotating pairs |
-| Chorus | Red rotating pairs + full yellow |
-| Stomp | Beat-triggered alternating red/yellow |
-| Dischord | Alternating red/blue quarter-beat |
-| Intro | Static blue + green |
-| Menu | Blue bidirectional sweep |
-| Score | All zones full on |
-| Blackout | All off |
+| Cue | Effect | Description |
+|---|---|---|
+| Default | Trails | Blue/Red alternating on keyframe events |
+| Verse | Breathing, Trails | Ambient blue wash with slow sine breathing |
+| Chorus | Trails, Sparkle | Red chase + solid yellow base, sparkle on downbeats |
+| Intro | Breathing | Green ambient breathing |
+| Warm Automatic | Trails | Red opposing chase + Yellow CCW scanner |
+| Warm Manual | Trails | Same as Warm Auto (manual beat control) |
+| Cool Automatic | Trails | Blue opposing chase + Green CCW scanner |
+| Cool Manual | Trails | Same as Cool Auto (manual beat control) |
+| Big Rock Ending | Trails, Sparkle | 4-color rotating chase with beat sparkles |
+| Frenzy | Trails, Sparkle | Fast 3-color chase with direction reversals |
+| Searchlights | Trails, Additive | Yellow CW + Blue CCW single-bit comet beams |
+| Sweep | Trails | Smooth red bidirectional sweep |
+| Harmony | Trails, Additive | Yellow + Red counter-rotation with color mixing |
+| Dischord | Trails, Glitch | Counter-rotating chases + random color inversions |
+| Stomp | Trails, Sparkle | Keyframe-triggered 3-zone chase |
+| Flare Slow | Additive, Breathing, Flash | White flash → all-zone gentle breathing pulse |
+| Flare Fast | Additive, Breathing, Flash | Quick white flash → blue breathing |
+| Silhouettes | Breathing | Slow ambient green breathing |
+| Silhouettes Spotlight | Breathing | Slightly faster green breathing |
+| Menu | Trails | Blue scanner with long comet trail |
+| Score | Trails, Sparkle | Timed dual chase with continuous confetti |
+| Blackout | — | All LEDs off |
 
 ## Development
 
@@ -212,16 +253,18 @@ docker run --network host -e WLED_HOST=192.168.0.53 stagekit-wled-bridge
 ### Project Structure
 
 ```
-├── main.py                  # Entry point — asyncio event loop
+├── main.py                  # Entry point — render thread + asyncio event loop
 ├── config.py                # Environment variable configuration
+├── settings.py              # Persistent settings (brightness, palette)
 ├── status_server.py         # Web dashboard + SSE + test controls
 ├── test_sender.py           # Standalone fake YARG packet generator
 ├── protocol/
 │   ├── yarg_packet.py       # YARG UDP packet parser & enums
-│   └── ddp_sender.py        # DDP protocol sender
+│   ├── ddp_sender.py        # DDP protocol sender
+│   └── wled_api.py          # WLED JSON API (power control)
 ├── effects/
 │   ├── cue_engine.py        # Stage Kit cue state machine
-│   └── mapper.py            # Zone bitmasks → RGB pixel data
+│   └── mapper.py            # Zone bitmasks → RGB pixel data + effects
 ├── Dockerfile
 ├── docker-compose.yml
 └── .github/workflows/

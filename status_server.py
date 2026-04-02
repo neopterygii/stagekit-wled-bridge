@@ -76,11 +76,12 @@ class StatusTracker:
         self.current_cue = cue_byte
         self.current_cue_name = _CUE_NAMES.get(cue_byte, f"UNKNOWN({cue_byte})")
 
-    def on_render(self, zones: list[int], strobe_rate: float, bpm: float):
+    def on_render(self, zones: list[int], strobe_rate: float, bpm: float, ddp_sent: bool = False):
         self.zones = list(zones)
         self.strobe_rate = strobe_rate
         self.bpm = bpm
-        self.ddp_frames_sent += 1
+        if ddp_sent:
+            self.ddp_frames_sent += 1
 
     def on_beat(self, beat: int):
         self.last_beat = beat
@@ -246,6 +247,7 @@ STATUS_HTML = """\
     <div class="label">Brightness</div>
     <div class="value" id="brightness-pct">100%</div>
     <div class="btn-grid" id="brightness-btns" style="margin-top:0.4rem">
+      <button class="test-btn" data-brightness="10" onclick="setBrightness(10)">10%</button>
       <button class="test-btn" data-brightness="25" onclick="setBrightness(25)">25%</button>
       <button class="test-btn" data-brightness="50" onclick="setBrightness(50)">50%</button>
       <button class="test-btn" data-brightness="75" onclick="setBrightness(75)">75%</button>
@@ -309,7 +311,7 @@ STATUS_HTML = """\
   </div>
 
   <div class="btn-grid" style="margin-top:0.75rem">
-    <button class="test-btn stop" id="btn-stop" onclick="sendTest('stop')">&#9632; Stop Test</button>
+    <button class="test-btn stop" id="btn-stop" onclick="sendTest('stop')" style="display:none">&#9632; Stop Test</button>
   </div>
 </div>
 
@@ -317,9 +319,31 @@ STATUS_HTML = """\
 <div class="log" id="log"></div>
 
 <script>
-const ZONE_COLORS = { red: '#f85149', green: '#3fb950', blue: '#58a6ff', yellow: '#d29922' };
+const ZONE_NAMES = ['red','green','blue','yellow'];
+let ZONE_COLORS = { red: '#f85149', green: '#3fb950', blue: '#58a6ff', yellow: '#d29922' };
 const ZONE_OFF = '#21262d';
 let lastCue = '', lastStrobe = -1, lastBeat = -1, activePattern = '';
+
+function rgbToHex(r, g, b) {
+  return '#' + ((1<<24)+(r<<16)+(g<<8)+b).toString(16).slice(1);
+}
+
+function updateZoneColors(colors) {
+  if (!colors) return;
+  for (const name of ZONE_NAMES) {
+    if (colors[name]) {
+      ZONE_COLORS[name] = rgbToHex(colors[name][0], colors[name][1], colors[name][2]);
+    }
+  }
+  // Update zone label colors to match
+  document.querySelectorAll('.zone-section').forEach(sec => {
+    const label = sec.querySelector('.zone-label');
+    if (label) {
+      const name = label.textContent.trim().toLowerCase();
+      if (ZONE_COLORS[name]) label.style.color = ZONE_COLORS[name];
+    }
+  });
+}
 
 function initZones() {
   const container = document.getElementById('zones');
@@ -392,8 +416,9 @@ function updateSettings(s) {
   if (!s) return;
   // Sync brightness buttons from server value
   const pct = Math.round(s.brightness / 255 * 100);
-  // Snap to nearest 25% step for display
-  const snapped = Math.round(pct / 25) * 25 || 25;
+  // Snap to nearest available step for display
+  const steps = [10, 25, 50, 75, 100];
+  const snapped = steps.reduce((prev, curr) => Math.abs(curr - pct) < Math.abs(prev - pct) ? curr : prev);
   highlightBrightness(snapped);
   // Populate palette dropdown once
   if (!palettesPopulated && s.palettes) {
@@ -412,6 +437,7 @@ function updateSettings(s) {
   // Update color preview from palette colors
   if (s.colors) {
     updatePalettePreview(s.colors);
+    updateZoneColors(s.colors);
   }
 }
 
@@ -493,6 +519,9 @@ function update(d) {
 
   const badge = document.getElementById('test-badge');
   badge.className = d.test_active ? 'test-indicator on' : 'test-indicator off';
+
+  // Show/hide Stop Test button based on test state
+  document.getElementById('btn-stop').style.display = d.test_active ? '' : 'none';
 
   document.getElementById('bpm').textContent = d.bpm || '\\u2014';
   document.getElementById('pps').textContent = d.packets_per_sec;
@@ -583,7 +612,8 @@ class StatusServer:
             self._beat_task = None
 
     async def _run_test_beats(self, bpm: float):
-        """Fires alternating MEASURE/STRONG beats at the given BPM."""
+        """Fires alternating MEASURE/STRONG beats and periodic keyframes at the given BPM."""
+        from protocol.yarg_packet import KeyframeByte
         beat_count = 0
         try:
             while True:
@@ -592,6 +622,9 @@ class StatusServer:
                 if self.engine:
                     self.engine.on_beat(beat_type)
                     self.tracker.on_beat(beat_type)
+                    # Fire keyframe every other beat for cues that listen for keyframes
+                    if beat_count % 2 == 0:
+                        self.engine.on_keyframe(KeyframeByte.NEXT)
                 interval = 60.0 / max(bpm, 30.0) / 4  # sub-beats at 4× rate
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:

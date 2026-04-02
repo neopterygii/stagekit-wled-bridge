@@ -178,11 +178,11 @@ class CueEngine:
             return  # All off
 
         elif cue == CueByte.DEFAULT:
-            # Blue/Red ALL toggle on KeyframeNext
-            # Additive blending so overlap shows purple
-            self._set_effects(additive=True, trails=6)
-            self._start_listen_pattern(BLUE, [ALL, NONE], listen="keyframe")
-            self._start_listen_pattern(RED, [NONE, ALL], listen="keyframe")
+            # Blue/Red alternating toggle on KeyframeNext
+            self._set_effects(trails=3)
+            self._set_zone(BLUE, ALL)
+            self._start_listen_pattern(BLUE, [NONE, ALL], listen="keyframe")
+            self._start_listen_pattern(RED, [ALL, NONE], listen="keyframe")
 
         elif cue == CueByte.VERSE:
             # Ambient breathing wash — "settle in" moment
@@ -285,15 +285,15 @@ class CueEngine:
 
         elif cue == CueByte.FLARE_SLOW:
             # Explosion settling into gentle pulse — initial white flash
-            # then all 4 zones breathing slowly
-            self._set_effects(breathing=0.10)
+            # then all 4 zones breathing slowly (additive blend → white)
+            self._set_effects(additive=True, breathing=0.10)
             self._initial_flash_frames = 4
             for i in range(4):
                 self.zones[i] = ALL
 
         elif cue == CueByte.FLARE_FAST:
             # Quick blue flare with faster breathing
-            self._set_effects(breathing=0.5)
+            self._set_effects(additive=True, breathing=0.5)
             self._initial_flash_frames = 3
             self._set_zone(BLUE, ALL)
 

@@ -254,18 +254,21 @@ class RenderThread(threading.Thread):
                 pixel_data = self._black
 
             # Send DDP only when WLED is powered on
+            ddp_sent = False
             if self._wled_power.is_on:
                 now = time.monotonic()
                 if pixel_data != last_pixel_data or (now - last_send_time) >= self._keepalive:
                     self._sender.send_pixels(pixel_data)
                     last_pixel_data = pixel_data
                     last_send_time = now
+                    ddp_sent = True
             else:
                 last_pixel_data = b''
 
             self._tracker.on_render(self._engine.zones,
                                     self._engine.strobe_rate,
-                                    self._engine.bpm)
+                                    self._engine.bpm,
+                                    ddp_sent=ddp_sent)
             self._frames_rendered += 1
 
             # Rolling work-time stats
