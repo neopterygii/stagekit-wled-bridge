@@ -1,10 +1,10 @@
 """LED zone-to-pixel mapper with per-pixel effects.
 
-Maps 4 Stage Kit zones (8 bitmask LEDs each) to a 120 LED strip with
+Maps 4 Stage Kit zones (8 bitmask LEDs each) to an LED strip with
 post-processing effects inspired by LedFx/WLED.
 
-The strip is divided into 8 cells of 12 LEDs each (positions 0-95).
-Positions 96-119 mirror positions 0-23 for visual wrap-around.
+The strip is divided into 8 cells (LED_COUNT // 8 LEDs each).
+Any remainder LEDs mirror from the start for visual wrap-around.
 
 Effects layer (applied after base zone→pixel mapping):
   - Decay trails: pixels fade to black over N frames instead of instant off
@@ -34,12 +34,12 @@ ZONE_NAMES = ["red", "green", "blue", "yellow"]
 
 LEDS_PER_ZONE = 8
 NUM_CELLS = 8
-CELL_SIZE = 12  # LEDs per cell
+CELL_SIZE = LED_COUNT // NUM_CELLS  # LEDs per cell (scales with strip length)
 
-MAPPED_REGION = NUM_CELLS * CELL_SIZE  # 96
+MAPPED_REGION = NUM_CELLS * CELL_SIZE
 
-# Number of pixels on each side of a color boundary to blend over
-BLEND_WIDTH = 2
+# Number of pixels on each side of a color boundary to blend over (scales with cell size)
+BLEND_WIDTH = max(1, CELL_SIZE // 6)
 
 # Byte-level constants for a black pixel
 _OFF_R = 0
@@ -48,7 +48,7 @@ _OFF_B = 0
 
 
 class LEDMapper:
-    """Maps Stage Kit zone bitmask state to a 120-pixel RGB buffer with effects.
+    """Maps Stage Kit zone bitmask state to an RGB pixel buffer with effects.
 
     All pixel math uses pre-allocated flat bytearrays (3 bytes per pixel)
     to avoid per-frame heap allocations and GC pressure.
@@ -59,7 +59,7 @@ class LEDMapper:
         # Output buffer — written in place each frame
         self._out = bytearray(led_count * 3)
 
-        # Working buffer for the 96-pixel mapped region (R,G,B flat)
+        # Working buffer for the mapped region (R,G,B flat)
         self._buf = bytearray(MAPPED_REGION * 3)
 
         # Second working buffer for gradient blending pass

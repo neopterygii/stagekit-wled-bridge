@@ -1,7 +1,7 @@
 """YARG → WLED Stage Kit Bridge.
 
 Listens for YARG UDP lighting packets, runs the Stage Kit cue engine,
-renders 120 pixels, and sends them to WLED via DDP.
+renders pixels, and sends them to WLED via DDP.
 Automatically turns WLED on/off based on YARG activity.
 
 The render loop runs on a dedicated thread (isolated from the asyncio
