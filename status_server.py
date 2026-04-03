@@ -58,6 +58,7 @@ class StatusTracker:
         self.connected = False
         self.test_active = False
         self.test_pattern = ""
+        self.render_thread = None  # set after creation in main()
 
         self._pkt_count_window: list[float] = []
         self._sse_queues: list[asyncio.Queue] = []
@@ -111,6 +112,8 @@ class StatusTracker:
             d["wled_power"] = wled_power.power_snapshot()
         if settings:
             d["settings"] = settings.snapshot()
+        if self.render_thread:
+            d["render"] = self.render_thread.render_stats()
         return d
 
     def subscribe(self) -> asyncio.Queue:
@@ -239,6 +242,15 @@ STATUS_HTML = """\
   <div class="card">
     <div class="label">DDP Frames</div>
     <div class="value" id="ddp">0</div>
+  </div>
+  <div class="card" id="render-card">
+    <div class="label">Render</div>
+    <div class="value" id="render-fps" style="font-size:1.2rem">—</div>
+    <div style="font-size:0.75rem;color:var(--dim);margin-top:0.25rem;font-variant-numeric:tabular-nums">
+      <span id="render-gap"></span> &middot;
+      <span id="render-work"></span> &middot;
+      <span id="render-stalls" style="color:var(--red)"></span>
+    </div>
   </div>
   <div class="card" id="power-card">
     <div class="label">WLED Connection</div>
@@ -454,6 +466,30 @@ function fmtTime(s) {
   return m > 0 ? m + 'm ' + sec + 's' : sec + 's';
 }
 
+function updateRender(r) {
+  if (!r) return;
+  const fps = document.getElementById('render-fps');
+  const gap = document.getElementById('render-gap');
+  const work = document.getElementById('render-work');
+  const stalls = document.getElementById('render-stalls');
+
+  fps.textContent = r.fps + ' FPS';
+  gap.textContent = 'gap ' + r.gap_ms_avg.toFixed(1) + '/' + r.gap_ms_max.toFixed(1) + 'ms';
+  work.textContent = 'work ' + r.work_ms_avg.toFixed(1) + '/' + r.work_ms_max.toFixed(1) + 'ms';
+
+  const stall_text = r.stalls + ' stalls, ' + r.skipped + ' skips';
+  stalls.textContent = stall_text;
+  stalls.style.color = (r.stalls > 0 || r.skipped > 0) ? 'var(--red)' : 'var(--dim)';
+
+  // Flag the card if gap max exceeds 2x target
+  const card = document.getElementById('render-card');
+  if (r.gap_ms_max > r.target_ms * 2) {
+    card.style.borderColor = 'var(--red)';
+  } else {
+    card.style.borderColor = '';
+  }
+}
+
 function updatePower(p) {
   if (!p) return;
   const dot = document.getElementById('power-dot');
@@ -577,6 +613,9 @@ function update(d) {
 
   // Update WLED power info
   updatePower(d.wled_power);
+
+  // Update render performance stats
+  if (d.render) updateRender(d.render);
 
   // Update settings (brightness, palette)
   updateSettings(d.settings);

@@ -228,9 +228,12 @@ class RenderThread(threading.Thread):
         self._frames_rendered = 0
         self._frames_skipped = 0
 
-        # Rolling jitter stats (last N frames)
+        # Rolling stats (last N frames)
         self._STATS_WINDOW = 200
-        self._jitters: list[float] = []
+        self._work_times: list[float] = []
+        self._frame_gaps: list[float] = []
+        self._stall_count = 0
+        self._stall_threshold = self._interval * 2.0  # >2x target = stall
 
         # Strobe black frame (pre-allocated, never changes)
         self._black = b'\x00' * (LED_COUNT * 3)
@@ -245,7 +248,7 @@ class RenderThread(threading.Thread):
         last_send_time = 0.0
         interval = self._interval
         skip_threshold = interval * 2.0
-
+        last_frame_time = time.perf_counter()
         print(f"Render thread started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → "
               f"{WLED_HOST}:{WLED_DDP_PORT}")
 
@@ -306,12 +309,22 @@ class RenderThread(threading.Thread):
                                     ddp_sent=ddp_sent)
             self._frames_rendered += 1
 
-            # Rolling work-time stats
-            work_ms = (time.perf_counter() - frame_start) * 1000.0
-            if len(self._jitters) >= self._STATS_WINDOW:
-                self._jitters[self._frames_rendered % self._STATS_WINDOW] = work_ms
+            # Rolling stats
+            frame_end = time.perf_counter()
+            work_ms = (frame_end - frame_start) * 1000.0
+            gap_ms = (frame_start - last_frame_time) * 1000.0
+            last_frame_time = frame_start
+
+            idx = self._frames_rendered % self._STATS_WINDOW
+            if len(self._work_times) >= self._STATS_WINDOW:
+                self._work_times[idx] = work_ms
+                self._frame_gaps[idx] = gap_ms
             else:
-                self._jitters.append(work_ms)
+                self._work_times.append(work_ms)
+                self._frame_gaps.append(gap_ms)
+
+            if gap_ms > self._stall_threshold * 1000.0:
+                self._stall_count += 1
 
             # Adaptive sleep: subtract elapsed work from target interval
             sleep_time = next_frame - time.perf_counter()
@@ -327,16 +340,23 @@ class RenderThread(threading.Thread):
 
     def render_stats(self) -> dict:
         """Rolling timing stats for diagnostics / status page."""
-        jitters = self._jitters
-        if not jitters:
-            return {"fps": 0, "rendered": 0, "skipped": 0,
-                    "work_ms_avg": 0.0, "work_ms_max": 0.0}
+        work = self._work_times
+        gaps = self._frame_gaps
+        if not work:
+            return {"fps": 0, "rendered": 0, "skipped": 0, "stalls": 0,
+                    "work_ms_avg": 0.0, "work_ms_max": 0.0,
+                    "gap_ms_avg": 0.0, "gap_ms_max": 0.0,
+                    "target_ms": round(self._interval * 1000, 1)}
         return {
             "fps": TARGET_FPS,
             "rendered": self._frames_rendered,
             "skipped": self._frames_skipped,
-            "work_ms_avg": round(sum(jitters) / len(jitters), 2),
-            "work_ms_max": round(max(jitters), 2),
+            "stalls": self._stall_count,
+            "work_ms_avg": round(sum(work) / len(work), 2),
+            "work_ms_max": round(max(work), 2),
+            "gap_ms_avg": round(sum(gaps) / len(gaps), 2),
+            "gap_ms_max": round(max(gaps), 2),
+            "target_ms": round(self._interval * 1000, 1),
         }
 
 
@@ -381,6 +401,9 @@ async def main():
     # Start render thread (Phase 3: isolated from asyncio event loop)
     render_thread = RenderThread(engine, mapper, sender, tracker, settings, wled_power)
     render_thread.start()
+
+    # Provide render thread reference for status snapshots
+    tracker.render_thread = render_thread
 
     # Start WLED idle watchdog
     watchdog_task = asyncio.create_task(wled_power.watchdog_loop())
