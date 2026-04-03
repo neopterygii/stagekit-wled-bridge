@@ -41,6 +41,37 @@ STROBE_RATES = {
 }
 
 
+class _TimePattern:
+    """Time-driven zone pattern ticked deterministically by the render thread.
+
+    Instead of asyncio.sleep() between steps, the current step is computed
+    from wall-clock time — immune to event-loop congestion.
+    """
+    __slots__ = ('steps', 'step', 'next_time', 'bpm_sync', 'param',
+                 'direction', 'reverse_on_beat', 'reverse_counter')
+
+    def __init__(self, steps, *, bpm_sync, param, now, init_bpm=120.0,
+                 direction=1, reverse_on_beat=False):
+        self.steps = steps           # list of list[(zone, mask)]
+        self.step = 0                # current step index
+        self.bpm_sync = bpm_sync     # True → param is cycles_per_beat
+        self.param = param           # cycles_per_beat (bpm) or total_seconds (timed)
+        self.direction = direction
+        self.reverse_on_beat = reverse_on_beat
+        self.reverse_counter = 0     # counts steps for reversal timing
+        # Schedule first transition one interval in the future so step 0
+        # is visible for the correct duration on the very first tick.
+        self.next_time = now + self.step_interval(init_bpm)
+
+    def step_interval(self, bpm: float) -> float:
+        """Seconds per step at the given BPM."""
+        n = len(self.steps)
+        if self.bpm_sync:
+            effective_bpm = bpm if bpm > 0 else 120.0
+            return 60.0 / effective_bpm / (n * self.param)
+        return self.param / n
+
+
 class CueEngine:
     """Manages active lighting cue and produces zone bitmask state + effects."""
 
@@ -58,8 +89,11 @@ class CueEngine:
         # BPM from YARG
         self.bpm = 120.0
 
-        # Active primitives (asyncio tasks)
+        # Active primitives (asyncio tasks for event-driven patterns only)
         self._active_tasks: list[asyncio.Task] = []
+
+        # Time-driven patterns (ticked from render thread)
+        self._time_patterns: list[_TimePattern] = []
 
         # Beat/keyframe event for listen patterns
         self._beat_event = asyncio.Event()
@@ -77,10 +111,15 @@ class CueEngine:
         self._initial_flash_frames = 0
 
     def get_strobe_visible(self) -> bool:
-        """Returns whether pixels should be visible (considering strobe)."""
+        """Returns whether pixels should be visible (considering strobe).
+
+        Computed from wall-clock time so the render thread gets accurate
+        strobe phase without depending on an asyncio coroutine.
+        """
         if self.strobe_rate == 0:
             return True
-        return self._strobe_on
+        period = 1.0 / self.strobe_rate
+        return (time.monotonic() % period) < (period / 2)
 
     def get_effects(self) -> dict:
         """Return current effects dict with transient flags, then clear them."""
@@ -98,16 +137,25 @@ class CueEngine:
 
         return fx
 
-    async def run_strobe(self):
-        """Background task that toggles strobe phase."""
-        while True:
-            if self.strobe_rate > 0:
-                period = 1.0 / self.strobe_rate
-                self._strobe_on = not self._strobe_on
-                await asyncio.sleep(period / 2)
-            else:
-                self._strobe_on = True
-                await asyncio.sleep(0.05)
+    def tick(self, now: float):
+        """Advance all time-based patterns to the current timestamp.
+
+        Called from the render thread each frame.  Zone bitmasks are set
+        deterministically from wall-clock time — immune to asyncio lag.
+        """
+        bpm = self.bpm
+        patterns = self._time_patterns  # local ref — safe across threads
+        for p in patterns:
+            interval = p.step_interval(bpm)
+            while now >= p.next_time:
+                p.step = (p.step + p.direction) % len(p.steps)
+                p.next_time += interval
+                if p.reverse_on_beat:
+                    p.reverse_counter += 1
+                    if p.reverse_counter % 4 == 0:
+                        p.direction = -p.direction
+            for zone, mask in p.steps[p.step]:
+                self.zones[zone] = mask
 
     def on_beat(self, beat_type: int):
         """Called when a beat event arrives from YARG."""
@@ -141,10 +189,11 @@ class CueEngine:
         self._launch_cue(cue_byte)
 
     def _kill_primitives(self):
-        """Cancel all active pattern tasks."""
+        """Cancel all active pattern tasks and time-driven patterns."""
         for task in self._active_tasks:
             task.cancel()
         self._active_tasks.clear()
+        self._time_patterns = []  # atomic reference swap — safe for render thread
 
     def _set_zone(self, zone: int, mask: int):
         """Set a zone's bitmask."""
@@ -349,15 +398,29 @@ class CueEngine:
 
     def _start_beat_pattern(self, zone: int, pattern: list[int],
                             cycles_per_beat: float, listen: str | None = None):
-        """Launch a beat-synced pattern loop on a zone."""
-        task = asyncio.ensure_future(
-            self._run_beat_pattern(zone, pattern, cycles_per_beat, listen)
-        )
-        self._active_tasks.append(task)
+        """Launch a beat-synced pattern loop on a zone.
+
+        When *listen* is None the pattern is time-driven and ticked from the
+        render thread (immune to event-loop congestion).  Event-driven
+        patterns still use asyncio tasks.
+        """
+        if listen is not None:
+            task = asyncio.ensure_future(
+                self._run_beat_pattern(zone, pattern, cycles_per_beat, listen)
+            )
+            self._active_tasks.append(task)
+            return
+
+        steps = [[(zone, mask)] for mask in pattern]
+        now = time.monotonic()
+        self._time_patterns.append(_TimePattern(
+            steps, bpm_sync=True, param=cycles_per_beat,
+            now=now, init_bpm=self.bpm,
+        ))
 
     async def _run_beat_pattern(self, zone: int, pattern: list[int],
                                 cycles_per_beat: float, listen: str | None = None):
-        """Beat-synced pattern loop."""
+        """Beat-synced pattern loop (event-driven only — kept for listen modes)."""
         idx = 0
         try:
             while True:
@@ -379,23 +442,12 @@ class CueEngine:
             pass
 
     def _start_timed_pattern(self, zone: int, pattern: list[int], seconds: float):
-        """Launch a time-based (not BPM) pattern loop on a zone."""
-        task = asyncio.ensure_future(
-            self._run_timed_pattern(zone, pattern, seconds)
-        )
-        self._active_tasks.append(task)
-
-    async def _run_timed_pattern(self, zone: int, pattern: list[int], seconds: float):
-        """Time-based pattern loop (fixed period, independent of BPM)."""
-        idx = 0
-        interval = seconds / len(pattern)
-        try:
-            while True:
-                self.zones[zone] = pattern[idx]
-                idx = (idx + 1) % len(pattern)
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            pass
+        """Launch a fixed-period pattern (not BPM-synced), ticked from render thread."""
+        steps = [[(zone, mask)] for mask in pattern]
+        now = time.monotonic()
+        self._time_patterns.append(_TimePattern(
+            steps, bpm_sync=False, param=seconds, now=now,
+        ))
 
     def _start_multi_zone_chase(self, zone_order: list[int], bits_per_zone: int,
                                  cycles_per_beat: float, listen: str | None = None,
@@ -419,16 +471,31 @@ class CueEngine:
                 masks[zone_order[zone_idx]] |= bit_values[bit_pos]
             frames.append(masks)
 
-        task = asyncio.ensure_future(
-            self._run_multi_zone_chase(zone_order, frames, cycles_per_beat,
-                                       listen, reverse_on_beat)
-        )
-        self._active_tasks.append(task)
+        if listen is not None:
+            task = asyncio.ensure_future(
+                self._run_multi_zone_chase(zone_order, frames, cycles_per_beat,
+                                           listen, reverse_on_beat)
+            )
+            self._active_tasks.append(task)
+            return
+
+        # Time-based — store for render-thread ticking
+        steps = [list(f.items()) for f in frames]
+        used = set(zone_order)
+        for z in range(4):
+            if z not in used:
+                self.zones[z] = NONE
+        now = time.monotonic()
+        self._time_patterns.append(_TimePattern(
+            steps, bpm_sync=True, param=cycles_per_beat,
+            now=now, init_bpm=self.bpm,
+            reverse_on_beat=reverse_on_beat,
+        ))
 
     async def _run_multi_zone_chase(self, zone_order: list[int], frames: list[dict],
                                      cycles_per_beat: float, listen: str | None,
                                      reverse_on_beat: bool):
-        """Run the multi-zone rotating chase."""
+        """Run the multi-zone rotating chase (event-driven only)."""
         idx = 0
         direction = 1
         beat_count = 0

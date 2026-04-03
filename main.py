@@ -197,7 +197,10 @@ class RenderThread(threading.Thread):
     Reads engine state, runs the mapper, sends DDP packets, all on its own
     OS thread with time.sleep() + perf_counter adaptive timing.  This
     eliminates event-loop contention from SSE broadcasts, HTTP handlers,
-    strobe toggles, and beat-pattern coroutines.
+    and beat-pattern coroutines.
+
+    Time-based patterns and strobe are now computed deterministically on
+    this thread via engine.tick() — immune to event-loop congestion.
 
     Communication with the asyncio world:
       - engine.zones / engine.get_effects() are read directly (list/dict
@@ -272,6 +275,10 @@ class RenderThread(threading.Thread):
             if palette_name != self._cached_palette:
                 self._cached_colors = self._settings.zone_colors
                 self._cached_palette = palette_name
+
+            # Advance time-based patterns (zone bitmasks computed from
+            # wall-clock time — immune to asyncio event-loop congestion)
+            self._engine.tick(time.monotonic())
 
             # Get effects (consumes and clears transient flags)
             effects = self._engine.get_effects()
@@ -392,9 +399,6 @@ async def main():
         local_addr=(YARG_LISTEN_HOST, YARG_LISTEN_PORT),
     )
 
-    # Start strobe background task
-    strobe_task = asyncio.create_task(engine.run_strobe())
-
     # Start status broadcast task
     broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power, settings=settings))
 
@@ -423,7 +427,6 @@ async def main():
     # Cleanup
     render_thread.stop()
     render_thread.join(timeout=2.0)
-    strobe_task.cancel()
     broadcast_task.cancel()
     watchdog_task.cancel()
     transport.close()
