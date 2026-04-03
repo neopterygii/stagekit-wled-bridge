@@ -84,12 +84,14 @@ class WLEDPowerManager:
         self._last_activity = 0.0
         self._wled_on = False
         self._enabled = idle_timeout > 0
+        self._power_on_pending = False
+        self._power_off_pending = False
 
     def on_activity(self):
         """Called when a YARG packet is received."""
         self._last_activity = time.monotonic()
         if not self._wled_on:
-            self._power_on()
+            self._power_on_pending = True
 
     def on_test_activity(self):
         """Called when a test pattern is triggered from the web UI."""
@@ -129,26 +131,33 @@ class WLEDPowerManager:
         }
 
     def manual_power(self, on: bool):
-        """Manual power toggle from the web UI."""
+        """Manual power toggle from the web UI (deferred to watchdog thread)."""
         if on:
             self._last_activity = time.monotonic()
             if not self._wled_on:
-                self._power_on()
+                self._power_on_pending = True
         else:
             if self._wled_on:
-                self._power_off()
+                self._power_off_pending = True
 
     async def watchdog_loop(self):
         """Background task that turns WLED off after idle timeout and checks reachability."""
-        # Initial reachability check
-        self._api.is_on()
+        # Initial reachability check (non-blocking)
+        await asyncio.to_thread(self._api.is_on)
 
         if not self._enabled:
             print(f"WLED power management: disabled (IDLE_TIMEOUT=0)")
-            # Still check reachability periodically
+            # Still check reachability and handle manual power periodically
             while True:
-                await asyncio.sleep(30)
-                self._api.is_on()
+                await asyncio.sleep(5)
+                if self._power_on_pending:
+                    self._power_on_pending = False
+                    await asyncio.to_thread(self._power_on)
+                if self._power_off_pending:
+                    self._power_off_pending = False
+                    await asyncio.to_thread(self._power_off)
+                await asyncio.sleep(25)
+                await asyncio.to_thread(self._api.is_on)
             return
 
         print(f"WLED power management: enabled ({self._idle_timeout}s idle timeout)")
@@ -156,20 +165,30 @@ class WLEDPowerManager:
         check_counter = 0
         while True:
             await asyncio.sleep(5)
+
+            # Handle deferred power-on from on_activity() or manual_power()
+            if self._power_on_pending:
+                self._power_on_pending = False
+                await asyncio.to_thread(self._power_on)
+
+            if self._power_off_pending:
+                self._power_off_pending = False
+                await asyncio.to_thread(self._power_off)
+
             check_counter += 1
 
             # Reachability check every ~30s (6 × 5s)
             if check_counter >= 6:
                 check_counter = 0
                 if not self._wled_on:
-                    self._api.is_on()
+                    await asyncio.to_thread(self._api.is_on)
 
             if not self._wled_on:
                 continue
 
             elapsed = time.monotonic() - self._last_activity
             if elapsed >= self._idle_timeout:
-                self._power_off()
+                await asyncio.to_thread(self._power_off)
 
 
 class RenderThread(threading.Thread):
