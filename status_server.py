@@ -256,6 +256,7 @@ STATUS_HTML = """\
     <div class="label">WLED Connection</div>
     <div class="value"><span class="status-dot off" id="power-dot"></span><span id="power-state">Unknown</span></div>
     <div id="power-timer" style="font-size:0.8rem;color:var(--dim);margin-top:0.35rem;font-variant-numeric:tabular-nums"></div>
+    <div id="wifi-info" style="font-size:0.7rem;color:var(--dim);margin-top:0.25rem;font-variant-numeric:tabular-nums"></div>
     <button class="test-btn" id="btn-power" onclick="togglePower()" style="margin-top:0.5rem;font-size:0.75rem">Toggle</button>
   </div>
   <div class="card" id="brightness-card">
@@ -277,6 +278,16 @@ STATUS_HTML = """\
       <option value="default">Default (RGBY)</option>
     </select>
     <div id="palette-preview" style="display:flex;gap:2px;margin-top:0.5rem;height:16px;border-radius:4px;overflow:hidden"></div>
+  </div>
+  <div class="card" id="fps-card">
+    <div class="label">Target FPS</div>
+    <div class="value" id="fps-val">40</div>
+    <div class="btn-grid" id="fps-btns" style="margin-top:0.4rem"></div>
+  </div>
+  <div class="card" id="direction-card">
+    <div class="label">LED Direction</div>
+    <div class="value" id="direction-val">Normal</div>
+    <button class="test-btn" id="btn-direction" onclick="toggleDirection()" style="margin-top:0.5rem;font-size:0.75rem">Reverse</button>
   </div>
 </div>
 
@@ -430,6 +441,28 @@ function updatePalettePreview(colors) {
   }
 }
 
+// FPS buttons
+let fpsPopulated = false;
+function setFps(val) {
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ fps: val }) });
+  highlightFps(val);
+}
+function highlightFps(val) {
+  document.querySelectorAll('#fps-btns .test-btn').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.fps) === val);
+  });
+  document.getElementById('fps-val').textContent = val;
+}
+
+// Direction toggle
+function toggleDirection() {
+  const current = document.getElementById('direction-val').textContent.toLowerCase();
+  const next = current === 'normal' ? 'reverse' : 'normal';
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ direction: next }) });
+}
+
 function updateSettings(s) {
   if (!s) return;
   // Sync brightness buttons from server value
@@ -456,6 +489,27 @@ function updateSettings(s) {
   if (s.colors) {
     updatePalettePreview(s.colors);
     updateZoneColors(s.colors);
+  }
+  // Populate FPS buttons once
+  if (!fpsPopulated && s.fps_options) {
+    const container = document.getElementById('fps-btns');
+    container.innerHTML = '';
+    for (const f of s.fps_options) {
+      const btn = document.createElement('button');
+      btn.className = 'test-btn';
+      btn.dataset.fps = f;
+      btn.textContent = f;
+      btn.onclick = () => setFps(f);
+      container.appendChild(btn);
+    }
+    fpsPopulated = true;
+  }
+  if (s.fps) highlightFps(s.fps);
+  // Sync direction
+  if (s.direction) {
+    const label = s.direction === 'reverse' ? 'Reverse' : 'Normal';
+    document.getElementById('direction-val').textContent = label;
+    document.getElementById('btn-direction').textContent = s.direction === 'reverse' ? 'Normal' : 'Reverse';
   }
 }
 
@@ -496,6 +550,17 @@ function updatePower(p) {
   const state = document.getElementById('power-state');
   const timer = document.getElementById('power-timer');
   const btn = document.getElementById('btn-power');
+  const wifiEl = document.getElementById('wifi-info');
+  // WiFi info (updated every ~30s)
+  const w = p.wifi;
+  if (w && w.signal) {
+    const sigColor = w.signal >= 60 ? 'var(--green)' : w.signal >= 30 ? 'var(--yellow)' : 'var(--red)';
+    wifiEl.innerHTML = 'WiFi: <span style="color:' + sigColor + '">' + w.signal + '%</span> (' + w.rssi + ' dBm) &middot; ch' + w.channel + ' &middot; ' + w.bssid;
+  } else if (p.reachable) {
+    wifiEl.textContent = 'WiFi: polling...';
+  } else {
+    wifiEl.textContent = '';
+  }
   if (!p.reachable) {
     dot.className = 'status-dot off';
     state.textContent = 'Unreachable';
@@ -768,6 +833,19 @@ class StatusServer:
                 changed.append(f"palette={self.settings.palette_name}")
             elif str(body["palette"]) != old:
                 return 400, f"Unknown palette: {body['palette']}"
+        if "fps" in body:
+            try:
+                old_fps = self.settings.fps
+                self.settings.fps = int(body["fps"])
+                if self.settings.fps != old_fps:
+                    changed.append(f"fps={self.settings.fps}")
+            except (ValueError, TypeError):
+                return 400, "Invalid FPS value"
+        if "direction" in body:
+            old_dir = self.settings.direction
+            self.settings.direction = str(body["direction"])
+            if self.settings.direction != old_dir:
+                changed.append(f"direction={self.settings.direction}")
         if not changed:
             return 400, "No valid settings provided"
         return 200, "Updated: " + ", ".join(changed)

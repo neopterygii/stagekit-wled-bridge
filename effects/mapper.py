@@ -102,7 +102,8 @@ class LEDMapper:
         buf[o + 2] = min(255, buf[o + 2] + b)
 
     def render(self, zone_bitmasks: list[int], zone_colors: dict | None = None,
-               effects: dict | None = None, brightness: float = 1.0) -> bytes:
+               effects: dict | None = None, brightness: float = 1.0,
+               reverse: bool = False) -> bytes:
         """Render pixels from 4 zone bitmasks with optional effects.
 
         Args:
@@ -345,12 +346,18 @@ class LEDMapper:
             for k in range(mapped_bytes):
                 out[k] = int(buf[k] * brightness)
 
-        # Positions 96-119 mirror positions 0-23
+        # Reverse pixel order if direction is reversed
+        if reverse:
+            for i in range(MAPPED_REGION // 2):
+                j = MAPPED_REGION - 1 - i
+                io, jo = i * 3, j * 3
+                out[io], out[jo] = out[jo], out[io]
+                out[io + 1], out[jo + 1] = out[jo + 1], out[io + 1]
+                out[io + 2], out[jo + 2] = out[jo + 2], out[io + 2]
+
+        # Remainder LEDs mirror from start for visual wrap-around
         mirror_bytes = (self.led_count - MAPPED_REGION) * 3
-        if brightness >= 1.0:
-            out[mapped_bytes:mapped_bytes + mirror_bytes] = out[:mirror_bytes]
-        else:
-            # Already brightness-scaled in out[0:mirror_bytes]
+        if mirror_bytes > 0:
             out[mapped_bytes:mapped_bytes + mirror_bytes] = out[:mirror_bytes]
 
         return bytes(out)

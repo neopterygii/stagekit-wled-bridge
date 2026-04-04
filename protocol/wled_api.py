@@ -15,6 +15,7 @@ class WLEDApi:
     def __init__(self, host: str):
         self._base_url = f"http://{host}/json"
         self.reachable: bool = False
+        self.wifi_info: dict = {}
 
     def set_power(self, on: bool) -> bool:
         """Turn WLED on or off. Returns True on success."""
@@ -43,3 +44,20 @@ class WLEDApi:
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
             self.reachable = False
             return None
+
+    def fetch_wifi_info(self) -> dict:
+        """Fetch WiFi diagnostics from /json/info. Returns {} on failure."""
+        try:
+            with urllib.request.urlopen(f"{self._base_url}/info", timeout=3) as resp:
+                data = json.loads(resp.read())
+                wifi = data.get("wifi", {})
+                self.wifi_info = {
+                    "signal": wifi.get("signal", 0),
+                    "rssi": wifi.get("rssi", 0),
+                    "bssid": wifi.get("bssid", ""),
+                    "channel": wifi.get("channel", 0),
+                }
+                return self.wifi_info
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            self.wifi_info = {}
+            return {}

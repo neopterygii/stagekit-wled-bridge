@@ -18,7 +18,7 @@ import time
 from config import (
     YARG_LISTEN_HOST, YARG_LISTEN_PORT,
     WLED_HOST, WLED_DDP_PORT,
-    LED_COUNT, TARGET_FPS, GLOBAL_BRIGHTNESS,
+    LED_COUNT, GLOBAL_BRIGHTNESS,
     STATUS_HOST, STATUS_PORT,
     IDLE_TIMEOUT,
 )
@@ -117,8 +117,9 @@ class WLEDPowerManager:
 
     def power_snapshot(self) -> dict:
         """Return current power state for the status page."""
+        wifi = self._api.wifi_info
         if not self._enabled:
-            return {"enabled": False, "on": self._wled_on, "reachable": self._api.reachable, "idle_seconds": 0, "timeout": 0, "remaining": 0}
+            return {"enabled": False, "on": self._wled_on, "reachable": self._api.reachable, "idle_seconds": 0, "timeout": 0, "remaining": 0, "wifi": wifi}
         elapsed = time.monotonic() - self._last_activity if self._last_activity > 0 else 0.0
         remaining = max(0.0, self._idle_timeout - elapsed) if self._wled_on else 0.0
         return {
@@ -128,6 +129,7 @@ class WLEDPowerManager:
             "idle_seconds": round(elapsed),
             "timeout": self._idle_timeout,
             "remaining": round(remaining),
+            "wifi": wifi,
         }
 
     def manual_power(self, on: bool):
@@ -144,10 +146,12 @@ class WLEDPowerManager:
         """Background task that turns WLED off after idle timeout and checks reachability."""
         # Initial reachability check (non-blocking)
         await asyncio.to_thread(self._api.is_on)
+        await asyncio.to_thread(self._api.fetch_wifi_info)
 
         if not self._enabled:
             print(f"WLED power management: disabled (IDLE_TIMEOUT=0)")
             # Still check reachability and handle manual power periodically
+            wifi_counter = 0
             while True:
                 await asyncio.sleep(5)
                 if self._power_on_pending:
@@ -156,8 +160,11 @@ class WLEDPowerManager:
                 if self._power_off_pending:
                     self._power_off_pending = False
                     await asyncio.to_thread(self._power_off)
-                await asyncio.sleep(25)
-                await asyncio.to_thread(self._api.is_on)
+                wifi_counter += 1
+                if wifi_counter >= 6:
+                    wifi_counter = 0
+                    await asyncio.to_thread(self._api.is_on)
+                    await asyncio.to_thread(self._api.fetch_wifi_info)
             return
 
         print(f"WLED power management: enabled ({self._idle_timeout}s idle timeout)")
@@ -177,11 +184,12 @@ class WLEDPowerManager:
 
             check_counter += 1
 
-            # Reachability check every ~30s (6 × 5s)
+            # Reachability + WiFi check every ~30s (6 × 5s)
             if check_counter >= 6:
                 check_counter = 0
                 if not self._wled_on:
                     await asyncio.to_thread(self._api.is_on)
+                await asyncio.to_thread(self._api.fetch_wifi_info)
 
             if not self._wled_on:
                 continue
@@ -223,10 +231,6 @@ class RenderThread(threading.Thread):
         self._wled_power = wled_power
         self._active = False
 
-        # Timing
-        self._interval = 1.0 / TARGET_FPS
-        self._keepalive = 50.0  # seconds — well under WLED's 65s DDP timeout
-
         # Frame-skip tracking
         self._frames_rendered = 0
         self._frames_skipped = 0
@@ -236,7 +240,6 @@ class RenderThread(threading.Thread):
         self._work_times: list[float] = []
         self._frame_gaps: list[float] = []
         self._stall_count = 0
-        self._stall_threshold = self._interval * 2.0  # >2x target = stall
 
         # Strobe black frame (pre-allocated, never changes)
         self._black = b'\x00' * (LED_COUNT * 3)
@@ -247,24 +250,29 @@ class RenderThread(threading.Thread):
 
     def run(self):
         self._active = True
-        last_pixel_data = b''
-        last_send_time = 0.0
-        interval = self._interval
-        skip_threshold = interval * 2.0
         last_frame_time = time.perf_counter()
-        print(f"Render thread started: {TARGET_FPS} FPS, {LED_COUNT} LEDs → "
+        fps = self._settings.fps
+        interval = 1.0 / fps
+        print(f"Render thread started: {fps} FPS, {LED_COUNT} LEDs → "
               f"{WLED_HOST}:{WLED_DDP_PORT}")
 
         next_frame = time.perf_counter()
 
         while self._active:
+            # Re-read FPS from settings (lock-protected, cheap)
+            new_fps = self._settings.fps
+            if new_fps != fps:
+                fps = new_fps
+                interval = 1.0 / fps
+                next_frame = time.perf_counter()
+
             next_frame += interval
             frame_start = time.perf_counter()
 
             # Frame-skip detection: if we're >2 frame periods behind,
             # drop this frame and reset the deadline
             drift = frame_start - (next_frame - interval)
-            if drift > skip_threshold:
+            if drift > interval * 2.0:
                 self._frames_skipped += 1
                 next_frame = time.perf_counter() + interval
                 time.sleep(0.001)
@@ -287,28 +295,25 @@ class RenderThread(threading.Thread):
             brightness = self._settings.brightness / 255.0
 
             # Render pixels
+            reverse = self._settings.direction == "reverse"
             pixel_data = self._mapper.render(
                 self._engine.zones,
                 zone_colors=self._cached_colors,
                 effects=effects,
                 brightness=brightness,
+                reverse=reverse,
             )
 
             # Apply strobe (replace with pre-allocated black)
             if not self._engine.get_strobe_visible():
                 pixel_data = self._black
 
-            # Send DDP only when WLED is powered on
+            # Send DDP every frame when WLED is on (no dedup — WiFi
+            # can drop UDP packets, so always resend like LedFx does)
             ddp_sent = False
             if self._wled_power.is_on:
-                now = time.monotonic()
-                if pixel_data != last_pixel_data or (now - last_send_time) >= self._keepalive:
-                    self._sender.send_pixels(pixel_data)
-                    last_pixel_data = pixel_data
-                    last_send_time = now
-                    ddp_sent = True
-            else:
-                last_pixel_data = b''
+                self._sender.send_pixels(pixel_data)
+                ddp_sent = True
 
             self._tracker.on_render(self._engine.zones,
                                     self._engine.strobe_rate,
@@ -330,7 +335,7 @@ class RenderThread(threading.Thread):
                 self._work_times.append(work_ms)
                 self._frame_gaps.append(gap_ms)
 
-            if gap_ms > self._stall_threshold * 1000.0:
+            if gap_ms > interval * 2000.0:
                 self._stall_count += 1
 
             # Adaptive sleep: subtract elapsed work from target interval
@@ -347,15 +352,16 @@ class RenderThread(threading.Thread):
 
     def render_stats(self) -> dict:
         """Rolling timing stats for diagnostics / status page."""
+        fps = self._settings.fps
         work = self._work_times
         gaps = self._frame_gaps
         if not work:
-            return {"fps": 0, "rendered": 0, "skipped": 0, "stalls": 0,
+            return {"fps": fps, "rendered": 0, "skipped": 0, "stalls": 0,
                     "work_ms_avg": 0.0, "work_ms_max": 0.0,
                     "gap_ms_avg": 0.0, "gap_ms_max": 0.0,
-                    "target_ms": round(self._interval * 1000, 1)}
+                    "target_ms": round(1000.0 / fps, 1)}
         return {
-            "fps": TARGET_FPS,
+            "fps": fps,
             "rendered": self._frames_rendered,
             "skipped": self._frames_skipped,
             "stalls": self._stall_count,
@@ -363,7 +369,7 @@ class RenderThread(threading.Thread):
             "work_ms_max": round(max(work), 2),
             "gap_ms_avg": round(sum(gaps) / len(gaps), 2),
             "gap_ms_max": round(max(gaps), 2),
-            "target_ms": round(self._interval * 1000, 1),
+            "target_ms": round(1000.0 / fps, 1),
         }
 
 
@@ -373,7 +379,7 @@ async def main():
     print("  YARG → WLED Stage Kit Bridge")
     print(f"  Listening on {YARG_LISTEN_HOST}:{YARG_LISTEN_PORT}")
     print(f"  Sending DDP to {WLED_HOST}:{WLED_DDP_PORT}")
-    print(f"  LED count: {LED_COUNT} | FPS: {TARGET_FPS}")
+    print(f"  LED count: {LED_COUNT}")
     print(f"  WLED idle timeout: {idle_mins}m" if IDLE_TIMEOUT else "  WLED idle timeout: disabled")
     print(f"  Status page: http://{STATUS_HOST}:{STATUS_PORT}/")
     print("=" * 60)

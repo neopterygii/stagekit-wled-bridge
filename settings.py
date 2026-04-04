@@ -136,9 +136,13 @@ PALETTES = {
     },
 }
 
+VALID_FPS = (10, 15, 20, 25, 30, 40, 50, 60)
+
 DEFAULT_SETTINGS = {
     "brightness": 255,
     "palette": "default",
+    "fps": 40,
+    "direction": "normal",
 }
 
 
@@ -160,6 +164,10 @@ class BridgeSettings:
                 self._data["brightness"] = max(0, min(255, stored["brightness"]))
             if stored.get("palette") in PALETTES:
                 self._data["palette"] = stored["palette"]
+            if isinstance(stored.get("fps"), int) and stored["fps"] in VALID_FPS:
+                self._data["fps"] = stored["fps"]
+            if stored.get("direction") in ("normal", "reverse"):
+                self._data["direction"] = stored["direction"]
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
 
@@ -197,6 +205,33 @@ class BridgeSettings:
             self._save()
 
     @property
+    def fps(self) -> int:
+        with self._lock:
+            return self._data["fps"]
+
+    @fps.setter
+    def fps(self, value: int):
+        value = int(value)
+        if value not in VALID_FPS:
+            return
+        with self._lock:
+            self._data["fps"] = value
+            self._save()
+
+    @property
+    def direction(self) -> str:
+        with self._lock:
+            return self._data["direction"]
+
+    @direction.setter
+    def direction(self, value: str):
+        if value not in ("normal", "reverse"):
+            return
+        with self._lock:
+            self._data["direction"] = value
+            self._save()
+
+    @property
     def zone_colors(self) -> dict[str, tuple[int, int, int]]:
         """Current palette's zone color mapping."""
         with self._lock:
@@ -211,4 +246,7 @@ class BridgeSettings:
                 "palette": palette_key,
                 "palettes": {k: v["label"] for k, v in PALETTES.items()},
                 "colors": PALETTES[palette_key]["colors"],
+                "fps": self._data["fps"],
+                "fps_options": list(VALID_FPS),
+                "direction": self._data["direction"],
             }
