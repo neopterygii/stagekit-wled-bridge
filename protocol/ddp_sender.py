@@ -15,6 +15,7 @@ DDP packet structure (10-byte header + pixel data):
 
 import socket
 import struct
+import time
 
 DDP_PORT = 4048
 DDP_HEADER_LEN = 10
@@ -25,6 +26,8 @@ DDP_FLAGS_PUSH = 0x01
 DDP_TYPE_RGB24 = 0x0B
 DDP_ID_DISPLAY = 0x01
 
+_STATS_WINDOW = 200
+
 
 class DDPSender:
     def __init__(self, host: str, port: int = DDP_PORT):
@@ -32,6 +35,9 @@ class DDPSender:
         self.port = port
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._seq = 0
+        self._send_errors = 0
+        self._send_times: list[float] = []  # rolling µs per sendto()
+        self._frames_sent = 0
 
     def send_pixels(self, pixel_data: bytes) -> None:
         """Send RGB pixel data to WLED via DDP.
@@ -61,10 +67,35 @@ class DDPSender:
             )
 
             packet = header + pixel_data[offset:offset + chunk_size]
-            self._sock.sendto(packet, (self.host, self.port))
+            try:
+                t0 = time.perf_counter()
+                self._sock.sendto(packet, (self.host, self.port))
+                us = (time.perf_counter() - t0) * 1e6
+                idx = self._frames_sent % _STATS_WINDOW
+                if len(self._send_times) >= _STATS_WINDOW:
+                    self._send_times[idx] = us
+                else:
+                    self._send_times.append(us)
+            except OSError:
+                self._send_errors += 1
 
             offset += chunk_size
             self._seq = (self._seq + 1) & 0x0F
+
+        self._frames_sent += 1
+
+    def stats(self) -> dict:
+        """Rolling DDP send statistics."""
+        t = self._send_times
+        if not t:
+            return {"send_us_avg": 0.0, "send_us_max": 0.0,
+                    "send_errors": 0, "frames_sent": 0}
+        return {
+            "send_us_avg": round(sum(t) / len(t), 1),
+            "send_us_max": round(max(t), 1),
+            "send_errors": self._send_errors,
+            "frames_sent": self._frames_sent,
+        }
 
     def close(self):
         self._sock.close()

@@ -359,7 +359,8 @@ class RenderThread(threading.Thread):
             return {"fps": fps, "rendered": 0, "skipped": 0, "stalls": 0,
                     "work_ms_avg": 0.0, "work_ms_max": 0.0,
                     "gap_ms_avg": 0.0, "gap_ms_max": 0.0,
-                    "target_ms": round(1000.0 / fps, 1)}
+                    "target_ms": round(1000.0 / fps, 1),
+                    "ddp": self._sender.stats()}
         return {
             "fps": fps,
             "rendered": self._frames_rendered,
@@ -370,6 +371,7 @@ class RenderThread(threading.Thread):
             "gap_ms_avg": round(sum(gaps) / len(gaps), 2),
             "gap_ms_max": round(max(gaps), 2),
             "target_ms": round(1000.0 / fps, 1),
+            "ddp": self._sender.stats(),
         }
 
 

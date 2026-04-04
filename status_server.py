@@ -239,9 +239,13 @@ STATUS_HTML = """\
     <div class="label">Packets/sec</div>
     <div class="value" id="pps">0</div>
   </div>
-  <div class="card">
+  <div class="card" id="ddp-card">
     <div class="label">DDP Frames</div>
     <div class="value" id="ddp">0</div>
+    <div style="font-size:0.75rem;color:var(--dim);margin-top:0.25rem;font-variant-numeric:tabular-nums">
+      <span id="ddp-send-time"></span>
+      <span id="ddp-errors" style="color:var(--dim)"></span>
+    </div>
   </div>
   <div class="card" id="render-card">
     <div class="label">Render</div>
@@ -541,6 +545,23 @@ function updateRender(r) {
     card.style.borderColor = 'var(--red)';
   } else {
     card.style.borderColor = '';
+  }
+
+  // DDP send stats
+  const ddp = r.ddp;
+  if (ddp) {
+    const sendEl = document.getElementById('ddp-send-time');
+    const errEl = document.getElementById('ddp-errors');
+    sendEl.textContent = 'send ' + ddp.send_us_avg.toFixed(0) + '/' + ddp.send_us_max.toFixed(0) + '\u00b5s';
+    if (ddp.send_errors > 0) {
+      errEl.textContent = ' \u00b7 ' + ddp.send_errors + ' errors';
+      errEl.style.color = 'var(--red)';
+      document.getElementById('ddp-card').style.borderColor = 'var(--red)';
+    } else {
+      errEl.textContent = '';
+      errEl.style.color = 'var(--dim)';
+      document.getElementById('ddp-card').style.borderColor = '';
+    }
   }
 }
 
