@@ -78,6 +78,19 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # Drum notes (for cues that listen for drums)
         self.engine.on_drum(pkt.drum_notes)
 
+        # Bonus FX flag — one-frame celebration burst on the strip.
+        if pkt.bonus_effect:
+            self.engine.on_bonus()
+
+        # Pause state — freezes pattern motion + dims output.
+        # YARG: 0 = AtMenu, 1 = Unpaused, 2 = Paused.
+        self.engine.on_paused(pkt.paused == 2)
+
+        # Surface scene + auto-gen track flag for the status page.
+        self.tracker.on_scene(pkt.scene)
+        self.tracker.on_auto_gen(pkt.auto_gen)
+        self.tracker.on_paused(pkt.paused == 2)
+
 
 class WLEDPowerManager:
     """Manages WLED power state based on YARG activity."""
@@ -255,6 +268,17 @@ class RenderThread(threading.Thread):
         self._cached_palette = ""
         self._cached_colors: dict = {}
 
+        # Cue cross-fade state. When the engine signals a cue change, we
+        # snapshot the previously sent frame into _fade_from and linearly
+        # blend new frames against it for FADE_DURATION seconds. Removes
+        # the one-frame all-black blink between cues.
+        self._fade_from = bytearray(LED_COUNT * 3)
+        self._fade_buf = bytearray(LED_COUNT * 3)
+        self._last_sent = bytearray(LED_COUNT * 3)
+        self._fade_until = 0.0
+        self._last_cue_change_at = 0.0
+        self._FADE_DURATION = 0.25  # seconds
+
     def run(self):
         self._active = True
         last_frame_time = time.perf_counter()
@@ -309,11 +333,40 @@ class RenderThread(threading.Thread):
                 effects=effects,
                 brightness=brightness,
                 reverse=reverse,
+                zone_cell_levels=self._engine.zone_cell_levels,
             )
 
             # Apply strobe (replace with pre-allocated black)
             if not self._engine.get_strobe_visible():
                 pixel_data = self._black
+
+            # Cue cross-fade: snapshot the last sent frame on cue change,
+            # then blend incoming frames against it for FADE_DURATION.
+            # Skipped when strobe is suppressing the frame to black, so
+            # we don't fade *through* the strobe blackout.
+            now = time.monotonic()
+            cue_change_at = effects.get("cue_change_at") or 0.0
+            if cue_change_at > self._last_cue_change_at:
+                self._fade_from[:] = self._last_sent
+                self._fade_until = cue_change_at + self._FADE_DURATION
+                self._last_cue_change_at = cue_change_at
+
+            if pixel_data is not self._black and now < self._fade_until:
+                t = 1.0 - (self._fade_until - now) / self._FADE_DURATION
+                if t < 0.0:
+                    t = 0.0
+                inv_t = 1.0 - t
+                fb = self._fade_buf
+                ff = self._fade_from
+                pd = pixel_data
+                n = len(pd)
+                for i in range(n):
+                    fb[i] = int(ff[i] * inv_t + pd[i] * t)
+                pixel_data = fb
+
+            # Save for next frame's potential cross-fade source
+            n = len(pixel_data)
+            self._last_sent[:n] = pixel_data
 
             # Send DDP every frame when WLED is on (no dedup — WiFi
             # can drop UDP packets, so always resend like LedFx does)

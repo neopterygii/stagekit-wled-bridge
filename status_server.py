@@ -24,6 +24,15 @@ CONNECTED_TIMEOUT = 3.0
 # Reverse lookup: cue byte value → name
 _CUE_NAMES = {v: k for k, v in vars(CueByte).items() if isinstance(v, int)}
 
+# YARG scene index → human label (matches DataStreamController.SceneIndexByte)
+_SCENE_NAMES = {
+    0: "Unknown",
+    1: "Menu",
+    2: "Gameplay",
+    3: "Score",
+    4: "Calibration",
+}
+
 # Test patterns available from the web UI
 TEST_PATTERNS = {
     "default": CueByte.DEFAULT,
@@ -68,6 +77,11 @@ class StatusTracker:
         self.render_thread = None  # set after creation in main()
         self._last_packet_time = 0.0
 
+        # YARG game state surfaced for the dashboard
+        self.scene = 0          # 0=Unknown 1=Menu 2=Gameplay 3=Score 4=Calibration
+        self.auto_gen = False   # True when YARG is using auto-generated venue lighting
+        self.paused = False
+
         self._pkt_count_window: list[float] = []
         self._sse_queues: list[asyncio.Queue] = []
 
@@ -102,6 +116,15 @@ class StatusTracker:
     def on_beat(self, beat: int):
         self.last_beat = beat
 
+    def on_scene(self, scene: int):
+        self.scene = scene
+
+    def on_auto_gen(self, auto_gen: bool):
+        self.auto_gen = auto_gen
+
+    def on_paused(self, paused: bool):
+        self.paused = paused
+
     def snapshot(self, wled_power=None, settings=None) -> dict:
         # Recompute packets/sec from the rolling window so the value decays
         # to zero when packets stop arriving (instead of sticking at the
@@ -133,6 +156,10 @@ class StatusTracker:
             "connected": self.connected,
             "test_active": self.test_active,
             "test_pattern": self.test_pattern,
+            "scene": _SCENE_NAMES.get(self.scene, "Unknown"),
+            "scene_id": self.scene,
+            "auto_gen": self.auto_gen,
+            "paused": self.paused,
         }
         if wled_power:
             d["wled_power"] = wled_power.power_snapshot()
@@ -239,6 +266,15 @@ STATUS_HTML = """\
                     border-radius: 4px; margin-left: 0.75rem; vertical-align: middle; }
   .test-indicator.on { background: var(--accent); color: white; }
   .test-indicator.off { display: none; }
+
+  .pill { display: inline-block; font-size: 0.6rem; padding: 0.1rem 0.4rem;
+          border-radius: 4px; margin-left: 0.4rem; vertical-align: middle;
+          font-weight: 600; letter-spacing: 0.05em; }
+  .pill.auto { background: var(--dim); color: var(--bg); }
+  .pill.paused { background: var(--yellow); color: var(--bg); }
+  .pill.hidden { display: none; }
+  .scene-label { font-size: 0.7rem; color: var(--dim); margin-top: 0.25rem;
+                 text-transform: uppercase; letter-spacing: 0.05em; }
 </style>
 </head>
 <body>
@@ -248,10 +284,11 @@ STATUS_HTML = """\
   <div class="card">
     <div class="label">YARG Connection</div>
     <div class="value"><span class="status-dot off" id="dot"></span><span id="conn">Disconnected</span></div>
+    <div class="scene-label" id="scene-label"></div>
   </div>
   <div class="card">
     <div class="label">Current Cue</div>
-    <div class="value" id="cue">&mdash;</div>
+    <div class="value" id="cue">&mdash; <span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span></div>
   </div>
   <div class="card">
     <div class="label">BPM</div>
@@ -703,9 +740,27 @@ function update(d) {
   document.getElementById('ddp').textContent = d.ddp_frames_sent.toLocaleString();
 
   if (d.cue !== lastCue) {
-    document.getElementById('cue').textContent = d.cue;
+    // Replace just the leading text node so the AUTO/PAUSED pills survive.
+    const cueEl = document.getElementById('cue');
+    if (cueEl.firstChild && cueEl.firstChild.nodeType === Node.TEXT_NODE) {
+      cueEl.firstChild.nodeValue = d.cue + ' ';
+    } else {
+      cueEl.insertBefore(document.createTextNode(d.cue + ' '), cueEl.firstChild);
+    }
     addLog('<span class="cue">CUE \\u2192 ' + d.cue + '</span>');
     lastCue = d.cue;
+  }
+
+  // AUTO badge — YARG auto-generated venue track
+  document.getElementById('autogen-pill').classList.toggle('hidden', !d.auto_gen);
+  // PAUSED pill — YARG game is paused
+  document.getElementById('paused-pill').classList.toggle('hidden', !d.paused);
+  // Scene label under the connection card
+  const sceneEl = document.getElementById('scene-label');
+  if (d.scene && d.scene !== 'Unknown') {
+    sceneEl.textContent = 'Scene: ' + d.scene;
+  } else {
+    sceneEl.textContent = '';
   }
 
   const sh = d.strobe_hz;

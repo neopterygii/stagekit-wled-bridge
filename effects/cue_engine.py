@@ -103,11 +103,25 @@ class CueEngine:
 
         # Current cue ID
         self._current_cue = CueByte.NO_CUE
+        # Wall-clock time of the most recent cue change — read by the
+        # render thread to drive the cross-fade between cues.
+        self._cue_change_at: float = 0.0
 
         # Frame-level flags (set per-beat, consumed by mapper, cleared by engine)
         self._beat_flash = False
+        self._downbeat_flash = False    # MEASURE only — stronger accent
         self._glitch_trigger = False
         self._initial_flash_frames = 0
+        self._reveal_frames = 0         # one-shot reveal (Intro)
+        self._bonus_burst_frames = 0    # YARG bonus_effect — celebration burst
+
+        # Pause state (frozen patterns + global dim)
+        self.paused = False
+
+        # Per-zone, per-cell brightness 0.0..1.0. Computed by tick() with
+        # sub-cell interpolation between consecutive pattern steps so
+        # scanner/comet movement isn't quantised to 8 hops across the strip.
+        self.zone_cell_levels: list[list[float]] = [[0.0] * 8 for _ in range(4)]
 
     def get_strobe_visible(self) -> bool:
         """Returns whether pixels should be visible (considering strobe).
@@ -125,28 +139,63 @@ class CueEngine:
         fx = dict(self.effects)
         fx["bpm"] = self.bpm
         fx["beat_flash"] = self._beat_flash
+        fx["downbeat_flash"] = self._downbeat_flash
         fx["glitch_trigger"] = self._glitch_trigger
         fx["initial_flash"] = self._initial_flash_frames
+        fx["reveal_frames"] = self._reveal_frames
+        fx["bonus_burst"] = self._bonus_burst_frames
+        fx["paused"] = self.paused
+        fx["cue_change_at"] = self._cue_change_at
 
         # Clear transient flags after consumption
         self._beat_flash = False
+        self._downbeat_flash = False
         self._glitch_trigger = False
         if self._initial_flash_frames > 0:
             self._initial_flash_frames -= 1
+        if self._reveal_frames > 0:
+            self._reveal_frames -= 1
+        if self._bonus_burst_frames > 0:
+            self._bonus_burst_frames -= 1
 
         return fx
 
     def tick(self, now: float):
         """Advance all time-based patterns to the current timestamp.
 
-        Called from the render thread each frame.  Zone bitmasks are set
+        Called from the render thread each frame.  Zone bitmasks AND the
+        per-cell brightness levels (zone_cell_levels) are set
         deterministically from wall-clock time — immune to asyncio lag.
+
+        Sub-cell motion: each pattern interpolates between its current and
+        next step based on the fractional progress through the step
+        interval. So instead of cells popping on/off in 8 discrete jumps,
+        a moving bit fades out of one cell while fading into the next —
+        the LedFx-style smooth scanner look.
 
         If the deadline is far in the past (host suspend, container pause,
         long GC), snap forward instead of catching up step-by-step — that
         would block the render thread and emit a flurry of stale frames.
+
+        Pause handling: when self.paused is True, freeze pattern motion
+        entirely (don't advance steps, don't recompute levels). The mapper
+        applies the brightness dim separately.
         """
+        if self.paused:
+            return
+
         bpm = self.bpm
+        levels = self.zone_cell_levels
+
+        # Reset levels from the current bitmask state. Patterns will
+        # overwrite the cells they own with interpolated values; zones set
+        # by static cue setup (no pattern) stay at their bitmask values.
+        for zone_idx in range(4):
+            mask = self.zones[zone_idx]
+            row = levels[zone_idx]
+            for cell in range(8):
+                row[cell] = 1.0 if (mask >> cell) & 1 else 0.0
+
         patterns = self._time_patterns  # local ref — safe across threads
         for p in patterns:
             interval = p.step_interval(bpm)
@@ -161,18 +210,53 @@ class CueEngine:
                     p.reverse_counter += 1
                     if p.reverse_counter % 4 == 0:
                         p.direction = -p.direction
-            for zone, mask in p.steps[p.step]:
-                self.zones[zone] = mask
+
+            # Fractional progress (0.0 at step start, 1.0 at next-step boundary).
+            if interval > 0:
+                progress = 1.0 - (p.next_time - now) / interval
+                if progress < 0.0:
+                    progress = 0.0
+                elif progress > 1.0:
+                    progress = 1.0
+            else:
+                progress = 0.0
+
+            cur_step = p.steps[p.step]
+            nxt_idx = (p.step + p.direction) % len(p.steps)
+            nxt_step = p.steps[nxt_idx]
+            nxt_zones = {z: m for (z, m) in nxt_step}
+
+            inv_p = 1.0 - progress
+            for zone, cur_mask in cur_step:
+                nxt_mask = nxt_zones.get(zone, 0)
+                self.zones[zone] = cur_mask
+                row = levels[zone]
+                for cell in range(8):
+                    cur_on = (cur_mask >> cell) & 1
+                    nxt_on = (nxt_mask >> cell) & 1
+                    # Linear blend between current step's bit and next step's bit
+                    row[cell] = cur_on * inv_p + nxt_on * progress
 
     def on_beat(self, beat_type: int):
-        """Called when a beat event arrives from YARG."""
+        """Called when a beat event arrives from YARG.
+
+        MEASURE = downbeat (start of a measure) — most prominent.
+        STRONG  = strong beat within the measure.
+        WEAK    = sub-beat — fires _beat_event so listen-patterns nudge,
+                  but no sparkle/glitch overlay (would feel cluttered).
+        """
         self._last_beat_type = beat_type
-        if beat_type != BeatByte.OFF:
-            self._beat_event.set()
-            # Set transient flags for sparkle/glitch effects
-            if beat_type in (BeatByte.MEASURE, BeatByte.STRONG):
-                self._beat_flash = True
-                self._glitch_trigger = True
+        if beat_type == BeatByte.OFF:
+            return
+        self._beat_event.set()
+        if beat_type == BeatByte.MEASURE:
+            self._beat_flash = True
+            self._downbeat_flash = True
+            self._glitch_trigger = True
+        elif beat_type == BeatByte.STRONG:
+            self._beat_flash = True
+            self._glitch_trigger = True
+        # WEAK: event already set; no flash/glitch on the off-beats.
 
     def on_keyframe(self, keyframe_type: int):
         """Called when a keyframe event arrives from YARG."""
@@ -187,11 +271,21 @@ class CueEngine:
         """Called when strobe state changes."""
         self.strobe_rate = STROBE_RATES.get(strobe_byte, 0)
 
+    def on_bonus(self):
+        """Called when YARG flags a bonus_effect — celebration burst."""
+        # ~250 ms at 30 fps. Mapper renders white-tinted flash that decays.
+        self._bonus_burst_frames = 8
+
+    def on_paused(self, paused: bool):
+        """Freeze pattern motion; mapper handles the global dim."""
+        self.paused = paused
+
     def on_cue(self, cue_byte: int):
         """Called when the lighting cue changes."""
         if cue_byte == self._current_cue:
             return
         self._current_cue = cue_byte
+        self._cue_change_at = time.monotonic()
         self._kill_primitives()
         self._launch_cue(cue_byte)
 
@@ -230,8 +324,18 @@ class CueEngine:
         self._initial_flash_frames = 0
 
         if cue == CueByte.NO_CUE or cue == CueByte.BLACKOUT_FAST or \
-           cue == CueByte.BLACKOUT_SLOW or cue == CueByte.BLACKOUT_SPOTLIGHT:
+           cue == CueByte.BLACKOUT_SLOW:
             return  # All off
+
+        elif cue == CueByte.BLACKOUT_SPOTLIGHT:
+            # Single warm-white spotlight in the strip center, everything
+            # else dark. The mapper paints the spotlight when it sees
+            # spotlight_only=(r,g,b) with a spotlight_region < 1.0.
+            self._set_effects(
+                spotlight_only=(255, 200, 140),
+                spotlight_region=0.18,
+            )
+            return
 
         elif cue == CueByte.DEFAULT:
             # Blue/Red alternating toggle on KeyframeNext
@@ -256,24 +360,26 @@ class CueEngine:
             self._set_zone(YELLOW, ALL)
 
         elif cue == CueByte.WARM_MANUAL:
-            # Warm mood — smooth scanner trails
+            # Warm mood — manual cue: pattern only steps on KEYFRAME events
+            # from the chart (instead of running procedurally on BPM). Gives
+            # the chart-author control over rhythm of the scanner.
             self._set_effects(trails=8)
             self._start_beat_pattern(RED, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
-            ], cycles_per_beat=0.25)
+            ], cycles_per_beat=0.25, listen="keyframe")
             self._start_beat_pattern(YELLOW, [
                 TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR, THREE,
-            ], cycles_per_beat=0.125)
+            ], cycles_per_beat=0.125, listen="keyframe")
 
         elif cue == CueByte.COOL_MANUAL:
-            # Cool mood — smooth scanner trails
+            # Cool mood — manual cue: keyframe-stepped scanner.
             self._set_effects(trails=8)
             self._start_beat_pattern(BLUE, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
-            ], cycles_per_beat=0.25)
+            ], cycles_per_beat=0.25, listen="keyframe")
             self._start_beat_pattern(GREEN, [
                 TWO, ONE, ZERO, SEVEN, SIX, FIVE, FOUR, THREE,
-            ], cycles_per_beat=0.125)
+            ], cycles_per_beat=0.125, listen="keyframe")
 
         elif cue == CueByte.WARM_AUTOMATIC:
             # Red opposing-pair chase + Yellow CCW accent with scanner trails
@@ -354,13 +460,15 @@ class CueEngine:
             self._set_zone(BLUE, ALL)
 
         elif cue == CueByte.SILHOUETTES:
-            # Slow ambient green breathing
+            # Slow ambient green breathing across the full strip
             self._set_effects(breathing=0.05)
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.SILHOUETTES_SPOTLIGHT:
-            # Slightly faster green breathing for spotlight variant
-            self._set_effects(breathing=0.08)
+            # Same breathing green, but constrained to a spotlight region
+            # in the middle of the strip — the rest stays dark, evoking
+            # a single performer lit on a darkened stage.
+            self._set_effects(breathing=0.08, spotlight_region=0.40)
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.STOMP:
@@ -382,8 +490,12 @@ class CueEngine:
             self._set_zone(BLUE, TWO | SIX)
 
         elif cue == CueByte.INTRO:
-            # Green ambient breathing (same as Silhouettes but distinct cue)
-            self._set_effects(breathing=0.05)
+            # Reveal animation: pixels light up sequentially from the
+            # center outward, then settle into the green breathing wash.
+            # ~1.5s reveal at 30fps; mapper masks pixels beyond the
+            # current reveal radius, decremented per frame.
+            self._set_effects(breathing=0.05, reveal_total=45)
+            self._reveal_frames = 45
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.MENU:
@@ -439,6 +551,14 @@ class CueEngine:
                         await self._beat_event.wait()
                         self._beat_event.clear()
                         if self._last_beat_type in (BeatByte.MEASURE, BeatByte.STRONG):
+                            break
+                elif listen == "keyframe":
+                    # Step only when YARG emits a NEXT keyframe — used by
+                    # the *_MANUAL cues so the chart drives the rhythm.
+                    while True:
+                        await self._keyframe_event.wait()
+                        self._keyframe_event.clear()
+                        if self._last_keyframe_type == KeyframeByte.NEXT:
                             break
                 else:
                     steps_per_beat = len(pattern) * cycles_per_beat
