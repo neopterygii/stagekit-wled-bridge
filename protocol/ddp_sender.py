@@ -5,12 +5,15 @@ Port 4048, version 1, RGB24 data type.
 
 DDP packet structure (10-byte header + pixel data):
   byte 0: flags (version | push)
-  byte 1: sequence number (lower 4 bits)
+  byte 1: sequence number (lower 4 bits, 1-15; 0 = "no sequence")
   byte 2: data type (0x0B = RGB24)
   byte 3: destination (0x01 = display)
-  bytes 4-7: channel offset (big-endian uint32) 
+  bytes 4-7: channel offset (big-endian uint32)
   bytes 8-9: data length (big-endian uint16)
   bytes 10+: RGB pixel data
+
+Per the DDP spec, all packets that make up a single frame share the same
+sequence number, and the sequence cycles 1..15 (0 means "no sequence info").
 """
 
 import socket
@@ -34,19 +37,22 @@ class DDPSender:
         self.host = host
         self.port = port
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._seq = 0
         self._send_errors = 0
         self._send_times: list[float] = []  # rolling µs per sendto()
         self._frames_sent = 0
 
     def send_pixels(self, pixel_data: bytes) -> None:
         """Send RGB pixel data to WLED via DDP.
-        
+
         pixel_data: flat bytes of R,G,B,R,G,B,... for all LEDs.
         Automatically splits into multiple packets if > 480 LEDs.
+        All packets in this frame share one sequence number (1..15).
         """
         total = len(pixel_data)
         offset = 0
+
+        # One sequence per frame. Values 1..15; 0 is reserved for "no seq".
+        seq = (self._frames_sent % 15) + 1
 
         while offset < total:
             chunk_size = min(DDP_MAX_CHANNELS_PER_PACKET, total - offset)
@@ -59,7 +65,7 @@ class DDPSender:
             header = struct.pack(
                 ">BBBB I H",
                 flags,
-                self._seq & 0x0F,
+                seq,
                 DDP_TYPE_RGB24,
                 DDP_ID_DISPLAY,
                 offset,       # channel offset (big-endian)
@@ -80,7 +86,6 @@ class DDPSender:
                 self._send_errors += 1
 
             offset += chunk_size
-            self._seq = (self._seq + 1) & 0x0F
 
         self._frames_sent += 1
 

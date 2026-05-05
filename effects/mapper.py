@@ -77,15 +77,6 @@ class LEDMapper:
         # Timing for breathing
         self._start_time = time.monotonic()
 
-    # ── Helper: inline pixel read/write at index i ───────────────
-    # These are kept as methods for readability but are small enough
-    # for CPython to call without significant overhead on 96 pixels.
-
-    @staticmethod
-    def _is_off(buf: bytearray, i: int) -> bool:
-        o = i * 3
-        return buf[o] == 0 and buf[o + 1] == 0 and buf[o + 2] == 0
-
     @staticmethod
     def _set_px(buf: bytearray, i: int, r: int, g: int, b: int):
         o = i * 3
@@ -181,7 +172,14 @@ class LEDMapper:
         if solid_zones:
             for cell in range(NUM_CELLS):
                 cell_start = cell * CELL_SIZE
-                if all(self._is_off(buf, cell_start + j) for j in range(CELL_SIZE)):
+                base = cell_start * 3
+                cell_off = True
+                for j in range(CELL_SIZE):
+                    o = base + j * 3
+                    if buf[o] | buf[o + 1] | buf[o + 2]:
+                        cell_off = False
+                        break
+                if cell_off:
                     n = len(solid_zones)
                     leds_per = CELL_SIZE // n
                     remainder = CELL_SIZE % n
@@ -200,17 +198,19 @@ class LEDMapper:
             decay = 1.0 - 1.0 / max(trail_len, 1)
             for i in range(MAPPED_REGION):
                 o = i * 3
-                if not self._is_off(buf, i):
+                br = buf[o]
+                bg = buf[o + 1]
+                bb = buf[o + 2]
+                if br | bg | bb:
                     # New color — overwrite trail
-                    trail[o] = buf[o]
-                    trail[o + 1] = buf[o + 1]
-                    trail[o + 2] = buf[o + 2]
+                    trail[o] = br
+                    trail[o + 1] = bg
+                    trail[o + 2] = bb
                 else:
-                    # Decay the trail
                     tr = trail[o]
                     tg = trail[o + 1]
                     tb = trail[o + 2]
-                    if tr > 0 or tg > 0 or tb > 0:
+                    if tr | tg | tb:
                         tr = int(tr * decay)
                         tg = int(tg * decay)
                         tb = int(tb * decay)
@@ -235,9 +235,12 @@ class LEDMapper:
         for i in range(1, MAPPED_REGION):
             o = i * 3
             p = (i - 1) * 3
-            # Check if adjacent pixels differ and neither is black
-            if (buf[o] != buf[p] or buf[o+1] != buf[p+1] or buf[o+2] != buf[p+2]) \
-               and not self._is_off(buf, i) and not self._is_off(buf, i - 1):
+            # Adjacent pixels differ and neither is black
+            cur_on = buf[o] | buf[o + 1] | buf[o + 2]
+            prev_on = buf[p] | buf[p + 1] | buf[p + 2]
+            if cur_on and prev_on and (
+                buf[o] != buf[p] or buf[o + 1] != buf[p + 1] or buf[o + 2] != buf[p + 2]
+            ):
                 for offset in range(1, BLEND_WIDTH + 1):
                     t = 1.0 - offset / (BLEND_WIDTH + 1)
                     t_half = t * 0.5
@@ -279,7 +282,8 @@ class LEDMapper:
             sparkle = self._sparkle
             if beat_flash or sparkle_continuous:
                 for i in range(MAPPED_REGION):
-                    if not self._is_off(buf, i) and random.random() < sparkle_density:
+                    o = i * 3
+                    if (buf[o] | buf[o + 1] | buf[o + 2]) and random.random() < sparkle_density:
                         sparkle[i] = 3
 
             for i in range(MAPPED_REGION):

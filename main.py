@@ -10,6 +10,7 @@ Virtual.thread_function pattern.
 """
 
 import asyncio
+import logging
 import signal
 import sys
 import threading
@@ -21,6 +22,7 @@ from config import (
     LED_COUNT, GLOBAL_BRIGHTNESS,
     STATUS_HOST, STATUS_PORT,
     IDLE_TIMEOUT,
+    LOG_LEVEL,
 )
 from protocol.yarg_packet import parse_packet, CueByte
 from protocol.ddp_sender import DDPSender
@@ -29,6 +31,8 @@ from effects.cue_engine import CueEngine
 from effects.mapper import LEDMapper
 from status_server import StatusTracker, StatusServer
 from settings import BridgeSettings
+
+log = logging.getLogger(__name__)
 
 
 class YARGProtocol(asyncio.DatagramProtocol):
@@ -89,8 +93,11 @@ class WLEDPowerManager:
 
     def on_activity(self):
         """Called when a YARG packet is received."""
+        # Hot path — this runs ~88x/second per YARG packet. Update timestamp
+        # unconditionally (cheap), but only mark a power transition when the
+        # WLED is actually off.
         self._last_activity = time.monotonic()
-        if not self._wled_on:
+        if not self._wled_on and not self._power_on_pending:
             self._power_on_pending = True
 
     def on_test_activity(self):
@@ -100,16 +107,16 @@ class WLEDPowerManager:
     def _power_on(self):
         if self._api.set_power(True):
             self._wled_on = True
-            print("WLED: powered ON (YARG activity detected)")
+            log.info("WLED: powered ON")
         else:
-            print("WLED: failed to power on via API")
+            log.warning("WLED: failed to power on via API")
 
     def _power_off(self):
         if self._api.set_power(False):
             self._wled_on = False
-            print("WLED: powered OFF (idle timeout)")
+            log.info("WLED: powered OFF (idle)")
         else:
-            print("WLED: failed to power off via API")
+            log.warning("WLED: failed to power off via API")
 
     @property
     def is_on(self) -> bool:
@@ -149,7 +156,7 @@ class WLEDPowerManager:
         await asyncio.to_thread(self._api.fetch_wifi_info)
 
         if not self._enabled:
-            print(f"WLED power management: disabled (IDLE_TIMEOUT=0)")
+            log.info("WLED power management: disabled (IDLE_TIMEOUT=0)")
             # Still check reachability and handle manual power periodically
             wifi_counter = 0
             while True:
@@ -167,7 +174,7 @@ class WLEDPowerManager:
                     await asyncio.to_thread(self._api.fetch_wifi_info)
             return
 
-        print(f"WLED power management: enabled ({self._idle_timeout}s idle timeout)")
+        log.info("WLED power management: enabled (%ds idle timeout)", self._idle_timeout)
 
         check_counter = 0
         while True:
@@ -253,8 +260,8 @@ class RenderThread(threading.Thread):
         last_frame_time = time.perf_counter()
         fps = self._settings.fps
         interval = 1.0 / fps
-        print(f"Render thread started: {fps} FPS, {LED_COUNT} LEDs → "
-              f"{WLED_HOST}:{WLED_DDP_PORT}")
+        log.info("Render thread started: %d FPS, %d LEDs → %s:%d",
+                 fps, LED_COUNT, WLED_HOST, WLED_DDP_PORT)
 
         next_frame = time.perf_counter()
 
@@ -345,7 +352,7 @@ class RenderThread(threading.Thread):
                 sleep_time = 0.001
             time.sleep(sleep_time)
 
-        print("Render thread stopped")
+        log.info("Render thread stopped")
 
     def stop(self):
         self._active = False
@@ -377,14 +384,15 @@ class RenderThread(threading.Thread):
 
 async def main():
     idle_mins = IDLE_TIMEOUT // 60 if IDLE_TIMEOUT else 0
-    print("=" * 60)
-    print("  YARG → WLED Stage Kit Bridge")
-    print(f"  Listening on {YARG_LISTEN_HOST}:{YARG_LISTEN_PORT}")
-    print(f"  Sending DDP to {WLED_HOST}:{WLED_DDP_PORT}")
-    print(f"  LED count: {LED_COUNT}")
-    print(f"  WLED idle timeout: {idle_mins}m" if IDLE_TIMEOUT else "  WLED idle timeout: disabled")
-    print(f"  Status page: http://{STATUS_HOST}:{STATUS_PORT}/")
-    print("=" * 60)
+    log.info("YARG → WLED Stage Kit Bridge")
+    log.info("  Listening on %s:%d", YARG_LISTEN_HOST, YARG_LISTEN_PORT)
+    log.info("  Sending DDP to %s:%d", WLED_HOST, WLED_DDP_PORT)
+    log.info("  LED count: %d", LED_COUNT)
+    if IDLE_TIMEOUT:
+        log.info("  WLED idle timeout: %dm", idle_mins)
+    else:
+        log.info("  WLED idle timeout: disabled")
+    log.info("  Status page: http://%s:%d/", STATUS_HOST, STATUS_PORT)
 
     engine = CueEngine()
     mapper = LEDMapper(LED_COUNT)
@@ -424,7 +432,7 @@ async def main():
     stop = asyncio.Event()
 
     def handle_signal():
-        print("\nShutting down...")
+        log.info("Shutting down...")
         stop.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -432,25 +440,39 @@ async def main():
 
     await stop.wait()
 
-    # Cleanup
+    # Cleanup — stop the render thread first so it can't race with the
+    # final all-black DDP send below, then send black before closing the
+    # socket and turning the strip off.
     render_thread.stop()
     render_thread.join(timeout=2.0)
     broadcast_task.cancel()
     watchdog_task.cancel()
     transport.close()
+
+    try:
+        sender.send_pixels(b'\x00' * LED_COUNT * 3)
+    except Exception as e:
+        log.debug("Final all-black send failed: %s", e)
     sender.close()
 
-    # Send all-black and turn off WLED on exit
     try:
-        cleanup_sender = DDPSender(WLED_HOST, WLED_DDP_PORT)
-        cleanup_sender.send_pixels(b'\x00' * LED_COUNT * 3)
-        cleanup_sender.close()
         wled_api.set_power(False)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("Final WLED power-off failed: %s", e)
 
-    print("Goodbye.")
+    log.info("Goodbye.")
+
+
+def _configure_logging():
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
 
 
 if __name__ == "__main__":
+    _configure_logging()
     asyncio.run(main())

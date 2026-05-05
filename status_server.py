@@ -7,10 +7,18 @@ Includes built-in test pattern controls to trigger cues from the web UI.
 
 import asyncio
 import json
+import logging
 import time
 from http import HTTPStatus
 
 from protocol.yarg_packet import CueByte, BeatByte, StrobeSpeed
+
+log = logging.getLogger(__name__)
+
+# A YARG sender is considered "connected" if we've heard from it within this
+# many seconds. YARG sends ~88 Hz, so anything beyond a few seconds means
+# the stream stopped.
+CONNECTED_TIMEOUT = 3.0
 
 
 # Reverse lookup: cue byte value → name
@@ -55,23 +63,30 @@ class StatusTracker:
         self.packets_per_sec = 0.0
         self.ddp_frames_sent = 0
         self.last_beat = 0
-        self.connected = False
         self.test_active = False
         self.test_pattern = ""
         self.render_thread = None  # set after creation in main()
+        self._last_packet_time = 0.0
 
         self._pkt_count_window: list[float] = []
         self._sse_queues: list[asyncio.Queue] = []
+
+    @property
+    def connected(self) -> bool:
+        """True if we've heard a YARG packet recently."""
+        if self._last_packet_time == 0.0:
+            return False
+        return (time.monotonic() - self._last_packet_time) < CONNECTED_TIMEOUT
 
     def on_packet(self):
         now = time.monotonic()
         self._pkt_count_window.append(now)
         self.packets_received += 1
+        self._last_packet_time = now
         # Trim to last 2 seconds
         cutoff = now - 2.0
         self._pkt_count_window = [t for t in self._pkt_count_window if t > cutoff]
         self.packets_per_sec = len(self._pkt_count_window) / 2.0
-        self.connected = True
 
     def on_cue(self, cue_byte: int):
         self.current_cue = cue_byte
@@ -88,6 +103,17 @@ class StatusTracker:
         self.last_beat = beat
 
     def snapshot(self, wled_power=None, settings=None) -> dict:
+        # Recompute packets/sec from the rolling window so the value decays
+        # to zero when packets stop arriving (instead of sticking at the
+        # last observed rate until the next packet).
+        now = time.monotonic()
+        cutoff = now - 2.0
+        live = [t for t in self._pkt_count_window if t > cutoff]
+        if len(live) != len(self._pkt_count_window):
+            self._pkt_count_window = live
+        pps = len(live) / 2.0
+        self.packets_per_sec = pps
+
         d = {
             "cue": self.current_cue_name,
             "cue_id": self.current_cue,
@@ -101,7 +127,7 @@ class StatusTracker:
             },
             "zones_raw": self.zones,
             "packets_received": self.packets_received,
-            "packets_per_sec": round(self.packets_per_sec, 1),
+            "packets_per_sec": round(pps, 1),
             "ddp_frames_sent": self.ddp_frames_sent,
             "last_beat": self.last_beat,
             "connected": self.connected,
@@ -266,13 +292,8 @@ STATUS_HTML = """\
   <div class="card" id="brightness-card">
     <div class="label">Brightness</div>
     <div class="value" id="brightness-pct">100%</div>
-    <div class="btn-grid" id="brightness-btns" style="margin-top:0.4rem">
-      <button class="test-btn" data-brightness="10" onclick="setBrightness(10)">10%</button>
-      <button class="test-btn" data-brightness="25" onclick="setBrightness(25)">25%</button>
-      <button class="test-btn" data-brightness="50" onclick="setBrightness(50)">50%</button>
-      <button class="test-btn" data-brightness="75" onclick="setBrightness(75)">75%</button>
-      <button class="test-btn active" data-brightness="100" onclick="setBrightness(100)">100%</button>
-    </div>
+    <input type="range" id="brightness-slider" min="0" max="255" value="255" step="1"
+           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
   </div>
   <div class="card" id="palette-card">
     <div class="label">Color Palette</div>
@@ -411,19 +432,36 @@ function togglePower() {
                         body: JSON.stringify({ action: 'toggle' }) });
 }
 
-// Brightness step buttons
-function setBrightness(pct) {
-  const raw = Math.round(pct / 100 * 255);
+// Brightness slider — sends raw 0-255 with light debouncing so we don't
+// flood the bridge while dragging.
+const brightnessSlider = document.getElementById('brightness-slider');
+const brightnessPct = document.getElementById('brightness-pct');
+let brightnessSendTimer = null;
+let brightnessUserDragging = false;
+
+function showBrightness(raw) {
+  const pct = Math.round(raw / 255 * 100);
+  brightnessPct.textContent = pct + '%';
+}
+
+function sendBrightness(raw) {
   fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                            body: JSON.stringify({ brightness: raw }) });
-  highlightBrightness(pct);
 }
-function highlightBrightness(pct) {
-  document.querySelectorAll('#brightness-btns .test-btn').forEach(b => {
-    b.classList.toggle('active', parseInt(b.dataset.brightness) === pct);
-  });
-  document.getElementById('brightness-pct').textContent = pct + '%';
-}
+
+brightnessSlider.addEventListener('input', () => {
+  brightnessUserDragging = true;
+  const raw = parseInt(brightnessSlider.value);
+  showBrightness(raw);
+  clearTimeout(brightnessSendTimer);
+  brightnessSendTimer = setTimeout(() => sendBrightness(raw), 80);
+});
+brightnessSlider.addEventListener('change', () => {
+  brightnessUserDragging = false;
+  // Final send to ensure the latest value lands even if a timer was queued.
+  clearTimeout(brightnessSendTimer);
+  sendBrightness(parseInt(brightnessSlider.value));
+});
 
 // Palette select
 const paletteSelect = document.getElementById('palette-select');
@@ -469,12 +507,14 @@ function toggleDirection() {
 
 function updateSettings(s) {
   if (!s) return;
-  // Sync brightness buttons from server value
-  const pct = Math.round(s.brightness / 255 * 100);
-  // Snap to nearest available step for display
-  const steps = [10, 25, 50, 75, 100];
-  const snapped = steps.reduce((prev, curr) => Math.abs(curr - pct) < Math.abs(prev - pct) ? curr : prev);
-  highlightBrightness(snapped);
+  // Sync brightness slider from server value (skip while user is dragging
+  // so our updates don't fight their input).
+  if (typeof s.brightness === 'number' && !brightnessUserDragging) {
+    if (parseInt(brightnessSlider.value) !== s.brightness) {
+      brightnessSlider.value = s.brightness;
+    }
+    showBrightness(s.brightness);
+  }
   // Populate palette dropdown once
   if (!palettesPopulated && s.palettes) {
     paletteSelect.innerHTML = '';
@@ -736,7 +776,7 @@ class StatusServer:
 
     async def start(self):
         server = await asyncio.start_server(self._handle_connection, self.host, self.port)
-        print(f"Status page: http://{self.host}:{self.port}/")
+        log.info("Status page: http://%s:%d/", self.host, self.port)
         return server
 
     def _start_test_beats(self, bpm: float):
@@ -831,7 +871,7 @@ class StatusServer:
             self.wled_power.manual_power(False)
             return 200, "WLED powered off"
         elif action == "toggle":
-            is_on = self.wled_power._wled_on
+            is_on = self.wled_power.is_on
             self.wled_power.manual_power(not is_on)
             return 200, f"WLED powered {'off' if is_on else 'on'}"
         return 400, f"Unknown power action: {action}"
@@ -840,20 +880,26 @@ class StatusServer:
         """Process a settings update request."""
         if self.settings is None:
             return 500, "Settings not connected"
+        if not body:
+            return 400, "No settings provided"
         changed = []
         if "brightness" in body:
             try:
+                old = self.settings.brightness
                 self.settings.brightness = int(body["brightness"])
-                changed.append(f"brightness={self.settings.brightness}")
+                if self.settings.brightness != old:
+                    changed.append(f"brightness={self.settings.brightness}")
             except (ValueError, TypeError):
                 return 400, "Invalid brightness value"
         if "palette" in body:
             old = self.settings.palette_name
-            self.settings.palette_name = str(body["palette"])
+            requested = str(body["palette"])
+            self.settings.palette_name = requested
             if self.settings.palette_name != old:
                 changed.append(f"palette={self.settings.palette_name}")
-            elif str(body["palette"]) != old:
-                return 400, f"Unknown palette: {body['palette']}"
+            elif requested != old:
+                # Setter silently ignored an unknown palette name.
+                return 400, f"Unknown palette: {requested}"
         if "fps" in body:
             try:
                 old_fps = self.settings.fps
@@ -868,7 +914,7 @@ class StatusServer:
             if self.settings.direction != old_dir:
                 changed.append(f"direction={self.settings.direction}")
         if not changed:
-            return 400, "No valid settings provided"
+            return 200, "No change"
         return 200, "Updated: " + ", ".join(changed)
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):

@@ -4,6 +4,12 @@ __pycache__/
 .git/
 .github/
 .venv/
+venv/
 *.egg-info/
 .env
 .DS_Store
+.vscode/
+.idea/
+.pytest_cache/
+*.md
+test_sender.py

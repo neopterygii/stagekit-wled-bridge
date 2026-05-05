@@ -5,8 +5,11 @@ can modify them at runtime via the /api/settings endpoint.
 """
 
 import json
+import logging
 import os
 import threading
+
+log = logging.getLogger(__name__)
 
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "/data/settings.json")
 
@@ -153,31 +156,56 @@ class BridgeSettings:
         self._path = path
         self._lock = threading.Lock()
         self._data = dict(DEFAULT_SETTINGS)
+        self._writable = self._probe_writable()
+        if not self._writable:
+            log.warning(
+                "Settings: %s is not writable — runtime changes will not persist. "
+                "Mount a volume at %s to enable persistence.",
+                self._path, os.path.dirname(self._path) or ".",
+            )
         self._load()
+
+    def _probe_writable(self) -> bool:
+        directory = os.path.dirname(self._path) or "."
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            return False
+        return os.access(directory, os.W_OK)
 
     def _load(self):
         try:
             with open(self._path, "r") as f:
                 stored = json.load(f)
-            # Validate and merge
-            if isinstance(stored.get("brightness"), int):
-                self._data["brightness"] = max(0, min(255, stored["brightness"]))
-            if stored.get("palette") in PALETTES:
-                self._data["palette"] = stored["palette"]
-            if isinstance(stored.get("fps"), int) and stored["fps"] in VALID_FPS:
-                self._data["fps"] = stored["fps"]
-            if stored.get("direction") in ("normal", "reverse"):
-                self._data["direction"] = stored["direction"]
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            pass
+        except FileNotFoundError:
+            return
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("Settings: failed to load %s: %s", self._path, e)
+            return
+        if isinstance(stored.get("brightness"), int):
+            self._data["brightness"] = max(0, min(255, stored["brightness"]))
+        if stored.get("palette") in PALETTES:
+            self._data["palette"] = stored["palette"]
+        if isinstance(stored.get("fps"), int) and stored["fps"] in VALID_FPS:
+            self._data["fps"] = stored["fps"]
+        if stored.get("direction") in ("normal", "reverse"):
+            self._data["direction"] = stored["direction"]
 
     def _save(self):
+        if not self._writable:
+            return
+        # Atomic write: tmp + rename so a crash mid-write can't corrupt the file.
+        tmp = self._path + ".tmp"
         try:
-            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-            with open(self._path, "w") as f:
+            with open(tmp, "w") as f:
                 json.dump(self._data, f, indent=2)
+            os.replace(tmp, self._path)
         except OSError as e:
-            print(f"Settings: failed to save: {e}")
+            log.error("Settings: failed to save: %s", e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     @property
     def brightness(self) -> int:

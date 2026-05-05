@@ -36,7 +36,17 @@ services:
       LED_COUNT: "120"                # Number of LEDs on your strip
       GLOBAL_BRIGHTNESS: "255"        # 0-255
       IDLE_TIMEOUT: "1800"            # Auto-off after 30 min idle (0 = disabled)
+    volumes:
+      - stagekit-data:/data           # Persists brightness/palette/fps across container recreates
+
+volumes:
+  stagekit-data:
 ```
+
+> **Note on the web UI:** the dashboard binds to `0.0.0.0:8080` with no
+> authentication. Anyone on your LAN can change brightness, palette, FPS,
+> trigger test patterns, and toggle WLED power. Fine for a home network;
+> don't expose port 8080 to the public internet.
 
 ```bash
 docker compose up -d
@@ -68,6 +78,16 @@ All settings are controlled via environment variables:
 | `STATUS_HOST` | `0.0.0.0` | Bind address for the web status page |
 | `STATUS_PORT` | `8080` | HTTP port for the status page |
 | `IDLE_TIMEOUT` | `1800` | Seconds of no YARG packets before WLED is powered off (0 = disabled) |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
+| `SETTINGS_FILE` | `/data/settings.json` | Where to store runtime settings (brightness, palette, FPS, direction) |
+
+### Persistent Settings
+
+Brightness, palette, FPS, and direction are stored in `SETTINGS_FILE`
+(`/data/settings.json` by default) so they survive container restarts.
+The compose example above mounts a named volume at `/data` for this. If
+`/data` isn't writable the bridge logs a warning and runs read-only —
+runtime changes will work but won't survive a recreate.
 
 ### WLED Power Management
 
@@ -186,9 +206,22 @@ If the status page shows "Disconnected" with 0 packets/sec:
 | **YARG setting** | "UDP Data Stream" must be enabled in Settings → Experimental |
 | **Firewall** | UDP port 36107 must not be blocked on the host running the container |
 | **Network mode** | The container must use `network_mode: host` to receive UDP broadcasts |
-| **Same subnet** | YARG PC and the container host must be on the same network/VLAN |
+| **Same L2 broadcast domain** | YARG sends to `255.255.255.255` (limited broadcast). It does not cross VLANs or routed subnets — the YARG PC and the container host must share the same L2 segment |
+| **Wi-Fi → wired bridging** | Some Wi-Fi APs drop or refuse to forward limited broadcasts onto the wired LAN. "Client isolation" / "AP isolation" / guest-network features will silently break this. Try moving the YARG PC onto the same network type as the host, or test from a wired client |
+| **Multi-homed sender** | macOS / Windows hosts with both Wi-Fi and Ethernet active will pick one outgoing interface for the broadcast. If it picks the "wrong" one, the broadcast may not reach the bridge — disable the other interface to test |
 | **Play a song** | Full lighting data (BPM, beats, cues) requires an active song — though YARG does send basic data from the menu screen |
 | **Test the strip first** | Use the built-in Test Patterns on the status page to verify WLED/LED connectivity independently of YARG |
+
+**Diagnose where it's broken with one command** (run on the host running the container):
+
+```bash
+# In the container:
+docker exec stagekit-wled-bridge sh -c \
+  "apk add --no-cache tcpdump >/dev/null && tcpdump -ni any -c 5 udp dst port 36107"
+```
+
+- **Zero packets** → YARG packets aren't reaching this host. Sender / network / firewall problem.
+- **Packets visible but `/api/status` shows `packets_received: 0`** → bridge / parser problem (open an issue).
 
 ## WLED Setup
 

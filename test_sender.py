@@ -1,7 +1,6 @@
 """Test packet sender — generates fake YARG UDP packets for development.
 
 Usage:
-  python test_sender.py --pattern chase_blue
   python test_sender.py --pattern all_on
   python test_sender.py --pattern strobe_fast
   python test_sender.py --pattern warm_loop

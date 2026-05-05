@@ -84,7 +84,6 @@ class CueEngine:
 
         # Strobe state
         self.strobe_rate = 0  # Hz, 0 = off
-        self._strobe_on = True  # strobe phase toggle
 
         # BPM from YARG
         self.bpm = 120.0
@@ -142,11 +141,19 @@ class CueEngine:
 
         Called from the render thread each frame.  Zone bitmasks are set
         deterministically from wall-clock time — immune to asyncio lag.
+
+        If the deadline is far in the past (host suspend, container pause,
+        long GC), snap forward instead of catching up step-by-step — that
+        would block the render thread and emit a flurry of stale frames.
         """
         bpm = self.bpm
         patterns = self._time_patterns  # local ref — safe across threads
         for p in patterns:
             interval = p.step_interval(bpm)
+            # Snap forward if we've fallen more than 1s (or 100 steps) behind.
+            max_catchup = max(100, int(1.0 / interval)) if interval > 0 else 100
+            if interval > 0 and (now - p.next_time) > max(1.0, interval * max_catchup):
+                p.next_time = now + interval
             while now >= p.next_time:
                 p.step = (p.step + p.direction) % len(p.steps)
                 p.next_time += interval

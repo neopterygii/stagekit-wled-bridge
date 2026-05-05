@@ -23,3 +23,11 @@ services:
       STATUS_PORT: "8080"
       # Auto power-off WLED after idle (seconds, 0 = disabled)
       IDLE_TIMEOUT: "1800"
+      # Logging — DEBUG, INFO, WARNING, ERROR
+      LOG_LEVEL: "INFO"
+    volumes:
+      # Persists brightness / palette / fps / direction across container recreates.
+      - stagekit-data:/data
+
+volumes:
+  stagekit-data:
