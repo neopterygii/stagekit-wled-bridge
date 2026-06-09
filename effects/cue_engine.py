@@ -40,6 +40,10 @@ STROBE_RATES = {
     StrobeSpeed.FASTEST: 16,
 }
 
+# Animation durations in seconds (wall-clock, independent of render FPS)
+REVEAL_DURATION = 1.5        # Intro center-out reveal
+BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
+
 
 class _TimePattern:
     """Time-driven zone pattern ticked deterministically by the render thread.
@@ -47,12 +51,15 @@ class _TimePattern:
     Instead of asyncio.sleep() between steps, the current step is computed
     from wall-clock time — immune to event-loop congestion.
     """
-    __slots__ = ('steps', 'step', 'next_time', 'bpm_sync', 'param',
-                 'direction', 'reverse_on_beat', 'reverse_counter')
+    __slots__ = ('steps', 'step_dicts', 'step', 'next_time', 'bpm_sync',
+                 'param', 'direction', 'reverse_on_beat', 'reverse_counter')
 
     def __init__(self, steps, *, bpm_sync, param, now, init_bpm=120.0,
                  direction=1, reverse_on_beat=False):
         self.steps = steps           # list of list[(zone, mask)]
+        # Per-step {zone: mask} lookups, precomputed so tick() doesn't
+        # rebuild a dict per pattern per frame during interpolation.
+        self.step_dicts = [dict(s) for s in steps]
         self.step = 0                # current step index
         self.bpm_sync = bpm_sync     # True → param is cycles_per_beat
         self.param = param           # cycles_per_beat (bpm) or total_seconds (timed)
@@ -112,11 +119,16 @@ class CueEngine:
         self._downbeat_flash = False    # MEASURE only — stronger accent
         self._glitch_trigger = False
         self._initial_flash_frames = 0
-        self._reveal_frames = 0         # one-shot reveal (Intro)
-        self._bonus_burst_frames = 0    # YARG bonus_effect — celebration burst
+        # One-shot reveal (Intro): monotonic start time, 0.0 = inactive.
+        self._reveal_started_at = 0.0
+        # YARG bonus_effect celebration burst: monotonic deadline, 0.0 = inactive.
+        self._bonus_until = 0.0
 
-        # Pause state (frozen patterns + global dim)
+        # Pause state (frozen patterns + global dim). While paused, animation
+        # clocks read _paused_at instead of now; on unpause, active deadlines
+        # are shifted forward by the pause duration so nothing is consumed.
         self.paused = False
+        self._paused_at = 0.0
 
         # Per-zone, per-cell brightness 0.0..1.0. Computed by tick() with
         # sub-cell interpolation between consecutive pattern steps so
@@ -136,14 +148,16 @@ class CueEngine:
 
     def get_effects(self) -> dict:
         """Return current effects dict with transient flags, then clear them."""
+        # While paused, animation clocks freeze at the pause instant.
+        now = self._paused_at if self.paused else time.monotonic()
         fx = dict(self.effects)
         fx["bpm"] = self.bpm
         fx["beat_flash"] = self._beat_flash
         fx["downbeat_flash"] = self._downbeat_flash
         fx["glitch_trigger"] = self._glitch_trigger
         fx["initial_flash"] = self._initial_flash_frames
-        fx["reveal_frames"] = self._reveal_frames
-        fx["bonus_burst"] = self._bonus_burst_frames
+        fx["reveal_progress"] = self._reveal_progress(now)
+        fx["bonus_t"] = self._bonus_remaining(now)
         fx["paused"] = self.paused
         fx["cue_change_at"] = self._cue_change_at
 
@@ -153,12 +167,24 @@ class CueEngine:
         self._glitch_trigger = False
         if self._initial_flash_frames > 0:
             self._initial_flash_frames -= 1
-        if self._reveal_frames > 0:
-            self._reveal_frames -= 1
-        if self._bonus_burst_frames > 0:
-            self._bonus_burst_frames -= 1
 
         return fx
+
+    def _reveal_progress(self, now: float) -> float:
+        """Intro reveal progress 0.0..1.0; 1.0 = finished or inactive."""
+        if self._reveal_started_at <= 0.0:
+            return 1.0
+        progress = (now - self._reveal_started_at) / REVEAL_DURATION
+        return min(1.0, max(0.0, progress))
+
+    def _bonus_remaining(self, now: float) -> float:
+        """Bonus burst intensity 1.0 → 0.0; 0.0 = expired or inactive."""
+        if self._bonus_until <= 0.0:
+            return 0.0
+        remaining = self._bonus_until - now
+        if remaining <= 0.0:
+            return 0.0
+        return min(1.0, remaining / BONUS_BURST_DURATION)
 
     def tick(self, now: float):
         """Advance all time-based patterns to the current timestamp.
@@ -178,12 +204,10 @@ class CueEngine:
         would block the render thread and emit a flurry of stale frames.
 
         Pause handling: when self.paused is True, freeze pattern motion
-        entirely (don't advance steps, don't recompute levels). The mapper
-        applies the brightness dim separately.
+        (don't advance steps or interpolate). The bitmask→levels reset
+        still runs so cue changes and web test patterns made while paused
+        reach the strip. The mapper applies the brightness dim separately.
         """
-        if self.paused:
-            return
-
         bpm = self.bpm
         levels = self.zone_cell_levels
 
@@ -195,6 +219,9 @@ class CueEngine:
             row = levels[zone_idx]
             for cell in range(8):
                 row[cell] = 1.0 if (mask >> cell) & 1 else 0.0
+
+        if self.paused:
+            return
 
         patterns = self._time_patterns  # local ref — safe across threads
         for p in patterns:
@@ -223,8 +250,7 @@ class CueEngine:
 
             cur_step = p.steps[p.step]
             nxt_idx = (p.step + p.direction) % len(p.steps)
-            nxt_step = p.steps[nxt_idx]
-            nxt_zones = {z: m for (z, m) in nxt_step}
+            nxt_zones = p.step_dicts[nxt_idx]
 
             inv_p = 1.0 - progress
             for zone, cur_mask in cur_step:
@@ -273,11 +299,23 @@ class CueEngine:
 
     def on_bonus(self):
         """Called when YARG flags a bonus_effect — celebration burst."""
-        # ~250 ms at 30 fps. Mapper renders white-tinted flash that decays.
-        self._bonus_burst_frames = 8
+        # Mapper renders a white-tinted flash that decays over the duration.
+        self._bonus_until = time.monotonic() + BONUS_BURST_DURATION
 
     def on_paused(self, paused: bool):
         """Freeze pattern motion; mapper handles the global dim."""
+        if paused == self.paused:
+            return
+        if paused:
+            self._paused_at = time.monotonic()
+        else:
+            # Shift active animation deadlines forward by the pause duration
+            # so reveal/bonus resume where they froze instead of being spent.
+            delta = time.monotonic() - self._paused_at
+            if self._reveal_started_at > 0.0:
+                self._reveal_started_at += delta
+            if self._bonus_until > 0.0:
+                self._bonus_until += delta
         self.paused = paused
 
     def on_cue(self, cue_byte: int):
@@ -322,6 +360,7 @@ class CueEngine:
             self.zones[i] = NONE
         self.effects = {}
         self._initial_flash_frames = 0
+        self._reveal_started_at = 0.0  # cancel an in-flight Intro reveal
 
         if cue == CueByte.NO_CUE or cue == CueByte.BLACKOUT_FAST or \
            cue == CueByte.BLACKOUT_SLOW:
@@ -491,11 +530,11 @@ class CueEngine:
 
         elif cue == CueByte.INTRO:
             # Reveal animation: pixels light up sequentially from the
-            # center outward, then settle into the green breathing wash.
-            # ~1.5s reveal at 30fps; mapper masks pixels beyond the
-            # current reveal radius, decremented per frame.
-            self._set_effects(breathing=0.05, reveal_total=45)
-            self._reveal_frames = 45
+            # center outward over REVEAL_DURATION seconds, then settle
+            # into the green breathing wash. The mapper masks pixels
+            # beyond the radius given by reveal_progress.
+            self._set_effects(breathing=0.05)
+            self._reveal_started_at = time.monotonic()
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.MENU:
@@ -553,10 +592,21 @@ class CueEngine:
                         if self._last_beat_type in (BeatByte.MEASURE, BeatByte.STRONG):
                             break
                 elif listen == "keyframe":
-                    # Step only when YARG emits a NEXT keyframe — used by
-                    # the *_MANUAL cues so the chart drives the rhythm.
+                    # Step on YARG NEXT keyframes — used by the *_MANUAL
+                    # cues so the chart drives the rhythm — but fall back
+                    # to BPM pacing when keyframes stop arriving so the
+                    # pattern never freezes on charts without them.
+                    steps_per_beat = len(pattern) * cycles_per_beat
+                    bpm = self.bpm if self.bpm > 0 else 120.0
+                    timeout = 2.0 * 60.0 / bpm / steps_per_beat
                     while True:
-                        await self._keyframe_event.wait()
+                        try:
+                            await asyncio.wait_for(
+                                self._keyframe_event.wait(), timeout)
+                        except asyncio.TimeoutError:
+                            if self.paused:
+                                continue  # frozen — keep waiting
+                            break  # no keyframes — step on BPM cadence
                         self._keyframe_event.clear()
                         if self._last_keyframe_type == KeyframeByte.NEXT:
                             break

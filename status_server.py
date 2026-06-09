@@ -11,7 +11,7 @@ import logging
 import time
 from http import HTTPStatus
 
-from protocol.yarg_packet import CueByte, BeatByte, StrobeSpeed
+from protocol.yarg_packet import CueByte, BeatByte, SceneIndexByte, StrobeSpeed
 
 log = logging.getLogger(__name__)
 
@@ -24,14 +24,9 @@ CONNECTED_TIMEOUT = 3.0
 # Reverse lookup: cue byte value → name
 _CUE_NAMES = {v: k for k, v in vars(CueByte).items() if isinstance(v, int)}
 
-# YARG scene index → human label (matches DataStreamController.SceneIndexByte)
-_SCENE_NAMES = {
-    0: "Unknown",
-    1: "Menu",
-    2: "Gameplay",
-    3: "Score",
-    4: "Calibration",
-}
+# YARG scene index → human label, derived from the protocol enum
+_SCENE_NAMES = {v: k.title() for k, v in vars(SceneIndexByte).items()
+                if isinstance(v, int)}
 
 # Test patterns available from the web UI
 TEST_PATTERNS = {
@@ -288,7 +283,7 @@ STATUS_HTML = """\
   </div>
   <div class="card">
     <div class="label">Current Cue</div>
-    <div class="value" id="cue">&mdash; <span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span></div>
+    <div class="value"><span id="cue">&mdash;</span> <span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span></div>
   </div>
   <div class="card">
     <div class="label">BPM</div>
@@ -740,13 +735,7 @@ function update(d) {
   document.getElementById('ddp').textContent = d.ddp_frames_sent.toLocaleString();
 
   if (d.cue !== lastCue) {
-    // Replace just the leading text node so the AUTO/PAUSED pills survive.
-    const cueEl = document.getElementById('cue');
-    if (cueEl.firstChild && cueEl.firstChild.nodeType === Node.TEXT_NODE) {
-      cueEl.firstChild.nodeValue = d.cue + ' ';
-    } else {
-      cueEl.insertBefore(document.createTextNode(d.cue + ' '), cueEl.firstChild);
-    }
+    document.getElementById('cue').textContent = d.cue;
     addLog('<span class="cue">CUE \\u2192 ' + d.cue + '</span>');
     lastCue = d.cue;
   }

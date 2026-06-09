@@ -92,6 +92,27 @@ class LEDMapper:
         buf[o + 1] = min(255, buf[o + 1] + g)
         buf[o + 2] = min(255, buf[o + 2] + b)
 
+    @staticmethod
+    def _center_window(fraction: float) -> tuple[int, int]:
+        """(lo, hi) pixel bounds of a centered window covering *fraction* of the strip."""
+        half = max(1, int(MAPPED_REGION * fraction / 2.0))
+        mid = MAPPED_REGION // 2
+        return max(0, mid - half), min(MAPPED_REGION, mid + half)
+
+    @staticmethod
+    def _mask_outside(buf: bytearray, lo: int, hi: int):
+        """Zero all pixels outside [lo, hi)."""
+        for i in range(lo):
+            o = i * 3
+            buf[o] = 0
+            buf[o + 1] = 0
+            buf[o + 2] = 0
+        for i in range(hi, MAPPED_REGION):
+            o = i * 3
+            buf[o] = 0
+            buf[o + 1] = 0
+            buf[o + 2] = 0
+
     def render(self, zone_bitmasks: list[int], zone_colors: dict | None = None,
                effects: dict | None = None, brightness: float = 1.0,
                reverse: bool = False,
@@ -135,11 +156,11 @@ class LEDMapper:
 
         # New YARG-data effects
         paused = effects.get("paused", False)
-        bonus_burst = effects.get("bonus_burst", 0)
-        reveal_frames = effects.get("reveal_frames", 0)
-        reveal_total = effects.get("reveal_total", 0)
+        bonus_t = effects.get("bonus_t", 0.0)                    # 1.0 → 0.0 decay
+        reveal_progress = effects.get("reveal_progress", 1.0)    # < 1.0 = masking
         spotlight_region = effects.get("spotlight_region", 0.0)  # 0 = no mask
         spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
+        fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
 
         buf = self._buf
 
@@ -161,13 +182,8 @@ class LEDMapper:
         # Spotlight-only mode (BLACKOUT_SPOTLIGHT): paint a fixed colour in
         # the centre region and skip the normal zone mapping entirely.
         if spotlight_only is not None:
-            sr = spotlight_only[0]
-            sg = spotlight_only[1]
-            sb = spotlight_only[2]
-            half = max(1, int(MAPPED_REGION * spotlight_region / 2.0)) if spotlight_region > 0 else MAPPED_REGION // 2
-            mid = MAPPED_REGION // 2
-            start = max(0, mid - half)
-            end = min(MAPPED_REGION, mid + half)
+            sr, sg, sb = spotlight_only
+            start, end = self._center_window(spotlight_region)
             for pos in range(start, end):
                 self._set_px(buf, pos, sr, sg, sb)
 
@@ -336,12 +352,14 @@ class LEDMapper:
             # Downbeat (MEASURE) gets ~1.5x density and longer-lived
             # sparkles. STRONG beats keep base density. WEAK doesn't
             # trigger sparkles at all (it doesn't set beat_flash).
+            # Lifetimes target wall-clock durations so they look the same
+            # at any render FPS.
             if downbeat_flash:
                 effective_density = min(1.0, sparkle_density * 1.5)
-                sparkle_life = 4
+                sparkle_life = max(2, round(fps * 0.10))   # ~100 ms
             else:
                 effective_density = sparkle_density
-                sparkle_life = 3
+                sparkle_life = max(2, round(fps * 0.075))  # ~75 ms
             if beat_flash or sparkle_continuous:
                 for i in range(MAPPED_REGION):
                     o = i * 3
@@ -352,7 +370,9 @@ class LEDMapper:
             for i in range(MAPPED_REGION):
                 if sparkle[i] > 0:
                     o = i * 3
-                    t = sparkle[i] / life_div
+                    # Clamp: live sparkles may outlast a shrunk life_div
+                    # after a downbeat or an FPS change.
+                    t = min(1.0, sparkle[i] / life_div)
                     if buf[o] or buf[o + 1] or buf[o + 2]:
                         # Blend toward white
                         t07 = t * 0.7
@@ -406,11 +426,11 @@ class LEDMapper:
 
         # ── Effect: Bonus burst (YARG bonus_effect) ──────────────
         # White celebration flash that rolls over the strip whenever YARG
-        # flags a big-moment bonus. Decays over ~8 frames.
-        if bonus_burst > 0:
-            burst_t = bonus_burst / 8.0
-            burst_w = int(255 * burst_t * 0.85)
-            inv = 1.0 - burst_t * 0.7
+        # flags a big-moment bonus. bonus_t decays 1.0 → 0.0 over the
+        # engine's BONUS_BURST_DURATION (wall-clock, FPS-independent).
+        if bonus_t > 0.0:
+            burst_w = int(255 * bonus_t * 0.85)
+            inv = 1.0 - bonus_t * 0.7
             for i in range(MAPPED_REGION):
                 o = i * 3
                 if buf[o] | buf[o + 1] | buf[o + 2]:
@@ -423,39 +443,21 @@ class LEDMapper:
                     buf[o + 2] = burst_w
 
         # ── Effect: Reveal mask (Intro) ─────────────────────────
-        # Pixels light up sequentially from the strip centre outward over
-        # reveal_total frames. While reveal_frames > 0, mask everything
-        # outside the current radius. When done, no-op.
-        if reveal_total > 0 and reveal_frames > 0:
-            elapsed = reveal_total - reveal_frames
-            progress = elapsed / float(reveal_total)
-            if progress < 1.0:
-                radius = int((MAPPED_REGION / 2.0) * progress)
-                mid = MAPPED_REGION // 2
-                lo = mid - radius
-                hi = mid + radius
-                for i in range(MAPPED_REGION):
-                    if i < lo or i >= hi:
-                        o = i * 3
-                        buf[o] = 0
-                        buf[o + 1] = 0
-                        buf[o + 2] = 0
+        # Pixels light up sequentially from the strip centre outward as
+        # reveal_progress climbs 0.0 → 1.0 (wall-clock driven by the
+        # engine). At 1.0 (done or inactive) this is a no-op.
+        if reveal_progress < 1.0:
+            radius = max(1, int((MAPPED_REGION / 2.0) * reveal_progress))
+            mid = MAPPED_REGION // 2
+            self._mask_outside(buf, mid - radius, mid + radius)
 
         # ── Effect: Spotlight region mask ────────────────────────
         # Used by SILHOUETTES_SPOTLIGHT (spotlight_only is None) — keep
         # only the centre fraction of the strip visible. spotlight_only
         # cues already painted the spotlight directly so they're skipped.
         if spotlight_region > 0.0 and spotlight_only is None:
-            half = max(1, int(MAPPED_REGION * spotlight_region / 2.0))
-            mid = MAPPED_REGION // 2
-            lo = mid - half
-            hi = mid + half
-            for i in range(MAPPED_REGION):
-                if i < lo or i >= hi:
-                    o = i * 3
-                    buf[o] = 0
-                    buf[o + 1] = 0
-                    buf[o + 2] = 0
+            lo, hi = self._center_window(spotlight_region)
+            self._mask_outside(buf, lo, hi)
 
         # ── Apply brightness + write to output buffer ────────────
         # Pause dims everything to 35% so the strip doesn't go fully dark

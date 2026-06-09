@@ -321,6 +321,9 @@ class RenderThread(threading.Thread):
 
             # Get effects (consumes and clears transient flags)
             effects = self._engine.get_effects()
+            # Mapper scales frame-count effects (sparkle life) by FPS so
+            # they hold their wall-clock duration at any render rate.
+            effects["fps"] = fps
 
             # Brightness baked into mapper output (Phase 2)
             brightness = self._settings.brightness / 255.0
@@ -364,9 +367,12 @@ class RenderThread(threading.Thread):
                     fb[i] = int(ff[i] * inv_t + pd[i] * t)
                 pixel_data = fb
 
-            # Save for next frame's potential cross-fade source
-            n = len(pixel_data)
-            self._last_sent[:n] = pixel_data
+            # Save for next frame's potential cross-fade source. Skip the
+            # strobe blank — a cue change mid-strobe should fade from the
+            # last visible frame, not from black.
+            if pixel_data is not self._black:
+                n = len(pixel_data)
+                self._last_sent[:n] = pixel_data
 
             # Send DDP every frame when WLED is on (no dedup — WiFi
             # can drop UDP packets, so always resend like LedFx does)
