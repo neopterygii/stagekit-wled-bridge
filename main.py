@@ -103,6 +103,31 @@ class WLEDPowerManager:
         self._enabled = idle_timeout > 0
         self._power_on_pending = False
         self._power_off_pending = False
+        self._dark_since = 0.0
+        self._dark_warned = False
+
+    def _check_dark_while_active(self):
+        """Warn when YARG is feeding us but the strip is still dark.
+
+        This state means power-on is failing silently — the render thread
+        gates DDP on _wled_on, so nothing reaches the strip while the
+        status page happily reports YARG as connected.
+        """
+        now = time.monotonic()
+        recent_activity = self._last_activity > 0 and (now - self._last_activity) < 10.0
+        if not recent_activity or self._wled_on:
+            self._dark_since = 0.0
+            self._dark_warned = False
+            return
+        if self._dark_since == 0.0:
+            self._dark_since = now
+        elif not self._dark_warned and (now - self._dark_since) >= 30.0:
+            self._dark_warned = True
+            log.warning(
+                "Receiving YARG packets but WLED has stayed off for %ds — "
+                "power-on is failing, no DDP is being sent (WLED reachable: %s)",
+                round(now - self._dark_since), self._api.reachable,
+            )
 
     def on_activity(self):
         """Called when a YARG packet is received."""
@@ -163,7 +188,24 @@ class WLEDPowerManager:
                 self._power_off_pending = True
 
     async def watchdog_loop(self):
-        """Background task that turns WLED off after idle timeout and checks reachability."""
+        """Background task that turns WLED off after idle timeout and checks reachability.
+
+        Never allowed to die. This task owns the only path that sets
+        _wled_on, and the render thread gates all DDP output on it — so if
+        this task raises, the strip goes dark permanently while YARG still
+        reads as connected, with nothing in the log to say why. Any
+        exception is logged and the loop resumes.
+        """
+        while True:
+            try:
+                await self._watchdog_run()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("WLED watchdog crashed — restarting in 5s")
+                await asyncio.sleep(5)
+
+    async def _watchdog_run(self):
         # Initial reachability check (non-blocking)
         await asyncio.to_thread(self._api.is_on)
         await asyncio.to_thread(self._api.fetch_wifi_info)
@@ -180,6 +222,7 @@ class WLEDPowerManager:
                 if self._power_off_pending:
                     self._power_off_pending = False
                     await asyncio.to_thread(self._power_off)
+                self._check_dark_while_active()
                 wifi_counter += 1
                 if wifi_counter >= 6:
                     wifi_counter = 0
@@ -201,6 +244,8 @@ class WLEDPowerManager:
             if self._power_off_pending:
                 self._power_off_pending = False
                 await asyncio.to_thread(self._power_off)
+
+            self._check_dark_while_active()
 
             check_counter += 1
 

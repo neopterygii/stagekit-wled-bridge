@@ -6,6 +6,9 @@ services:
     container_name: stagekit-wled-bridge
     restart: unless-stopped
     network_mode: host    # needed for UDP broadcast reception
+    init: true            # PID 1 would otherwise be python, which never reaps
+                          # orphaned children; healthcheck processes then leak
+                          # pid-cgroup charges until fork/thread creation fails
     environment:
       # Where to listen for YARG packets
       YARG_LISTEN_HOST: "0.0.0.0"
