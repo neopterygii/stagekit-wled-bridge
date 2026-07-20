@@ -92,16 +92,45 @@ class LEDMapper:
         buf[o + 1] = min(255, buf[o + 1] + g)
         buf[o + 2] = min(255, buf[o + 2] + b)
 
+    @staticmethod
+    def _center_window(fraction: float) -> tuple[int, int]:
+        """(lo, hi) pixel bounds of a centered window covering *fraction* of the strip."""
+        half = max(1, int(MAPPED_REGION * fraction / 2.0))
+        mid = MAPPED_REGION // 2
+        return max(0, mid - half), min(MAPPED_REGION, mid + half)
+
+    @staticmethod
+    def _mask_outside(buf: bytearray, lo: int, hi: int):
+        """Zero all pixels outside [lo, hi)."""
+        for i in range(lo):
+            o = i * 3
+            buf[o] = 0
+            buf[o + 1] = 0
+            buf[o + 2] = 0
+        for i in range(hi, MAPPED_REGION):
+            o = i * 3
+            buf[o] = 0
+            buf[o + 1] = 0
+            buf[o + 2] = 0
+
     def render(self, zone_bitmasks: list[int], zone_colors: dict | None = None,
                effects: dict | None = None, brightness: float = 1.0,
-               reverse: bool = False) -> bytes:
+               reverse: bool = False,
+               zone_cell_levels: list[list[float]] | None = None) -> bytes:
         """Render pixels from 4 zone bitmasks with optional effects.
 
         Args:
-            zone_bitmasks: 4 bitmasks [red, green, blue, yellow].
+            zone_bitmasks: 4 bitmasks [red, green, blue, yellow] — used to
+                detect "solid" background zones (mask 0xFF) and as a
+                fallback when zone_cell_levels isn't provided.
             zone_colors: Color mapping from settings palette.
             effects: Dict of active effects from cue engine.
             brightness: Global brightness 0.0-1.0 (baked into output).
+            reverse: Mirror the output horizontally.
+            zone_cell_levels: 4 zones x 8 cells of float 0.0-1.0 brightness.
+                When provided, the engine's tick() has computed sub-cell
+                interpolation for smooth scanner motion. When None, levels
+                are derived from zone_bitmasks (binary on/off).
 
         Returns:
             Flat bytes of R,G,B,R,G,B,... for all LEDs with brightness applied.
@@ -118,39 +147,75 @@ class LEDMapper:
         sparkle_density = effects.get("sparkle", 0.0)
         sparkle_continuous = effects.get("sparkle_continuous", False)
         beat_flash = effects.get("beat_flash", False)
+        downbeat_flash = effects.get("downbeat_flash", False)
         use_additive = effects.get("additive", False)
         glitch_prob = effects.get("glitch", 0.0)
         glitch_trigger = effects.get("glitch_trigger", False)
         bpm = effects.get("bpm", 120.0)
         initial_flash = effects.get("initial_flash", 0)
 
+        # New YARG-data effects
+        paused = effects.get("paused", False)
+        bonus_t = effects.get("bonus_t", 0.0)                    # 1.0 → 0.0 decay
+        reveal_progress = effects.get("reveal_progress", 1.0)    # < 1.0 = masking
+        spotlight_region = effects.get("spotlight_region", 0.0)  # 0 = no mask
+        spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
+        fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
+
         buf = self._buf
 
         # Resolve zone colors to flat ints once
         zc = [zone_colors[ZONE_NAMES[z]] for z in range(4)]
+
+        # Derive fractional cell levels from bitmasks if engine didn't.
+        if zone_cell_levels is None:
+            zone_cell_levels = [
+                [(1.0 if (zone_bitmasks[z] >> c) & 1 else 0.0) for c in range(8)]
+                for z in range(4)
+            ]
 
         # ── Base zone→pixel mapping ──────────────────────────────
         # Zero the working buffer
         for k in range(MAPPED_REGION * 3):
             buf[k] = 0
 
-        if use_additive:
+        # Spotlight-only mode (BLACKOUT_SPOTLIGHT): paint a fixed colour in
+        # the centre region and skip the normal zone mapping entirely.
+        if spotlight_only is not None:
+            sr, sg, sb = spotlight_only
+            start, end = self._center_window(spotlight_region)
+            for pos in range(start, end):
+                self._set_px(buf, pos, sr, sg, sb)
+
+        elif use_additive:
             for cell in range(NUM_CELLS):
                 cell_start = cell * CELL_SIZE
                 for zone_idx in range(4):
-                    if zone_bitmasks[zone_idx] & (1 << cell):
-                        cr, cg, cb = zc[zone_idx]
-                        for j in range(CELL_SIZE):
-                            pos = cell_start + j
-                            if pos < MAPPED_REGION:
-                                self._add_px(buf, pos, cr, cg, cb)
+                    level = zone_cell_levels[zone_idx][cell]
+                    if level <= 0.0:
+                        continue
+                    cr, cg, cb = zc[zone_idx]
+                    if level < 1.0:
+                        cr = int(cr * level)
+                        cg = int(cg * level)
+                        cb = int(cb * level)
+                    for j in range(CELL_SIZE):
+                        pos = cell_start + j
+                        if pos < MAPPED_REGION:
+                            self._add_px(buf, pos, cr, cg, cb)
         else:
+            # Non-additive: subdivide cell among "active" zones, where a
+            # zone is active when its level exceeds a small threshold.
+            # The colour for that zone slice is scaled by the zone's level
+            # so a cell mid-fade (level ~0.5) renders dimmer.
+            ACTIVE_THRESHOLD = 0.05
             for cell in range(NUM_CELLS):
                 cell_start = cell * CELL_SIZE
-                active = []
+                active: list[tuple[int, float]] = []
                 for zone_idx in range(4):
-                    if zone_bitmasks[zone_idx] & (1 << cell):
-                        active.append(zone_idx)
+                    level = zone_cell_levels[zone_idx][cell]
+                    if level > ACTIVE_THRESHOLD:
+                        active.append((zone_idx, level))
 
                 if not active:
                     continue
@@ -159,8 +224,12 @@ class LEDMapper:
                 leds_per = CELL_SIZE // n
                 remainder = CELL_SIZE % n
                 pos = cell_start
-                for i, zone_idx in enumerate(active):
+                for i, (zone_idx, level) in enumerate(active):
                     cr, cg, cb = zc[zone_idx]
+                    if level < 1.0:
+                        cr = int(cr * level)
+                        cg = int(cg * level)
+                        cb = int(cb * level)
                     count = leds_per + (1 if i < remainder else 0)
                     for _ in range(count):
                         if pos < MAPPED_REGION:
@@ -280,16 +349,30 @@ class LEDMapper:
         # ── Effect: Sparkle overlay ──────────────────────────────
         if sparkle_density > 0.0:
             sparkle = self._sparkle
+            # Downbeat (MEASURE) gets ~1.5x density and longer-lived
+            # sparkles. STRONG beats keep base density. WEAK doesn't
+            # trigger sparkles at all (it doesn't set beat_flash).
+            # Lifetimes target wall-clock durations so they look the same
+            # at any render FPS.
+            if downbeat_flash:
+                effective_density = min(1.0, sparkle_density * 1.5)
+                sparkle_life = max(2, round(fps * 0.10))   # ~100 ms
+            else:
+                effective_density = sparkle_density
+                sparkle_life = max(2, round(fps * 0.075))  # ~75 ms
             if beat_flash or sparkle_continuous:
                 for i in range(MAPPED_REGION):
                     o = i * 3
-                    if (buf[o] | buf[o + 1] | buf[o + 2]) and random.random() < sparkle_density:
-                        sparkle[i] = 3
+                    if (buf[o] | buf[o + 1] | buf[o + 2]) and random.random() < effective_density:
+                        sparkle[i] = sparkle_life
 
+            life_div = float(sparkle_life)
             for i in range(MAPPED_REGION):
                 if sparkle[i] > 0:
                     o = i * 3
-                    t = sparkle[i] / 3.0
+                    # Clamp: live sparkles may outlast a shrunk life_div
+                    # after a downbeat or an FPS change.
+                    t = min(1.0, sparkle[i] / life_div)
                     if buf[o] or buf[o + 1] or buf[o + 2]:
                         # Blend toward white
                         t07 = t * 0.7
@@ -341,14 +424,52 @@ class LEDMapper:
                     buf[o + 1] = white_v
                     buf[o + 2] = white_v
 
+        # ── Effect: Bonus burst (YARG bonus_effect) ──────────────
+        # White celebration flash that rolls over the strip whenever YARG
+        # flags a big-moment bonus. bonus_t decays 1.0 → 0.0 over the
+        # engine's BONUS_BURST_DURATION (wall-clock, FPS-independent).
+        if bonus_t > 0.0:
+            burst_w = int(255 * bonus_t * 0.85)
+            inv = 1.0 - bonus_t * 0.7
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                if buf[o] | buf[o + 1] | buf[o + 2]:
+                    buf[o]     = min(255, int(buf[o] * inv + burst_w))
+                    buf[o + 1] = min(255, int(buf[o + 1] * inv + burst_w))
+                    buf[o + 2] = min(255, int(buf[o + 2] * inv + burst_w))
+                else:
+                    buf[o] = burst_w
+                    buf[o + 1] = burst_w
+                    buf[o + 2] = burst_w
+
+        # ── Effect: Reveal mask (Intro) ─────────────────────────
+        # Pixels light up sequentially from the strip centre outward as
+        # reveal_progress climbs 0.0 → 1.0 (wall-clock driven by the
+        # engine). At 1.0 (done or inactive) this is a no-op.
+        if reveal_progress < 1.0:
+            radius = max(1, int((MAPPED_REGION / 2.0) * reveal_progress))
+            mid = MAPPED_REGION // 2
+            self._mask_outside(buf, mid - radius, mid + radius)
+
+        # ── Effect: Spotlight region mask ────────────────────────
+        # Used by SILHOUETTES_SPOTLIGHT (spotlight_only is None) — keep
+        # only the centre fraction of the strip visible. spotlight_only
+        # cues already painted the spotlight directly so they're skipped.
+        if spotlight_region > 0.0 and spotlight_only is None:
+            lo, hi = self._center_window(spotlight_region)
+            self._mask_outside(buf, lo, hi)
+
         # ── Apply brightness + write to output buffer ────────────
+        # Pause dims everything to 35% so the strip doesn't go fully dark
+        # when the player pauses — useful as a "still on, just waiting" cue.
+        effective_brightness = brightness * 0.35 if paused else brightness
         out = self._out
         mapped_bytes = MAPPED_REGION * 3
-        if brightness >= 1.0:
+        if effective_brightness >= 1.0:
             out[:mapped_bytes] = buf[:mapped_bytes]
         else:
             for k in range(mapped_bytes):
-                out[k] = int(buf[k] * brightness)
+                out[k] = int(buf[k] * effective_brightness)
 
         # Reverse pixel order if direction is reversed
         if reverse:

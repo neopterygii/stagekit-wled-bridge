@@ -98,6 +98,15 @@ class KeyframeByte:
     PREVIOUS = 29
 
 
+class SceneIndexByte:
+    """YARG scene index (matches DataStreamController.SceneIndexByte)."""
+    UNKNOWN = 0
+    MENU = 1
+    GAMEPLAY = 2
+    SCORE = 3
+    CALIBRATION = 4
+
+
 class StrobeSpeed:
     OFF = CueByte.STROBE_OFF        # 24
     SLOW = CueByte.STROBE_SLOW      # 23

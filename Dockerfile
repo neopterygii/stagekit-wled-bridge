@@ -15,7 +15,12 @@ VOLUME ["/data"]
 EXPOSE 36107/udp
 EXPOSE 8080/tcp
 
+# Probes the port the status server actually binds, not a hardcoded one — with
+# network_mode: host a wrong port silently probes some other container's
+# listener and fails forever. Every failed check forks a shell + wget, and
+# those pile up as unreaped zombies against the cgroup pid limit until the
+# container can no longer create threads.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD wget -q --spider http://127.0.0.1:8080/api/status || exit 1
+    CMD wget -q --spider "http://127.0.0.1:${STATUS_PORT:-8080}/api/status" || exit 1
 
 CMD ["python", "-u", "main.py"]
