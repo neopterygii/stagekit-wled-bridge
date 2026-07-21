@@ -56,6 +56,18 @@ PLL_TAU = 0.10               # seconds — lock time-constant
 BEAT_LOCK_TIMEOUT = 2.0      # seconds without a beat → free-run fallback
 PLL_DT_MAX = 0.2             # clamp per-frame dt so a stall can't fling motion
 
+# StageKit addressing: every zone bitmask is 8 bits → 8 cells on the ring.
+_CELLS = 8
+
+
+def _ring_delta(a: int, b: int) -> int:
+    """Signed shortest distance a→b on the 8-cell ring, in [-4, 3].
+
+    Used to glide a scanner head between its cell in one step and the next
+    along the *shorter* way round (so a 7→0 hop moves +1, not -7).
+    """
+    return ((b - a + _CELLS // 2) % _CELLS) - _CELLS // 2
+
 
 class _TimePattern:
     """Time-driven zone pattern ticked deterministically by the render thread.
@@ -63,9 +75,10 @@ class _TimePattern:
     Instead of asyncio.sleep() between steps, the current step is computed
     from wall-clock time — immune to event-loop congestion.
     """
-    __slots__ = ('steps', 'step_dicts', 'step', 'next_time', 'bpm_sync',
-                 'param', 'direction', 'reverse_on_beat', 'reverse_counter',
-                 'beat_lock', 'pos', 'last_tick')
+    __slots__ = ('steps', 'step_dicts', 'zone_cells', 'owned_zones', 'step',
+                 'next_time', 'bpm_sync', 'param', 'direction',
+                 'reverse_on_beat', 'reverse_counter', 'beat_lock', 'pos',
+                 'last_tick')
 
     def __init__(self, steps, *, bpm_sync, param, now, init_bpm=120.0,
                  direction=1, reverse_on_beat=False):
@@ -73,6 +86,21 @@ class _TimePattern:
         # Per-step {zone: mask} lookups, precomputed so tick() doesn't
         # rebuild a dict per pattern per frame during interpolation.
         self.step_dicts = [dict(s) for s in steps]
+        # Per-step {zone: [lit cell indices]} — the "heads" the motion
+        # renderer glides between (see motion_heads()). Precomputed so the
+        # hot path only interpolates positions, never re-scans bitmasks.
+        self.zone_cells = []
+        for d in self.step_dicts:
+            zc = {}
+            for zone, mask in d.items():
+                cells = [c for c in range(_CELLS) if (mask >> c) & 1]
+                if cells:
+                    zc[zone] = cells
+            self.zone_cells.append(zc)
+        # Zones this pattern ever drives — tick() zeros their cell levels so
+        # the base cell mapping skips them (motion owns those pixels).
+        self.owned_zones = set().union(*[zc.keys() for zc in self.zone_cells]) \
+            if self.zone_cells else set()
         self.step = 0                # current step index
         self.bpm_sync = bpm_sync     # True → param is cycles_per_beat
         self.param = param           # cycles_per_beat (bpm) or total_seconds (timed)
@@ -101,6 +129,57 @@ class _TimePattern:
             effective_bpm = bpm if bpm > 0 else 120.0
             return 60.0 / effective_bpm / (n * self.param)
         return self.param / n
+
+    def motion_heads(self, cur_idx: int, nxt_idx: int, progress: float):
+        """Continuous per-zone scanner heads gliding from step→step.
+
+        Each lit StageKit cell is a "head". Between the current and next
+        step, a zone's heads are matched by the cyclic rotation that
+        minimises total travel (these patterns are pure rotations), then
+        each head's cell position is interpolated along the shorter way
+        round the ring. This is what lets a scanner glide pixel-by-pixel
+        at a *continuous* position instead of snapping between 8 cells.
+
+        Returns a list of (zone, cell_pos, level): cell_pos is a float in
+        [0, 8); level is 1.0 for a matched head, or a crossfade weight when
+        a zone's head count changes between steps (appear/disappear), so a
+        head fades in/out in place rather than teleporting.
+        """
+        cur = self.zone_cells[cur_idx]
+        nxt = self.zone_cells[nxt_idx]
+        heads = []
+        for zone in cur.keys() | nxt.keys():
+            c = cur.get(zone)
+            m = nxt.get(zone)
+            if c and m and len(c) == len(m):
+                # Align next-step heads to current by the rotation with the
+                # least squared travel (favours a uniform ±1 rotation over a
+                # ragged pairing at the wrap seam).
+                best_cost = None
+                best = m
+                for shift in range(len(m)):
+                    cand = m[shift:] + m[:shift]
+                    cost = 0
+                    for a, b in zip(c, cand):
+                        d = _ring_delta(a, b)
+                        cost += d * d
+                    if best_cost is None or cost < best_cost:
+                        best_cost = cost
+                        best = cand
+                for a, b in zip(c, best):
+                    d = _ring_delta(a, b)
+                    heads.append((zone, (a + progress * d) % _CELLS, 1.0))
+            else:
+                # Head count changed — crossfade the old set out and the new
+                # set in, each held at its own cell (no spurious glide).
+                if c:
+                    w = 1.0 - progress
+                    for cell in c:
+                        heads.append((zone, float(cell), w))
+                if m:
+                    for cell in m:
+                        heads.append((zone, float(cell), progress))
+        return heads
 
 
 class CueEngine:
@@ -182,6 +261,14 @@ class CueEngine:
         # sub-cell interpolation between consecutive pattern steps so
         # scanner/comet movement isn't quantised to 8 hops across the strip.
         self.zone_cell_levels: list[list[float]] = [[0.0] * 8 for _ in range(4)]
+
+        # Motion sources for the sub-pixel scanner renderer: a flat list of
+        # (zone, cell_pos, level) heads rebuilt by tick() from the continuous
+        # pattern position. The mapper paints each as a soft profile at a
+        # float pixel position — gliding, not cell-snapping. Zones driven by a
+        # time pattern have their zone_cell_levels zeroed (motion owns them);
+        # static cues keep the cell model. Rebuilt (atomic rebind) each tick.
+        self.motion_sources: list[tuple[int, float, float]] = []
 
     def get_strobe_visible(self) -> bool:
         """Returns whether pixels should be visible (considering strobe).
@@ -292,39 +379,55 @@ class CueEngine:
     def tick(self, now: float):
         """Advance all time-based patterns to the current timestamp.
 
-        Called from the render thread each frame.  Zone bitmasks AND the
-        per-cell brightness levels (zone_cell_levels) are set
-        deterministically from wall-clock time — immune to asyncio lag.
+        Called from the render thread each frame.  Static zone brightness
+        (zone_cell_levels) and continuous scanner heads (motion_sources) are
+        both set deterministically from wall-clock time — immune to asyncio lag.
 
-        Sub-cell motion: each pattern interpolates between its current and
-        next step based on the fractional progress through the step
-        interval. So instead of cells popping on/off in 8 discrete jumps,
-        a moving bit fades out of one cell while fading into the next —
-        the LedFx-style smooth scanner look.
+        Two render models, split by cue type:
+          - Static cues (washes, spotlights) keep the 8-cell model: their
+            bitmask is expanded into zone_cell_levels and the mapper fills
+            cell blocks.
+          - Motion cues (scanners/chases/comets) are time patterns. Each
+            holds a continuous float position; tick() turns that into gliding
+            "heads" (motion_sources) which the mapper paints as soft profiles
+            at a sub-pixel position — no cell-block crossfade, so a moving
+            light keeps a constant peak and width instead of throbbing.
+
+        Zones a pattern owns have their cell levels zeroed here so the base
+        cell mapping skips them; the profile renderer paints them instead.
 
         If the deadline is far in the past (host suspend, container pause,
         long GC), snap forward instead of catching up step-by-step — that
         would block the render thread and emit a flurry of stale frames.
 
         Pause handling: when self.paused is True, freeze pattern motion
-        (don't advance steps or interpolate). The bitmask→levels reset
-        still runs so cue changes and web test patterns made while paused
-        reach the strip. The mapper applies the brightness dim separately.
+        (don't advance steps). motion_sources keeps its last positions so the
+        frozen scanner holds still; owned zones stay zeroed so it never
+        double-paints as blocks. The mapper applies the brightness dim.
         """
         bpm = self.bpm
         levels = self.zone_cell_levels
+        patterns = self._time_patterns  # local ref — safe across threads
 
-        # Reset levels from the current bitmask state. Patterns will
-        # overwrite the cells they own with interpolated values; zones set
-        # by static cue setup (no pattern) stay at their bitmask values.
+        # Reset levels from the current bitmask state. Static (patternless)
+        # zones keep their bitmask values; motion-owned zones are zeroed next.
         for zone_idx in range(4):
             mask = self.zones[zone_idx]
             row = levels[zone_idx]
             for cell in range(8):
                 row[cell] = 1.0 if (mask >> cell) & 1 else 0.0
 
+        # Motion-owned zones render as gliding profiles, not cell blocks.
+        # Zero their levels every tick (incl. while paused) so the base
+        # mapping skips them and a frozen scanner never double-paints.
+        for p in patterns:
+            for zone in p.owned_zones:
+                row = levels[zone]
+                for cell in range(8):
+                    row[cell] = 0.0
+
         if self.paused:
-            return
+            return  # motion_sources frozen at last positions
 
         # Beat-lock context: patterns lock to the beat only while beats are
         # fresh; otherwise they free-run on tempo (the fallback).
@@ -332,7 +435,7 @@ class CueEngine:
                       (now - self._beat_at) < BEAT_LOCK_TIMEOUT)
         beat_clock = self.beat_clock(now) if beats_live else 0.0
 
-        patterns = self._time_patterns  # local ref — safe across threads
+        motion: list[tuple[int, float, float]] = []
         for p in patterns:
             n = len(p.steps)
             if p.beat_lock:
@@ -388,19 +491,13 @@ class CueEngine:
                     progress = 0.0
                 nxt_idx = (p.step + p.direction) % n
 
-            cur_step = p.steps[p.step]
-            nxt_zones = p.step_dicts[nxt_idx]
-
-            inv_p = 1.0 - progress
-            for zone, cur_mask in cur_step:
-                nxt_mask = nxt_zones.get(zone, 0)
+            # Keep self.zones reflecting the logical step for the status page;
+            # the pixels come from the gliding heads below, not these cells.
+            for zone, cur_mask in p.steps[p.step]:
                 self.zones[zone] = cur_mask
-                row = levels[zone]
-                for cell in range(8):
-                    cur_on = (cur_mask >> cell) & 1
-                    nxt_on = (nxt_mask >> cell) & 1
-                    # Linear blend between current step's bit and next step's bit
-                    row[cell] = cur_on * inv_p + nxt_on * progress
+            motion.extend(p.motion_heads(p.step, nxt_idx, progress))
+
+        self.motion_sources = motion  # atomic rebind for the render read
 
     def on_beat(self, beat_type: int, now: float | None = None):
         """Called when a beat event arrives from YARG.

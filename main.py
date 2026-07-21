@@ -411,6 +411,7 @@ class RenderThread(threading.Thread):
                 brightness=brightness,
                 reverse=reverse,
                 zone_cell_levels=self._engine.zone_cell_levels,
+                motion_sources=self._engine.motion_sources,
             )
 
             # Apply strobe (replace with pre-allocated black)

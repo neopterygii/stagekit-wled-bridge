@@ -113,9 +113,10 @@ Who does what best, and where it lands in our code:
   gradient palettes recoloured onto the strip with a beat-locked scroll (demo:
   VERSE); BPM-synced chases hard-locked to the beat via a smooth PLL that coasts
   through dropped beats.
-- [ ] **2. Continuous sub-pixel scanner rendering** — *next; see "Current focus"
-  below.* Paint a soft profile at a continuous float position instead of
-  crossfading 8 fixed cell-blocks.
+- [x] **2. Continuous sub-pixel scanner rendering** *(implemented on
+  `feat/sub-pixel-scanner`, not yet merged)* — motion cues paint a soft
+  triangular profile at a continuous float position; peak and width stay
+  constant while the head glides pixel-by-pixel. See "Current focus" below.
 - [ ] **3. Layer/slot compositor** — restructure the mapper so overlays
   (wash / motion / strobe / star-power) compose cleanly.
 - [ ] **4. Note-hold + performer/vocal reactivity + post-processing colour
@@ -144,19 +145,32 @@ computes a **continuous float `pos`** per pattern, but the render path
 immediately quantises it back to `int(step)` + a cell crossfade — the precision
 exists and is thrown away.
 
-**The fix.** Add a motion renderer that paints a soft intensity profile
-(triangular/Gaussian) centred at a *continuous float position* on the pixel
-array — gliding pixel-by-pixel with constant peak and width, decoupled from the
-8-cell grid (the LedFx `scan.py` model). Keep the cell/zone model for
-StageKit-authentic *static* cues; express *motion* cues (scanners/chases/comets)
-as **position + profile + width**, fed by the `pos`/`beat_clock` the engine
-already computes. Cheap interim (won't fix position quantisation, so not the
-real fix): an energy-preserving (max/gamma) block blend to soften the 50% dip.
+**The fix (implemented).** A motion renderer paints a soft triangular profile
+centred at a *continuous float position* on the pixel array — gliding
+pixel-by-pixel with constant peak and width, decoupled from the 8-cell grid
+(the LedFx `scan.py` model). The cell/zone model is kept for StageKit-authentic
+*static* cues; *motion* cues (scanners/chases/comets) are expressed as
+**position + profile + width**, fed by the `pos`/`beat_clock` the engine already
+computes.
 
-Key code: `effects/cue_engine.py` `CueEngine.tick` (holds the continuous `pos`
-per `_TimePattern`); `effects/mapper.py` `LEDMapper.render` (the cell-block fill
-+ `zone_cell_levels` crossfade to replace for motion cues). Branch:
-`feat/sub-pixel-scanner`.
+How it fits together:
+- `_TimePattern.motion_heads(cur, nxt, progress)` turns the continuous pattern
+  position into gliding "heads" — one per lit StageKit cell, matched between
+  steps by the least-travel cyclic rotation and interpolated along the shorter
+  way round the ring (so a 7→0 hop moves +1, not −7).
+- `CueEngine.tick` builds `motion_sources` (a flat `(zone, cell_pos, level)`
+  list) each frame and **zeros the cell levels of motion-owned zones**, so the
+  two render models never double-paint.
+- `LEDMapper.render` paints each head as a triangular profile (half-width = one
+  cell) into a motion layer, accumulating colour additively and coverage as an
+  alpha, then alpha-composites that layer over the static base. Adjacent heads
+  form a partition of unity (tiled chases fill with no dark seam), crossing
+  scanners mix colour, and a lone scanner keeps a soft falloff over any wash.
+
+Verified: the MENU scanner holds peak ≈245 (was 255→127) and width ≈one cell
+(was 15→30) while gliding; a beat-locked CHORUS chase glides with <0.02 px/frame
+centroid jitter; the tiled BigRockEnding chase has no dark seams. Tests:
+`tests/test_scanner.py`. Branch: `feat/sub-pixel-scanner`.
 
 ## Status (implemented today, on main)
 - 33 lighting cues → zone/effect patterns; software strobe; beat flash/sparkle/
