@@ -1,0 +1,126 @@
+# VISION — translating YARG's lighting data onto an LED strip, truthfully and elegantly
+
+This is the design north star for the bridge: how every signal YARG broadcasts
+*should* become light on the strip, and which techniques from the reference
+projects get us there. It is a roadmap, not a spec — the current code implements
+a subset (see **Status** at the end).
+
+## The one constraint that shapes everything: DDP realtime
+
+The bridge streams **host-computed raw RGB** to WLED over **DDP**. In realtime
+mode WLED displays exactly the pixels we send and its **on-device engine is
+bypassed** — segments, palette morphing, blend modes, `fadeToBlackBy`,
+transitions: none of it runs. Our device is on firmware **0.14.4** (ESP32, 120
+LEDs, single segment, RGB), but the firmware version barely matters while we use
+DDP.
+
+**Consequence:** every "borrow this from WLED" idea below must be **reimplemented
+host-side in `effects/mapper.py`** — we cannot delegate it to the controller. A
+future *hybrid* path (drive WLED segments/palettes via its JSON API instead of
+DDP) is possible and 0.14.4 supports it, but it is a different architecture and
+out of scope here. Assume host-side rendering throughout.
+
+## Where the truth lives
+
+- **The datagram** is built by YARG's `DataStreamController.SerializeAndSend()`
+  (`DATAGRAM_VERSION = 4`), broadcast to `255.255.255.255:36107` at ~88 Hz.
+  Layout is append-only across versions; we parse **by length**, not by version.
+- **YALCY** is the canonical receiver/decoder and the reference for what each cue
+  *means*. **photonics-dmx**, **LedFx**, and **WLED** are technique sources.
+- `protocol/yarg_packet.py` is our decoder; `effects/cue_engine.py` turns signals
+  into zone/effect state; `effects/mapper.py` renders pixels; `main.py` wires the
+  UDP→engine→render-thread→DDP flow.
+
+## Signal inventory → ideal strip translation
+
+Every field, and what it should drive. **Bold** = implemented today.
+
+| Signal (offset) | Meaning | Ideal translation |
+|---|---|---|
+| **LightingCue (34)** | the authored "look" | **the primary wash/chase per cue** (33 cues, `cue_engine._launch_cue`) |
+| **StrobeState (37)** | strobe speed | **software strobe** (black-frame gate); *should* lock rate to BPM (YALCY `StrobeDmxFromBpm`) |
+| **Beat (38)** | Measure/Strong/Weak pulse | **beat flash/sparkle/glitch**; *should* also feed a continuous beat/bar oscillator for smooth motion |
+| **Keyframe (39)** | chart-driven step (First/Next/Prev) | **steps the manual cues** (`listen="keyframe"`) |
+| **BPM (9)** | tempo | **pattern speed**; basis for the oscillator and tempo-locked strobe |
+| **BonusEffect (40)** | one-shot big moment | **white celebration burst** (`bonus_t`) |
+| **Paused (7) / Scene (6)** | game state | **pause dim + motion freeze**; scene shown on status page |
+| **Star power (47+, v4)** | per-player overdrive amount + active | **charging cool tint → active "surge"** (lift + cool blend + shimmer) |
+| **Camera cut (44–46, v3)** | who the camera is on + priority | *parsed & shown on status page*; future: subtle subject color/region bias + a cut accent |
+| FogState (36) | haze on/off | lower contrast / add a soft blur-glow floor while foggy |
+| PostProcessing (35) | 40+ film grades | apply the *color-tint* ones (Desaturated_Blue, Contrast_Red, SepiaTone, B&W…) as a global palette modifier; ignore camera-only grades |
+| Note bitmasks (14–17) | per-fret/pad hits | rising-edge accents with a **note-hold** min (1/32 note) so transient hits are visible (YALCY DMX) |
+| Vocal/Harmony pitch (18–33) | MIDI pitch, 0=none | map pitch→gradient position for a vocal shimmer / pitch ribbon |
+| Spotlight / Singalong (42,43) | performer bitmask | bias a region/hue toward the highlighted performer(s) |
+| VenueSize (8) | small/large | density branching (sparser vs denser patterns), as YALCY does per-cue |
+| SongSection (13) | Verse/Chorus/… | slow palette/energy bias per section |
+| AutoGenVenueTrack (41) | chart has no authored venue | shown on status page (AUTO); could soften/idealize the look |
+
+### Quirks to respect (from YARG source)
+- **No song-time field** and **no drum-fill field** exist. Timing must be
+  inferred from BPM + beat pulses; there is no absolute clock or fill-lane flag.
+- **Star power is per-player only** — there is no pooled/aggregate value. We
+  aggregate host-side (any-active, max-amount-among-active, max-charge-overall).
+- **Beat "no-beat" sentinel:** after each send YARG resets the beat byte to `3`,
+  which collides with YALCY's "Weak=3". Currently harmless because
+  `cue_engine._run_beat_pattern` filters for Measure/Strong before acting, so a
+  spurious "weak" only nudges listen-patterns. If we ever make Weak beats
+  visually significant, disambiguate first (e.g. treat a repeated 3 with no
+  intervening pulse as "no beat").
+
+## Borrowed techniques, mapped to the bridge
+
+Who does what best, and where it lands in our code:
+
+- **Layer / slot compositor (photonics-dmx).** Model a look as concurrent slots —
+  *primary wash + secondary overlay + strobe + motion* — each rendered to its own
+  buffer and composited with `replace`/`add`/`mix` + opacity. This is the clean
+  home for star power (its own overlay layer), strobe (top layer), and beat
+  accents, so they stop fighting inside one flat buffer. → refactor `mapper` from
+  a fixed pass-chain toward a small layer compositor.
+- **Interpolating beat/bar oscillator (LedFx).** Synthesize a continuous phase
+  (0–1 per beat, 0–N across the bar) from BPM + beat edges, and drive motion/color
+  off the *smooth* phase instead of discrete 8-step hops. → new helper feeding
+  `cue_engine.tick`.
+- **Eased gradient / palette engine (LedFx + WLED).** Replace raw RGBY zone
+  colors with per-cue **palettes** (Warm=red/amber, Cool=blue/teal…) looked up by
+  position/phase/pitch, with sigmoid-eased stops and a rolling option for chases.
+- **Spatial target language (photonics `LightTarget` → WLED segments).**
+  A vocabulary for sub-regions/orderings (all/even/odd/halves/thirds/quarters/
+  linear/inverse-linear/pairs/ring/random) — the elegant way to address the strip
+  for performer bias, sweeps, and symmetry (mirror/reverse).
+- **Note-hold / rising-edge (YALCY DMX).** Hold a one-frame note flash for a
+  musically-scaled minimum so instrument hits are actually visible on the strip.
+- **Tempo-locked strobe (YALCY).** Strobe *rate* follows BPM rather than fixed Hz.
+- **Decaying overlays (LedFx / WLED `fadeToBlackBy`).** Flashes and shimmer fade
+  out over wall-clock time instead of hard-cutting. We already do this for
+  `bonus_t` and the star-power shimmer; generalize it.
+- **Crossfade / palette morph on cue change (WLED).** We already crossfade cue
+  changes over 0.25 s in the render thread; extend to morph *palettes*, not just
+  blend pixels, once palettes exist.
+- **Post-process chain: blur → mirror(max) → brightness → background (LedFx).**
+  A light Gaussian blur is the cheapest way to make discrete cue events read as
+  smooth, stage-quality light on a dense strip.
+- **Previous-cue / CueData context (YALCY + photonics).** Let context-sensitive
+  cues (Flare, Silhouettes, Dischord) adapt based on the previous cue and history.
+
+## Phased roadmap (backlog seed)
+
+0. **v4 signals — done on `feat/datagram-v4-features`:** parse camera cuts +
+   per-player star power; render star power as a *tasteful surge*; camera cuts
+   surfaced on the status page (parse-only).
+1. **Beat/bar oscillator + gradient palettes** — smooth motion, per-cue palettes.
+2. **Layer/slot compositor** — restructure the mapper so overlays compose cleanly.
+3. **Note-hold + performer/vocal reactivity + post-processing color tints** — use
+   the already-parsed-but-unused signals (notes 14–17, vocals 18–33, spotlight/
+   singalong 42–43, post-processing 35).
+4. **Camera-cut lighting** — subtle subject color/region bias + a cut accent.
+5. **Blur/mirror post-process polish** — the LedFx filter chain.
+
+## Status (implemented today)
+- 33 lighting cues → zone/effect patterns; software strobe; beat flash/sparkle/
+  glitch; keyframe-stepped manual cues; bonus burst; pause dim/freeze; cue
+  crossfade; sub-cell interpolation; decay trails; breathing; gradient-boundary
+  blend; spotlight/reveal masks.
+- **v4:** camera cuts + per-player star power parsed (length-guarded); star power
+  rendered as charging tint → active surge; camera subject shown on status page.
+- Everything else in the inventory above is **future work** per the roadmap.

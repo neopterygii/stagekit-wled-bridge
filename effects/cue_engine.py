@@ -124,6 +124,15 @@ class CueEngine:
         # YARG bonus_effect celebration burst: monotonic deadline, 0.0 = inactive.
         self._bonus_until = 0.0
 
+        # Star power (v4 datagram). Sustained state — unlike the one-shot
+        # bonus burst — updated every packet and surfaced to the mapper's
+        # "tasteful surge" overlay. sp_active drives the surge, sp_charge the
+        # pre-activation glow.
+        self._sp_active = False
+        self._sp_amount = 0.0        # max among active players, 0..1
+        self._sp_charge = 0.0        # max among all players, 0..1
+        self._sp_active_count = 0
+
         # Pause state (frozen patterns + global dim). While paused, animation
         # clocks read _paused_at instead of now; on unpause, active deadlines
         # are shifted forward by the pause duration so nothing is consumed.
@@ -160,6 +169,10 @@ class CueEngine:
         fx["bonus_t"] = self._bonus_remaining(now)
         fx["paused"] = self.paused
         fx["cue_change_at"] = self._cue_change_at
+        fx["sp_active"] = self._sp_active
+        fx["sp_amount"] = self._sp_amount
+        fx["sp_charge"] = self._sp_charge
+        fx["sp_active_count"] = self._sp_active_count
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -301,6 +314,20 @@ class CueEngine:
         """Called when YARG flags a bonus_effect — celebration burst."""
         # Mapper renders a white-tinted flash that decays over the duration.
         self._bonus_until = time.monotonic() + BONUS_BURST_DURATION
+
+    def on_star_power(self, active: bool, amount: float, charge: float,
+                      active_count: int):
+        """Update per-frame star-power state (v4 datagram).
+
+        Sustained, not a one-shot: the mapper reads these each frame to render
+        the "charging" glow (charge, while no player is active) and the surge
+        (active + amount). Purely stored here — no pattern/clock changes — so
+        it composites over whatever cue is running.
+        """
+        self._sp_active = active
+        self._sp_amount = amount
+        self._sp_charge = charge
+        self._sp_active_count = active_count
 
     def on_paused(self, paused: bool):
         """Freeze pattern motion; mapper handles the global dim."""
