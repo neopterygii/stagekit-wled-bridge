@@ -105,22 +105,69 @@ Who does what best, and where it lands in our code:
 
 ## Phased roadmap (backlog seed)
 
-0. **v4 signals — done on `feat/datagram-v4-features`:** parse camera cuts +
-   per-player star power; render star power as a *tasteful surge*; camera cuts
-   surfaced on the status page (parse-only).
-1. **Beat/bar oscillator + gradient palettes** — smooth motion, per-cue palettes.
-2. **Layer/slot compositor** — restructure the mapper so overlays compose cleanly.
-3. **Note-hold + performer/vocal reactivity + post-processing color tints** — use
-   the already-parsed-but-unused signals (notes 14–17, vocals 18–33, spotlight/
-   singalong 42–43, post-processing 35).
-4. **Camera-cut lighting** — subtle subject color/region bias + a cut accent.
-5. **Blur/mirror post-process polish** — the LedFx filter chain.
+- [x] **0. v4 signals** *(merged to main)* — parse camera cuts + per-player star
+  power; render star power as a *tasteful surge*; camera cuts surfaced on the
+  status page (parse-only).
+- [x] **1. Beat/bar oscillator + gradient palettes + phase-locked motion**
+  *(merged to main)* — continuous beat clock; on-beat brightness pump; eased
+  gradient palettes recoloured onto the strip with a beat-locked scroll (demo:
+  VERSE); BPM-synced chases hard-locked to the beat via a smooth PLL that coasts
+  through dropped beats.
+- [ ] **2. Continuous sub-pixel scanner rendering** — *next; see "Current focus"
+  below.* Paint a soft profile at a continuous float position instead of
+  crossfading 8 fixed cell-blocks.
+- [ ] **3. Layer/slot compositor** — restructure the mapper so overlays
+  (wash / motion / strobe / star-power) compose cleanly.
+- [ ] **4. Note-hold + performer/vocal reactivity + post-processing colour
+  tints** — use the already-parsed-but-unused signals (notes 14–17, vocals
+  18–33, spotlight/singalong 42–43, post-processing 35).
+- [ ] **5. Camera-cut lighting** — subtle subject colour/region bias + a cut
+  accent (data already parsed).
+- [ ] **6. Blur/mirror post-process polish** — the LedFx filter chain.
 
-## Status (implemented today)
+## Current focus — Phase 2: continuous sub-pixel scanner
+
+**Problem (established empirically 2026-07-21).** Chases aren't fluid. The
+scanner is modelled as 8 StageKit cells → 8 fixed 15-LED blocks (at
+LED_COUNT=120), and motion is a *linear brightness crossfade between whole
+blocks*. Measured:
+- Cell-aligned frame: one 15-LED block at full brightness (peak **255**).
+- Mid-transition frame: **two** adjacent blocks each at 50% → peak drops to
+  **127** and the lit width balloons **15 → 30 LEDs**, then sharpens back.
+- Position is quantised to 15-LED block boundaries — it never glides
+  pixel-by-pixel.
+
+So a moving scanner *throbs and smears* (peak −50%, width 2×, every handoff)
+instead of gliding. Affects **all** chases (timed and beat-locked); MENU just
+exposes it (slow, isolated single scanner). Note the beat-lock PLL already
+computes a **continuous float `pos`** per pattern, but the render path
+immediately quantises it back to `int(step)` + a cell crossfade — the precision
+exists and is thrown away.
+
+**The fix.** Add a motion renderer that paints a soft intensity profile
+(triangular/Gaussian) centred at a *continuous float position* on the pixel
+array — gliding pixel-by-pixel with constant peak and width, decoupled from the
+8-cell grid (the LedFx `scan.py` model). Keep the cell/zone model for
+StageKit-authentic *static* cues; express *motion* cues (scanners/chases/comets)
+as **position + profile + width**, fed by the `pos`/`beat_clock` the engine
+already computes. Cheap interim (won't fix position quantisation, so not the
+real fix): an energy-preserving (max/gamma) block blend to soften the 50% dip.
+
+Key code: `effects/cue_engine.py` `CueEngine.tick` (holds the continuous `pos`
+per `_TimePattern`); `effects/mapper.py` `LEDMapper.render` (the cell-block fill
++ `zone_cell_levels` crossfade to replace for motion cues). Branch:
+`feat/sub-pixel-scanner`.
+
+## Status (implemented today, on main)
 - 33 lighting cues → zone/effect patterns; software strobe; beat flash/sparkle/
   glitch; keyframe-stepped manual cues; bonus burst; pause dim/freeze; cue
-  crossfade; sub-cell interpolation; decay trails; breathing; gradient-boundary
-  blend; spotlight/reveal masks.
+  crossfade; sub-cell (block-crossfade) interpolation; decay trails; breathing;
+  gradient-boundary blend; spotlight/reveal masks.
 - **v4:** camera cuts + per-player star power parsed (length-guarded); star power
-  rendered as charging tint → active surge; camera subject shown on status page.
-- Everything else in the inventory above is **future work** per the roadmap.
+  rendered as charging tint → active surge; camera subject on the status page.
+- **Beat oscillator:** continuous beat clock (coasts through dropped beats);
+  on-beat brightness pump (CHORUS, BigRockEnding); phase-locked chase motion
+  (smooth PLL + free-run fallback); eased gradient palettes with beat-locked
+  scroll (`effects/gradient.py`; demo on VERSE).
+- Everything above under "Current focus" and the later roadmap phases is
+  **future work**.
