@@ -11,6 +11,19 @@ from dataclasses import dataclass, field
 PACKET_HEADER = 0x59415247  # "YARG"
 MIN_PACKET_SIZE = 44
 
+# Datagram versions whose first-44-byte layout this parser has been verified
+# against in YARG's DataStreamController.cs. The bridge only reads offsets
+# 0-43, and every version YARG has shipped keeps those identical and appends
+# newer fields beyond them:
+#   1 = v0.14.0
+#   3 = v0.15.0            (+3 camera-cut bytes)
+#   4 = nightly (dev)      (+ushort count, then variable-length star-power)
+# A version outside this set means the layout *may* have shifted under the
+# fields we read. parse_packet still parses at these offsets (best effort);
+# the caller warns so it gets re-verified against upstream rather than
+# silently rendering wrong lighting. See memory: yarg-datagram-version.
+KNOWN_DATAGRAM_VERSIONS = frozenset({1, 3, 4})
+
 
 @dataclass
 class YARGPacket:
