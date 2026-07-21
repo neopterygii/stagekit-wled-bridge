@@ -108,6 +108,17 @@ class CueEngine:
         self._last_keyframe_type = KeyframeByte.OFF
         self._last_drum_notes = 0
 
+        # Beat oscillator: a continuous musical phase synthesized from BPM +
+        # beat edges, so motion/colour can be driven off a smooth phase that is
+        # quantised to but continuous *within* the beat (LedFx's beat/bar
+        # oscillator idea). YARG sends no absolute time or beat counter, so we
+        # derive it: _beat_at is the monotonic time of the last real beat edge
+        # (MEASURE or STRONG); _bar_beat is the beat index within the current
+        # bar (reset to 0 on the downbeat). WEAK beats never drive it — they're
+        # ambiguous with YARG's post-send "3" sentinel (see VISION.md).
+        self._beat_at = 0.0
+        self._bar_beat = 0
+
         # Current cue ID
         self._current_cue = CueByte.NO_CUE
         # Wall-clock time of the most recent cue change — read by the
@@ -160,6 +171,9 @@ class CueEngine:
         fx["bonus_t"] = self._bonus_remaining(now)
         fx["paused"] = self.paused
         fx["cue_change_at"] = self._cue_change_at
+        fx["beat_phase"] = self.beat_phase(now)
+        fx["bar_phase"] = self.bar_phase(now)
+        fx["bar_beat"] = self._bar_beat
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -185,6 +199,31 @@ class CueEngine:
         if remaining <= 0.0:
             return 0.0
         return min(1.0, remaining / BONUS_BURST_DURATION)
+
+    def beat_phase(self, now: float) -> float:
+        """Continuous 0.0→1.0 phase across one beat.
+
+        0.0 the instant a beat lands, ramping to 1.0 over the beat interval
+        (60/BPM). Saturates at 1.0 and holds if the next beat is late or
+        dropped, so a missed UDP packet reads as "no motion" rather than a
+        jump. Returns 0.0 until the first beat is seen.
+        """
+        if self._beat_at <= 0.0:
+            return 0.0
+        interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+        p = (now - self._beat_at) / interval
+        return p if p < 1.0 else 1.0
+
+    def bar_phase(self, now: float) -> float:
+        """Continuous phase across the bar: beat index + intra-beat phase.
+
+        Runs 0.0 upward, resetting to 0.0 on each downbeat (MEASURE). The
+        integer part is the current beat within the bar; the fraction is the
+        smooth beat_phase. Beats-per-bar is inferred from the downbeat spacing
+        (no time-signature is transmitted), so odd metres self-correct at the
+        next downbeat.
+        """
+        return self._bar_beat + self.beat_phase(now)
 
     def tick(self, now: float):
         """Advance all time-based patterns to the current timestamp.
@@ -263,26 +302,43 @@ class CueEngine:
                     # Linear blend between current step's bit and next step's bit
                     row[cell] = cur_on * inv_p + nxt_on * progress
 
-    def on_beat(self, beat_type: int):
+    def on_beat(self, beat_type: int, now: float | None = None):
         """Called when a beat event arrives from YARG.
 
         MEASURE = downbeat (start of a measure) — most prominent.
         STRONG  = strong beat within the measure.
         WEAK    = sub-beat — fires _beat_event so listen-patterns nudge,
                   but no sparkle/glitch overlay (would feel cluttered).
+
+        MEASURE and STRONG also drive the beat oscillator (reset phase, advance
+        the bar). WEAK does not — it can't be told apart from YARG's post-send
+        "3" sentinel. *now* is injectable for tests; production passes None.
         """
         self._last_beat_type = beat_type
         if beat_type == BeatByte.OFF:
             return
         self._beat_event.set()
+        if now is None:
+            now = time.monotonic()
         if beat_type == BeatByte.MEASURE:
             self._beat_flash = True
             self._downbeat_flash = True
             self._glitch_trigger = True
+            # Downbeat: restart the bar and the beat phase.
+            self._bar_beat = 0
+            self._beat_at = now
         elif beat_type == BeatByte.STRONG:
             self._beat_flash = True
             self._glitch_trigger = True
-        # WEAK: event already set; no flash/glitch on the off-beats.
+            # Advance within the bar, debounced so a duplicated packet (or a
+            # WEAK immediately promoted to STRONG) can't double-count. Only a
+            # counted beat moves _beat_at, so phase keeps ramping from the true
+            # edge when a duplicate is ignored.
+            interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+            if self._beat_at <= 0.0 or (now - self._beat_at) > 0.3 * interval:
+                self._bar_beat += 1
+                self._beat_at = now
+        # WEAK: event already set; no flash/glitch and no oscillator update.
 
     def on_keyframe(self, keyframe_type: int):
         """Called when a keyframe event arrives from YARG."""
@@ -316,6 +372,8 @@ class CueEngine:
                 self._reveal_started_at += delta
             if self._bonus_until > 0.0:
                 self._bonus_until += delta
+            if self._beat_at > 0.0:
+                self._beat_at += delta
         self.paused = paused
 
     def on_cue(self, cue_byte: int):
@@ -391,8 +449,9 @@ class CueEngine:
 
         elif cue == CueByte.CHORUS:
             # Peak energy — BPM-synced chase with beat sparkles
-            # Red chase + yellow solid base + sparkle on downbeats
-            self._set_effects(trails=5, sparkle=0.10)
+            # Red chase + yellow solid base + sparkle on downbeats + a gentle
+            # on-beat brightness pump from the beat oscillator.
+            self._set_effects(trails=5, sparkle=0.10, beat_pulse=0.18)
             self._start_beat_pattern(RED, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
@@ -441,9 +500,9 @@ class CueEngine:
             ], cycles_per_beat=0.125)
 
         elif cue == CueByte.BIG_ROCK_ENDING:
-            # Chaotic climax — fast rotating chase + beat sparkles
-            # 4-color rotating chase with 10% sparkle on downbeats
-            self._set_effects(trails=4, sparkle=0.10)
+            # Chaotic climax — fast rotating chase + beat sparkles + a stronger
+            # on-beat brightness pump (beat oscillator) to hit the climax.
+            self._set_effects(trails=4, sparkle=0.10, beat_pulse=0.22)
             self._start_multi_zone_chase([RED, GREEN, BLUE, YELLOW],
                                          bits_per_zone=2, cycles_per_beat=0.5)
 

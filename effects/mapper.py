@@ -162,6 +162,11 @@ class LEDMapper:
         spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
         fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
 
+        # Beat oscillator: a gentle on-beat brightness pump. beat_pulse is the
+        # depth (0 = off); beat_phase is the engine's continuous 0→1 phase.
+        beat_pulse = effects.get("beat_pulse", 0.0)
+        beat_phase = effects.get("beat_phase", 1.0)
+
         buf = self._buf
 
         # Resolve zone colors to flat ints once
@@ -458,6 +463,27 @@ class LEDMapper:
         if spotlight_region > 0.0 and spotlight_only is None:
             lo, hi = self._center_window(spotlight_region)
             self._mask_outside(buf, lo, hi)
+
+        # ── Effect: Beat pulse (beat oscillator) ─────────────────
+        # A gentle global brightness pump locked to the beat: peaks the instant
+        # a beat lands (beat_phase 0) and eases back over the beat via a squared
+        # decay. Driven by the engine's continuous beat_phase, so it stays
+        # smooth between the ~88 Hz packets and tempo-locked. Seamless by
+        # construction — the envelope is at its floor (1.0) right where
+        # beat_phase wraps, so a beat reset never jumps.
+        if beat_pulse > 0.0:
+            decay = 1.0 - beat_phase
+            env = 1.0 + beat_pulse * decay * decay
+            if env > 1.0:
+                for i in range(MAPPED_REGION):
+                    o = i * 3
+                    if buf[o] | buf[o + 1] | buf[o + 2]:
+                        r = int(buf[o] * env)
+                        g = int(buf[o + 1] * env)
+                        b = int(buf[o + 2] * env)
+                        buf[o] = r if r < 255 else 255
+                        buf[o + 1] = g if g < 255 else 255
+                        buf[o + 2] = b if b < 255 else 255
 
         # ── Apply brightness + write to output buffer ────────────
         # Pause dims everything to 35% so the strip doesn't go fully dark
