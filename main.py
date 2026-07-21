@@ -24,7 +24,7 @@ from config import (
     IDLE_TIMEOUT,
     LOG_LEVEL,
 )
-from protocol.yarg_packet import parse_packet, CueByte
+from protocol.yarg_packet import parse_packet, CueByte, KNOWN_DATAGRAM_VERSIONS
 from protocol.ddp_sender import DDPSender
 from protocol.wled_api import WLEDApi
 from effects.cue_engine import CueEngine
@@ -44,6 +44,7 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.wled_power = wled_power
         self._last_cue = -1
         self._last_strobe = -1
+        self._warned_versions: set[int] = set()
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         pkt = parse_packet(data)
@@ -51,6 +52,21 @@ class YARGProtocol(asyncio.DatagramProtocol):
             return
 
         self.tracker.on_packet()
+
+        # Datagram-version guard. parse_packet reads a fixed offset layout;
+        # that layout has been stable across every YARG version (append-only),
+        # so an unknown version still parses but *might* have shifted a field
+        # we read. Warn once per unseen version — this runs ~88x/s, so the set
+        # keeps it to a single line — and keep rendering rather than going dark.
+        ver = pkt.datagram_version
+        if ver not in KNOWN_DATAGRAM_VERSIONS and ver not in self._warned_versions:
+            self._warned_versions.add(ver)
+            log.warning(
+                "YARG datagram version %d is unrecognised (known: %s) — parsing "
+                "lighting fields at their v1-v4 offsets, which may be wrong if "
+                "the layout changed; re-check DataStreamController.cs",
+                ver, sorted(KNOWN_DATAGRAM_VERSIONS),
+            )
         self.wled_power.on_activity()
 
         # Update BPM
