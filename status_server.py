@@ -11,7 +11,9 @@ import logging
 import time
 from http import HTTPStatus
 
-from protocol.yarg_packet import CueByte, BeatByte, SceneIndexByte, StrobeSpeed
+from protocol.yarg_packet import (
+    CueByte, BeatByte, SceneIndexByte, StrobeSpeed, CameraCutSubject,
+)
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +79,13 @@ class StatusTracker:
         self.auto_gen = False   # True when YARG is using auto-generated venue lighting
         self.paused = False
 
+        # v4 datagram signals surfaced for the dashboard
+        self.camera_subject = 0     # CameraCutSubject id (parse-only, no lighting yet)
+        self.camera_priority = 0    # 0=Normal 1=Directed
+        self.sp_active = False      # any player's overdrive engaged
+        self.sp_charge = 0.0        # fullest player's meter, 0..1
+        self.sp_active_count = 0    # players in overdrive
+
         self._pkt_count_window: list[float] = []
         self._sse_queues: list[asyncio.Queue] = []
 
@@ -120,6 +129,15 @@ class StatusTracker:
     def on_paused(self, paused: bool):
         self.paused = paused
 
+    def on_camera_cut(self, subject: int, priority: int):
+        self.camera_subject = subject
+        self.camera_priority = priority
+
+    def on_star_power(self, active: bool, charge: float, active_count: int):
+        self.sp_active = active
+        self.sp_charge = charge
+        self.sp_active_count = active_count
+
     def snapshot(self, wled_power=None, settings=None) -> dict:
         # Recompute packets/sec from the rolling window so the value decays
         # to zero when packets stop arriving (instead of sticking at the
@@ -155,6 +173,12 @@ class StatusTracker:
             "scene_id": self.scene,
             "auto_gen": self.auto_gen,
             "paused": self.paused,
+            "camera_subject": CameraCutSubject.name(self.camera_subject),
+            "camera_subject_id": self.camera_subject,
+            "camera_directed": self.camera_priority == 1,
+            "sp_active": self.sp_active,
+            "sp_charge": round(self.sp_charge, 2),
+            "sp_active_count": self.sp_active_count,
         }
         if wled_power:
             d["wled_power"] = wled_power.power_snapshot()
@@ -267,6 +291,7 @@ STATUS_HTML = """\
           font-weight: 600; letter-spacing: 0.05em; }
   .pill.auto { background: var(--dim); color: var(--bg); }
   .pill.paused { background: var(--yellow); color: var(--bg); }
+  .pill.sp { background: var(--blue); color: var(--bg); }
   .pill.hidden { display: none; }
   .scene-label { font-size: 0.7rem; color: var(--dim); margin-top: 0.25rem;
                  text-transform: uppercase; letter-spacing: 0.05em; }
@@ -292,6 +317,13 @@ STATUS_HTML = """\
   <div class="card">
     <div class="label">Strobe</div>
     <div class="value" id="strobe">Off</div>
+  </div>
+  <div class="card" id="starpower-card">
+    <div class="label">Star Power</div>
+    <div class="value"><span id="sp-state">&mdash;</span> <span class="pill sp hidden" id="sp-pill">ACTIVE</span></div>
+    <div style="font-size:0.7rem;color:var(--dim);margin-top:0.35rem">
+      <span id="camera-label"></span>
+    </div>
   </div>
   <div class="card">
     <div class="label">Packets/sec</div>
@@ -750,6 +782,22 @@ function update(d) {
     sceneEl.textContent = 'Scene: ' + d.scene;
   } else {
     sceneEl.textContent = '';
+  }
+
+  // Star Power (v4): ACTIVE pill + charge/players readout
+  document.getElementById('sp-pill').classList.toggle('hidden', !d.sp_active);
+  const spEl = document.getElementById('sp-state');
+  if (d.sp_active) {
+    spEl.textContent = d.sp_active_count + (d.sp_active_count === 1 ? ' player' : ' players');
+  } else {
+    spEl.textContent = Math.round((d.sp_charge || 0) * 100) + '%';
+  }
+  // Camera cut (v4, parse-only): subject + directed flag
+  const camEl = document.getElementById('camera-label');
+  if (d.camera_subject) {
+    camEl.textContent = 'Camera: ' + d.camera_subject + (d.camera_directed ? ' (directed)' : '');
+  } else {
+    camEl.textContent = '';
   }
 
   const sh = d.strobe_hz;

@@ -44,6 +44,7 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.wled_power = wled_power
         self._last_cue = -1
         self._last_strobe = -1
+        self._last_camera_subject = -1
         self._warned_versions: set[int] = set()
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
@@ -102,10 +103,22 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # YARG: 0 = AtMenu, 1 = Unpaused, 2 = Paused.
         self.engine.on_paused(pkt.paused == 2)
 
+        # Star power (v4) — sustained "tasteful surge" overlay. Fed every frame
+        # since amount drains continuously while a player's overdrive is active.
+        self.engine.on_star_power(
+            pkt.sp_active, pkt.sp_amount, pkt.sp_charge, pkt.sp_active_count)
+
+        # Camera cut (v3) — parse-only for now: surface the subject on the
+        # status page on change; not yet wired into lighting.
+        if pkt.camera_cut_subject != self._last_camera_subject:
+            self.tracker.on_camera_cut(pkt.camera_cut_subject, pkt.camera_cut_priority)
+            self._last_camera_subject = pkt.camera_cut_subject
+
         # Surface scene + auto-gen track flag for the status page.
         self.tracker.on_scene(pkt.scene)
         self.tracker.on_auto_gen(pkt.auto_gen)
         self.tracker.on_paused(pkt.paused == 2)
+        self.tracker.on_star_power(pkt.sp_active, pkt.sp_charge, pkt.sp_active_count)
 
 
 class WLEDPowerManager:

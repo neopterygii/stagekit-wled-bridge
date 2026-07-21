@@ -46,6 +46,19 @@ _OFF_R = 0
 _OFF_G = 0
 _OFF_B = 0
 
+# ── Star-power "tasteful surge" tuning ───────────────────────────
+# Cool overdrive tint (a blue-white). The surge acts ONLY on already-lit
+# pixels — it lifts, cools, and shimmers the current wash rather than adding a
+# floor to dark pixels, so it never lights up a deliberate blackout. Overdrive
+# reads as "the existing lights intensify," which is how it looks on a real rig.
+SP_TINT = (150, 200, 255)     # cool blue-white the surge blends lit pixels toward
+SP_SURGE_LIFT = 0.30          # max fractional brightness lift on lit pixels
+SP_SURGE_BASE = 0.45          # surge floor while active, before amount scales in
+SP_TINT_STRENGTH = 0.30       # how far lit pixels blend toward SP_TINT at full
+SP_CHARGE_TINT = 0.15         # max cool tint on lit pixels while only charging
+SP_SHIMMER_DENSITY = 0.05     # per-pixel cool-shimmer seeding probability/frame
+SP_SHIMMER_MULTI = 0.5        # extra shimmer per additional active player
+
 
 class LEDMapper:
     """Maps Stage Kit zone bitmask state to an RGB pixel buffer with effects.
@@ -73,6 +86,10 @@ class LEDMapper:
 
         # Glitch state: per-cell invert countdown
         self._glitch = bytearray(NUM_CELLS)
+
+        # Star-power shimmer: countdown per pixel (0 = none), decayed like
+        # sparkle so cool flecks fade smoothly instead of strobing per frame.
+        self._sp_shimmer = bytearray(MAPPED_REGION)
 
         # Timing for breathing
         self._start_time = time.monotonic()
@@ -161,6 +178,12 @@ class LEDMapper:
         spotlight_region = effects.get("spotlight_region", 0.0)  # 0 = no mask
         spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
         fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
+
+        # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
+        sp_active = effects.get("sp_active", False)
+        sp_amount = effects.get("sp_amount", 0.0)          # 0..1 (active players)
+        sp_charge = effects.get("sp_charge", 0.0)          # 0..1 (all players)
+        sp_active_count = effects.get("sp_active_count", 0)
 
         buf = self._buf
 
@@ -441,6 +464,61 @@ class LEDMapper:
                     buf[o] = burst_w
                     buf[o + 1] = burst_w
                     buf[o + 2] = burst_w
+
+        # ── Effect: Star-power surge (v4) ────────────────────────
+        # "Tasteful surge": while a player has overdrive active, lift the wash
+        # brighter, blend it toward a cool blue-white, and lay a decaying cool
+        # shimmer over it. Before activation, a subtle cool tint grows as the
+        # meter charges. Acts only on lit pixels (see SP_TINT note) so it
+        # composites over the current cue and never disturbs a blackout.
+        # Written pre-brightness so global brightness and pause-dim still scale.
+        if sp_active:
+            # Surge intensity: a floor while active plus amount on top (amount
+            # drains as overdrive is spent, so the floor keeps it from
+            # vanishing mid-activation).
+            surge = SP_SURGE_BASE + (1.0 - SP_SURGE_BASE) * sp_amount
+            lift = 1.0 + SP_SURGE_LIFT * surge
+            tint_t = SP_TINT_STRENGTH * surge
+            inv_t = 1.0 - tint_t
+            tr, tg, tb = SP_TINT
+            density = min(0.25, SP_SHIMMER_DENSITY *
+                          (1.0 + SP_SHIMMER_MULTI * max(0, sp_active_count - 1)))
+            shimmer_life = max(2, round(fps * 0.12))  # ~120 ms
+            shimmer = self._sp_shimmer
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                if buf[o] | buf[o + 1] | buf[o + 2]:
+                    r = int(buf[o] * lift * inv_t + tr * tint_t)
+                    g = int(buf[o + 1] * lift * inv_t + tg * tint_t)
+                    b = int(buf[o + 2] * lift * inv_t + tb * tint_t)
+                    buf[o] = r if r < 255 else 255
+                    buf[o + 1] = g if g < 255 else 255
+                    buf[o + 2] = b if b < 255 else 255
+                    if random.random() < density:
+                        shimmer[i] = shimmer_life
+            # Render + decay the cool shimmer flecks (additive toward SP_TINT).
+            life_div = float(shimmer_life)
+            for i in range(MAPPED_REGION):
+                if shimmer[i] > 0:
+                    o = i * 3
+                    t = min(1.0, shimmer[i] / life_div)
+                    v = buf[o] + int(tr * t);       buf[o] = v if v < 255 else 255
+                    v = buf[o + 1] + int(tg * t);   buf[o + 1] = v if v < 255 else 255
+                    v = buf[o + 2] + int(255 * t);  buf[o + 2] = v if v < 255 else 255
+                    shimmer[i] -= 1
+        elif sp_charge > 0.0:
+            # Charging only: a subtle cool tint on lit pixels, proportional to
+            # how full the fullest player's meter is. No brightness lift, no
+            # shimmer — it should be barely-there anticipation.
+            tint_t = SP_CHARGE_TINT * sp_charge
+            inv_t = 1.0 - tint_t
+            tr, tg, tb = SP_TINT
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                if buf[o] | buf[o + 1] | buf[o + 2]:
+                    buf[o] = int(buf[o] * inv_t + tr * tint_t)
+                    buf[o + 1] = int(buf[o + 1] * inv_t + tg * tint_t)
+                    buf[o + 2] = int(buf[o + 2] * inv_t + tb * tint_t)
 
         # ── Effect: Reveal mask (Intro) ─────────────────────────
         # Pixels light up sequentially from the strip centre outward as
