@@ -47,6 +47,15 @@ def test_phase_tracks_bpm():
     assert abs(e.beat_phase(10.5) - 0.5) < 1e-9
 
 
+def test_phase_never_negative():
+    # Defensive: a query before the last beat's timestamp clamps to 0, never
+    # a negative phase (which would scroll motion backwards).
+    e = _engine(bpm=120.0)
+    e.on_beat(BeatByte.STRONG, now=100.0)
+    assert e.beat_phase(99.0) == 0.0
+    assert e.beat_clock(99.0) == e._beat_count  # phase floored at 0
+
+
 # ── bar position ─────────────────────────────────────────────────
 
 def test_measure_resets_bar_strong_advances():

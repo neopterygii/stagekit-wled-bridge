@@ -167,6 +167,13 @@ class LEDMapper:
         beat_pulse = effects.get("beat_pulse", 0.0)
         beat_phase = effects.get("beat_phase", 1.0)
 
+        # Gradient palette (opt-in): a Gradient LUT that recolours lit pixels by
+        # position, scrolled along the strip by the beat clock. gradient_roll is
+        # gradient-cycles per beat (0 = static).
+        gradient = effects.get("gradient", None)
+        gradient_roll = effects.get("gradient_roll", 0.0)
+        beat_clock = effects.get("beat_clock", 0.0)
+
         buf = self._buf
 
         # Resolve zone colors to flat ints once
@@ -265,6 +272,32 @@ class LEDMapper:
                             if pos < MAPPED_REGION:
                                 self._set_px(buf, pos, cr, cg, cb)
                             pos += 1
+
+        # ── Gradient recolour (beat oscillator) ──────────────────
+        # Opt-in: recolour every lit pixel from the gradient by its position,
+        # scrolled along the strip by the beat clock. Zones/patterns decided
+        # which pixels are lit and how bright; the gradient decides hue,
+        # preserving each pixel's intensity (its brightest channel). Runs before
+        # trails so decay/breathing/sparkle all operate on the gradient colour.
+        if gradient is not None:
+            offset = (beat_clock * gradient_roll) % 1.0 if gradient_roll else 0.0
+            color_at = gradient.color_at
+            inv_region = 1.0 / MAPPED_REGION
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                r = buf[o]
+                g = buf[o + 1]
+                b = buf[o + 2]
+                mx = r if r >= g else g
+                if b > mx:
+                    mx = b
+                if mx == 0:
+                    continue
+                gr, gg, gb = color_at(i * inv_region + offset)
+                inten = mx / 255.0
+                buf[o] = int(gr * inten)
+                buf[o + 1] = int(gg * inten)
+                buf[o + 2] = int(gb * inten)
 
         # ── Effect: Decay trails ─────────────────────────────────
         trail = self._trail

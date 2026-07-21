@@ -12,6 +12,7 @@ import asyncio
 import time
 
 from protocol.yarg_packet import CueByte, BeatByte, KeyframeByte, StrobeSpeed
+from effects.gradient import GRADIENTS
 
 # Bitmask constants matching YALCY
 NONE = 0b00000000
@@ -118,6 +119,10 @@ class CueEngine:
         # ambiguous with YARG's post-send "3" sentinel (see VISION.md).
         self._beat_at = 0.0
         self._bar_beat = 0
+        # Monotonic beat count (never resets) — with beat_phase it forms a
+        # continuous, tempo-locked clock for scrolling motion/colour that must
+        # not restart each bar (e.g. a rolling gradient).
+        self._beat_count = 0
 
         # Current cue ID
         self._current_cue = CueByte.NO_CUE
@@ -174,6 +179,7 @@ class CueEngine:
         fx["beat_phase"] = self.beat_phase(now)
         fx["bar_phase"] = self.bar_phase(now)
         fx["bar_beat"] = self._bar_beat
+        fx["beat_clock"] = self.beat_clock(now)
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -212,6 +218,8 @@ class CueEngine:
             return 0.0
         interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
         p = (now - self._beat_at) / interval
+        if p <= 0.0:
+            return 0.0
         return p if p < 1.0 else 1.0
 
     def bar_phase(self, now: float) -> float:
@@ -224,6 +232,16 @@ class CueEngine:
         next downbeat.
         """
         return self._bar_beat + self.beat_phase(now)
+
+    def beat_clock(self, now: float) -> float:
+        """Monotonic, continuous, tempo-locked beat count (beats + phase).
+
+        Unlike bar_phase this never resets, so it's the clock for motion/colour
+        that must scroll continuously across bars (e.g. a rolling gradient). It
+        plateaus while a beat is late (beat_phase saturates) and resumes on the
+        next beat rather than jittering.
+        """
+        return self._beat_count + self.beat_phase(now)
 
     def tick(self, now: float):
         """Advance all time-based patterns to the current timestamp.
@@ -327,6 +345,7 @@ class CueEngine:
             # Downbeat: restart the bar and the beat phase.
             self._bar_beat = 0
             self._beat_at = now
+            self._beat_count += 1
         elif beat_type == BeatByte.STRONG:
             self._beat_flash = True
             self._glitch_trigger = True
@@ -338,6 +357,7 @@ class CueEngine:
             if self._beat_at <= 0.0 or (now - self._beat_at) > 0.3 * interval:
                 self._bar_beat += 1
                 self._beat_at = now
+                self._beat_count += 1
         # WEAK: event already set; no flash/glitch and no oscillator update.
 
     def on_keyframe(self, keyframe_type: int):
@@ -442,9 +462,13 @@ class CueEngine:
             self._start_listen_pattern(RED, [ALL, NONE], listen="keyframe")
 
         elif cue == CueByte.VERSE:
-            # Ambient breathing wash — "settle in" moment
-            # Full blue wash with slow sine breathing like WLED Breathe
-            self._set_effects(breathing=0.25, trails=10)
+            # Ambient breathing wash — "settle in" moment. A full wash that
+            # breathes, recoloured by a slowly-rolling "cool" gradient locked to
+            # the beat (1 gradient cycle per 8 beats) so the colour drifts with
+            # the song instead of sitting on a flat blue. The BLUE zone just
+            # lights the strip; the gradient supplies the hue.
+            self._set_effects(breathing=0.25, trails=10,
+                              gradient=GRADIENTS["cool"], gradient_roll=0.125)
             self._set_zone(BLUE, ALL)
 
         elif cue == CueByte.CHORUS:
