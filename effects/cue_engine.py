@@ -257,14 +257,24 @@ class CueEngine:
         return self._bar_beat + self.beat_phase(now)
 
     def beat_clock(self, now: float) -> float:
-        """Monotonic, continuous, tempo-locked beat count (beats + phase).
+        """Monotonic, free-running, tempo-locked beat count (beats + phase).
 
-        Unlike bar_phase this never resets, so it's the clock for motion/colour
-        that must scroll continuously across bars (e.g. a rolling gradient). It
-        plateaus while a beat is late (beat_phase saturates) and resumes on the
-        next beat rather than jittering.
+        The clock for motion/colour that must run continuously across bars (a
+        chase, a rolling gradient). Unlike beat_phase it does NOT saturate: on a
+        dropped beat it keeps advancing at tempo (a missing beat is almost
+        always a lost UDP packet, not a musical stop), so motion coasts instead
+        of freezing. Real beats re-align it by the *rounded* elapsed beats (see
+        on_beat), so bridging a dropped beat stays continuous with no lurch, and
+        the per-pattern PLL absorbs any residual smoothly. Only used while beats
+        are fresh; the render loop's BEAT_LOCK_TIMEOUT catches a genuine stop.
         """
-        return self._beat_count + self.beat_phase(now)
+        if self._beat_at <= 0.0:
+            return 0.0
+        interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+        p = (now - self._beat_at) / interval
+        if p < 0.0:
+            p = 0.0
+        return self._beat_count + p
 
     def tick(self, now: float):
         """Advance all time-based patterns to the current timestamp.
@@ -401,10 +411,9 @@ class CueEngine:
             self._beat_flash = True
             self._downbeat_flash = True
             self._glitch_trigger = True
-            # Downbeat: restart the bar and the beat phase.
+            # Downbeat: restart the bar and re-align the beat clock.
             self._bar_beat = 0
-            self._beat_at = now
-            self._beat_count += 1
+            self._advance_clock(now)
         elif beat_type == BeatByte.STRONG:
             self._beat_flash = True
             self._glitch_trigger = True
@@ -415,9 +424,25 @@ class CueEngine:
             interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
             if self._beat_at <= 0.0 or (now - self._beat_at) > 0.3 * interval:
                 self._bar_beat += 1
-                self._beat_at = now
-                self._beat_count += 1
+                self._advance_clock(now)
         # WEAK: event already set; no flash/glitch and no oscillator update.
+
+    def _advance_clock(self, now: float):
+        """Re-align the free-running beat clock on a real beat.
+
+        Advance _beat_count by the *rounded* number of beats since the last
+        real beat (≥ 1). Normally that's 1; when a beat's UDP packet was lost
+        it's ~2, which bridges the gap so beat_clock (which coasted at tempo
+        meanwhile) stays continuous instead of lurching back a beat. Then move
+        the phase origin to this beat.
+        """
+        if self._beat_at > 0.0:
+            interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+            elapsed = (now - self._beat_at) / interval
+            self._beat_count += max(1, round(elapsed))
+        else:
+            self._beat_count += 1
+        self._beat_at = now
 
     def on_keyframe(self, keyframe_type: int):
         """Called when a keyframe event arrives from YARG."""
