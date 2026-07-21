@@ -12,6 +12,7 @@ import asyncio
 import time
 
 from protocol.yarg_packet import CueByte, BeatByte, KeyframeByte, StrobeSpeed
+from effects.gradient import GRADIENTS
 
 # Bitmask constants matching YALCY
 NONE = 0b00000000
@@ -44,6 +45,17 @@ STROBE_RATES = {
 REVEAL_DURATION = 1.5        # Intro center-out reveal
 BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
 
+# Beat-lock phase-locked loop (drives BPM-synced chase motion onto the beat).
+# The pattern free-runs on tempo, then each frame is pulled a fraction
+# min(1, dt/PLL_TAU) of the way toward the beat-locked target — a smooth
+# exponential correction (no snap). Small TAU = tight lock; the correction is
+# clamped so motion never runs backwards (it hesitates instead). Locking is
+# only applied while beats are fresh; after BEAT_LOCK_TIMEOUT with no beat the
+# pattern free-runs on tempo alone (the fallback).
+PLL_TAU = 0.10               # seconds — lock time-constant
+BEAT_LOCK_TIMEOUT = 2.0      # seconds without a beat → free-run fallback
+PLL_DT_MAX = 0.2             # clamp per-frame dt so a stall can't fling motion
+
 
 class _TimePattern:
     """Time-driven zone pattern ticked deterministically by the render thread.
@@ -52,7 +64,8 @@ class _TimePattern:
     from wall-clock time — immune to event-loop congestion.
     """
     __slots__ = ('steps', 'step_dicts', 'step', 'next_time', 'bpm_sync',
-                 'param', 'direction', 'reverse_on_beat', 'reverse_counter')
+                 'param', 'direction', 'reverse_on_beat', 'reverse_counter',
+                 'beat_lock', 'pos', 'last_tick')
 
     def __init__(self, steps, *, bpm_sync, param, now, init_bpm=120.0,
                  direction=1, reverse_on_beat=False):
@@ -69,6 +82,17 @@ class _TimePattern:
         # Schedule first transition one interval in the future so step 0
         # is visible for the correct duration on the very first tick.
         self.next_time = now + self.step_interval(init_bpm)
+        # Beat-lock: BPM-synced forward chases are phase-locked to the beat
+        # oscillator (see tick()). Randomly-reversing chaos patterns (Frenzy)
+        # and non-tempo timed patterns keep the free-run scheduler above.
+        self.beat_lock = bpm_sync and not reverse_on_beat
+        self.pos = 0.0               # continuous step position for the PLL
+        self.last_tick = now         # wall-clock of the last PLL advance
+
+    def steps_per_second(self, bpm: float) -> float:
+        """Free-run motion rate for a beat-locked pattern (steps/sec)."""
+        effective_bpm = bpm if bpm > 0 else 120.0
+        return len(self.steps) * self.param * effective_bpm / 60.0
 
     def step_interval(self, bpm: float) -> float:
         """Seconds per step at the given BPM."""
@@ -107,6 +131,21 @@ class CueEngine:
         self._last_beat_type = BeatByte.OFF
         self._last_keyframe_type = KeyframeByte.OFF
         self._last_drum_notes = 0
+
+        # Beat oscillator: a continuous musical phase synthesized from BPM +
+        # beat edges, so motion/colour can be driven off a smooth phase that is
+        # quantised to but continuous *within* the beat (LedFx's beat/bar
+        # oscillator idea). YARG sends no absolute time or beat counter, so we
+        # derive it: _beat_at is the monotonic time of the last real beat edge
+        # (MEASURE or STRONG); _bar_beat is the beat index within the current
+        # bar (reset to 0 on the downbeat). WEAK beats never drive it — they're
+        # ambiguous with YARG's post-send "3" sentinel (see VISION.md).
+        self._beat_at = 0.0
+        self._bar_beat = 0
+        # Monotonic beat count (never resets) — with beat_phase it forms a
+        # continuous, tempo-locked clock for scrolling motion/colour that must
+        # not restart each bar (e.g. a rolling gradient).
+        self._beat_count = 0
 
         # Current cue ID
         self._current_cue = CueByte.NO_CUE
@@ -173,6 +212,10 @@ class CueEngine:
         fx["sp_amount"] = self._sp_amount
         fx["sp_charge"] = self._sp_charge
         fx["sp_active_count"] = self._sp_active_count
+        fx["beat_phase"] = self.beat_phase(now)
+        fx["bar_phase"] = self.bar_phase(now)
+        fx["bar_beat"] = self._bar_beat
+        fx["beat_clock"] = self.beat_clock(now)
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -198,6 +241,53 @@ class CueEngine:
         if remaining <= 0.0:
             return 0.0
         return min(1.0, remaining / BONUS_BURST_DURATION)
+
+    def beat_phase(self, now: float) -> float:
+        """Continuous 0.0→1.0 phase across one beat.
+
+        0.0 the instant a beat lands, ramping to 1.0 over the beat interval
+        (60/BPM). Saturates at 1.0 and holds if the next beat is late or
+        dropped, so a missed UDP packet reads as "no motion" rather than a
+        jump. Returns 0.0 until the first beat is seen.
+        """
+        if self._beat_at <= 0.0:
+            return 0.0
+        interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+        p = (now - self._beat_at) / interval
+        if p <= 0.0:
+            return 0.0
+        return p if p < 1.0 else 1.0
+
+    def bar_phase(self, now: float) -> float:
+        """Continuous phase across the bar: beat index + intra-beat phase.
+
+        Runs 0.0 upward, resetting to 0.0 on each downbeat (MEASURE). The
+        integer part is the current beat within the bar; the fraction is the
+        smooth beat_phase. Beats-per-bar is inferred from the downbeat spacing
+        (no time-signature is transmitted), so odd metres self-correct at the
+        next downbeat.
+        """
+        return self._bar_beat + self.beat_phase(now)
+
+    def beat_clock(self, now: float) -> float:
+        """Monotonic, free-running, tempo-locked beat count (beats + phase).
+
+        The clock for motion/colour that must run continuously across bars (a
+        chase, a rolling gradient). Unlike beat_phase it does NOT saturate: on a
+        dropped beat it keeps advancing at tempo (a missing beat is almost
+        always a lost UDP packet, not a musical stop), so motion coasts instead
+        of freezing. Real beats re-align it by the *rounded* elapsed beats (see
+        on_beat), so bridging a dropped beat stays continuous with no lurch, and
+        the per-pattern PLL absorbs any residual smoothly. Only used while beats
+        are fresh; the render loop's BEAT_LOCK_TIMEOUT catches a genuine stop.
+        """
+        if self._beat_at <= 0.0:
+            return 0.0
+        interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+        p = (now - self._beat_at) / interval
+        if p < 0.0:
+            p = 0.0
+        return self._beat_count + p
 
     def tick(self, now: float):
         """Advance all time-based patterns to the current timestamp.
@@ -236,33 +326,69 @@ class CueEngine:
         if self.paused:
             return
 
+        # Beat-lock context: patterns lock to the beat only while beats are
+        # fresh; otherwise they free-run on tempo (the fallback).
+        beats_live = (self._beat_at > 0.0 and
+                      (now - self._beat_at) < BEAT_LOCK_TIMEOUT)
+        beat_clock = self.beat_clock(now) if beats_live else 0.0
+
         patterns = self._time_patterns  # local ref — safe across threads
         for p in patterns:
-            interval = p.step_interval(bpm)
-            # Snap forward if we've fallen more than 1s (or 100 steps) behind.
-            max_catchup = max(100, int(1.0 / interval)) if interval > 0 else 100
-            if interval > 0 and (now - p.next_time) > max(1.0, interval * max_catchup):
-                p.next_time = now + interval
-            while now >= p.next_time:
-                p.step = (p.step + p.direction) % len(p.steps)
-                p.next_time += interval
-                if p.reverse_on_beat:
-                    p.reverse_counter += 1
-                    if p.reverse_counter % 4 == 0:
-                        p.direction = -p.direction
-
-            # Fractional progress (0.0 at step start, 1.0 at next-step boundary).
-            if interval > 0:
-                progress = 1.0 - (p.next_time - now) / interval
-                if progress < 0.0:
-                    progress = 0.0
-                elif progress > 1.0:
-                    progress = 1.0
+            n = len(p.steps)
+            if p.beat_lock:
+                # ── Phase-locked motion ──────────────────────────
+                # Free-run on tempo, then pull a fraction min(1, dt/PLL_TAU) of
+                # the way toward the beat-locked target — a smooth exponential
+                # correction, never a snap. The advance is clamped ≥ 0 so a
+                # dropped beat makes the chase hesitate, not jump backwards.
+                dt = now - p.last_tick
+                p.last_tick = now
+                if dt < 0.0:
+                    dt = 0.0
+                elif dt > PLL_DT_MAX:
+                    dt = PLL_DT_MAX
+                advance = dt * p.steps_per_second(bpm)
+                if beats_live:
+                    # target position (in steps) implied by the beat clock
+                    target = beat_clock * n * p.param
+                    err = target - (p.pos + advance)
+                    err = (err + n * 0.5) % n - n * 0.5   # shortest wrapped path
+                    advance += err * (dt / PLL_TAU if dt < PLL_TAU else 1.0)
+                    if advance < 0.0:
+                        advance = 0.0
+                p.pos = (p.pos + advance) % n
+                p.step = int(p.pos)
+                if p.step >= n:
+                    p.step = n - 1
+                progress = p.pos - p.step
+                nxt_idx = (p.step + 1) % n
             else:
-                progress = 0.0
+                # ── Free-run scheduler (timed + chaos patterns) ──
+                interval = p.step_interval(bpm)
+                # Snap forward if we've fallen more than 1s (or 100 steps) behind.
+                max_catchup = max(100, int(1.0 / interval)) if interval > 0 else 100
+                if interval > 0 and (now - p.next_time) > max(1.0, interval * max_catchup):
+                    p.next_time = now + interval
+                while now >= p.next_time:
+                    p.step = (p.step + p.direction) % n
+                    p.next_time += interval
+                    if p.reverse_on_beat:
+                        p.reverse_counter += 1
+                        if p.reverse_counter % 4 == 0:
+                            p.direction = -p.direction
+
+                # Fractional progress (0.0 at step start, 1.0 at next boundary).
+                if interval > 0:
+                    progress = 1.0 - (p.next_time - now) / interval
+                    if progress < 0.0:
+                        progress = 0.0
+                    elif progress > 1.0:
+                        progress = 1.0
+                else:
+                    progress = 0.0
+                nxt_idx = (p.step + p.direction) % n
 
             cur_step = p.steps[p.step]
-            nxt_idx = (p.step + p.direction) % len(p.steps)
             nxt_zones = p.step_dicts[nxt_idx]
 
             inv_p = 1.0 - progress
@@ -276,26 +402,60 @@ class CueEngine:
                     # Linear blend between current step's bit and next step's bit
                     row[cell] = cur_on * inv_p + nxt_on * progress
 
-    def on_beat(self, beat_type: int):
+    def on_beat(self, beat_type: int, now: float | None = None):
         """Called when a beat event arrives from YARG.
 
         MEASURE = downbeat (start of a measure) — most prominent.
         STRONG  = strong beat within the measure.
         WEAK    = sub-beat — fires _beat_event so listen-patterns nudge,
                   but no sparkle/glitch overlay (would feel cluttered).
+
+        MEASURE and STRONG also drive the beat oscillator (reset phase, advance
+        the bar). WEAK does not — it can't be told apart from YARG's post-send
+        "3" sentinel. *now* is injectable for tests; production passes None.
         """
         self._last_beat_type = beat_type
         if beat_type == BeatByte.OFF:
             return
         self._beat_event.set()
+        if now is None:
+            now = time.monotonic()
         if beat_type == BeatByte.MEASURE:
             self._beat_flash = True
             self._downbeat_flash = True
             self._glitch_trigger = True
+            # Downbeat: restart the bar and re-align the beat clock.
+            self._bar_beat = 0
+            self._advance_clock(now)
         elif beat_type == BeatByte.STRONG:
             self._beat_flash = True
             self._glitch_trigger = True
-        # WEAK: event already set; no flash/glitch on the off-beats.
+            # Advance within the bar, debounced so a duplicated packet (or a
+            # WEAK immediately promoted to STRONG) can't double-count. Only a
+            # counted beat moves _beat_at, so phase keeps ramping from the true
+            # edge when a duplicate is ignored.
+            interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+            if self._beat_at <= 0.0 or (now - self._beat_at) > 0.3 * interval:
+                self._bar_beat += 1
+                self._advance_clock(now)
+        # WEAK: event already set; no flash/glitch and no oscillator update.
+
+    def _advance_clock(self, now: float):
+        """Re-align the free-running beat clock on a real beat.
+
+        Advance _beat_count by the *rounded* number of beats since the last
+        real beat (≥ 1). Normally that's 1; when a beat's UDP packet was lost
+        it's ~2, which bridges the gap so beat_clock (which coasted at tempo
+        meanwhile) stays continuous instead of lurching back a beat. Then move
+        the phase origin to this beat.
+        """
+        if self._beat_at > 0.0:
+            interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+            elapsed = (now - self._beat_at) / interval
+            self._beat_count += max(1, round(elapsed))
+        else:
+            self._beat_count += 1
+        self._beat_at = now
 
     def on_keyframe(self, keyframe_type: int):
         """Called when a keyframe event arrives from YARG."""
@@ -343,6 +503,8 @@ class CueEngine:
                 self._reveal_started_at += delta
             if self._bonus_until > 0.0:
                 self._bonus_until += delta
+            if self._beat_at > 0.0:
+                self._beat_at += delta
         self.paused = paused
 
     def on_cue(self, cue_byte: int):
@@ -411,15 +573,20 @@ class CueEngine:
             self._start_listen_pattern(RED, [ALL, NONE], listen="keyframe")
 
         elif cue == CueByte.VERSE:
-            # Ambient breathing wash — "settle in" moment
-            # Full blue wash with slow sine breathing like WLED Breathe
-            self._set_effects(breathing=0.25, trails=10)
+            # Ambient breathing wash — "settle in" moment. A full wash that
+            # breathes, recoloured by a slowly-rolling "cool" gradient locked to
+            # the beat (1 gradient cycle per 8 beats) so the colour drifts with
+            # the song instead of sitting on a flat blue. The BLUE zone just
+            # lights the strip; the gradient supplies the hue.
+            self._set_effects(breathing=0.25, trails=10,
+                              gradient=GRADIENTS["cool"], gradient_roll=0.125)
             self._set_zone(BLUE, ALL)
 
         elif cue == CueByte.CHORUS:
             # Peak energy — BPM-synced chase with beat sparkles
-            # Red chase + yellow solid base + sparkle on downbeats
-            self._set_effects(trails=5, sparkle=0.10)
+            # Red chase + yellow solid base + sparkle on downbeats + a gentle
+            # on-beat brightness pump from the beat oscillator.
+            self._set_effects(trails=5, sparkle=0.10, beat_pulse=0.18)
             self._start_beat_pattern(RED, [
                 ZERO | FOUR, ONE | FIVE, TWO | SIX, THREE | SEVEN,
             ], cycles_per_beat=0.25)
@@ -468,9 +635,9 @@ class CueEngine:
             ], cycles_per_beat=0.125)
 
         elif cue == CueByte.BIG_ROCK_ENDING:
-            # Chaotic climax — fast rotating chase + beat sparkles
-            # 4-color rotating chase with 10% sparkle on downbeats
-            self._set_effects(trails=4, sparkle=0.10)
+            # Chaotic climax — fast rotating chase + beat sparkles + a stronger
+            # on-beat brightness pump (beat oscillator) to hit the climax.
+            self._set_effects(trails=4, sparkle=0.10, beat_pulse=0.22)
             self._start_multi_zone_chase([RED, GREEN, BLUE, YELLOW],
                                          bits_per_zone=2, cycles_per_beat=0.5)
 
