@@ -45,6 +45,17 @@ STROBE_RATES = {
 REVEAL_DURATION = 1.5        # Intro center-out reveal
 BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
 
+# Beat-lock phase-locked loop (drives BPM-synced chase motion onto the beat).
+# The pattern free-runs on tempo, then each frame is pulled a fraction
+# min(1, dt/PLL_TAU) of the way toward the beat-locked target — a smooth
+# exponential correction (no snap). Small TAU = tight lock; the correction is
+# clamped so motion never runs backwards (it hesitates instead). Locking is
+# only applied while beats are fresh; after BEAT_LOCK_TIMEOUT with no beat the
+# pattern free-runs on tempo alone (the fallback).
+PLL_TAU = 0.10               # seconds — lock time-constant
+BEAT_LOCK_TIMEOUT = 2.0      # seconds without a beat → free-run fallback
+PLL_DT_MAX = 0.2             # clamp per-frame dt so a stall can't fling motion
+
 
 class _TimePattern:
     """Time-driven zone pattern ticked deterministically by the render thread.
@@ -53,7 +64,8 @@ class _TimePattern:
     from wall-clock time — immune to event-loop congestion.
     """
     __slots__ = ('steps', 'step_dicts', 'step', 'next_time', 'bpm_sync',
-                 'param', 'direction', 'reverse_on_beat', 'reverse_counter')
+                 'param', 'direction', 'reverse_on_beat', 'reverse_counter',
+                 'beat_lock', 'pos', 'last_tick')
 
     def __init__(self, steps, *, bpm_sync, param, now, init_bpm=120.0,
                  direction=1, reverse_on_beat=False):
@@ -70,6 +82,17 @@ class _TimePattern:
         # Schedule first transition one interval in the future so step 0
         # is visible for the correct duration on the very first tick.
         self.next_time = now + self.step_interval(init_bpm)
+        # Beat-lock: BPM-synced forward chases are phase-locked to the beat
+        # oscillator (see tick()). Randomly-reversing chaos patterns (Frenzy)
+        # and non-tempo timed patterns keep the free-run scheduler above.
+        self.beat_lock = bpm_sync and not reverse_on_beat
+        self.pos = 0.0               # continuous step position for the PLL
+        self.last_tick = now         # wall-clock of the last PLL advance
+
+    def steps_per_second(self, bpm: float) -> float:
+        """Free-run motion rate for a beat-locked pattern (steps/sec)."""
+        effective_bpm = bpm if bpm > 0 else 120.0
+        return len(self.steps) * self.param * effective_bpm / 60.0
 
     def step_interval(self, bpm: float) -> float:
         """Seconds per step at the given BPM."""
@@ -280,33 +303,69 @@ class CueEngine:
         if self.paused:
             return
 
+        # Beat-lock context: patterns lock to the beat only while beats are
+        # fresh; otherwise they free-run on tempo (the fallback).
+        beats_live = (self._beat_at > 0.0 and
+                      (now - self._beat_at) < BEAT_LOCK_TIMEOUT)
+        beat_clock = self.beat_clock(now) if beats_live else 0.0
+
         patterns = self._time_patterns  # local ref — safe across threads
         for p in patterns:
-            interval = p.step_interval(bpm)
-            # Snap forward if we've fallen more than 1s (or 100 steps) behind.
-            max_catchup = max(100, int(1.0 / interval)) if interval > 0 else 100
-            if interval > 0 and (now - p.next_time) > max(1.0, interval * max_catchup):
-                p.next_time = now + interval
-            while now >= p.next_time:
-                p.step = (p.step + p.direction) % len(p.steps)
-                p.next_time += interval
-                if p.reverse_on_beat:
-                    p.reverse_counter += 1
-                    if p.reverse_counter % 4 == 0:
-                        p.direction = -p.direction
-
-            # Fractional progress (0.0 at step start, 1.0 at next-step boundary).
-            if interval > 0:
-                progress = 1.0 - (p.next_time - now) / interval
-                if progress < 0.0:
-                    progress = 0.0
-                elif progress > 1.0:
-                    progress = 1.0
+            n = len(p.steps)
+            if p.beat_lock:
+                # ── Phase-locked motion ──────────────────────────
+                # Free-run on tempo, then pull a fraction min(1, dt/PLL_TAU) of
+                # the way toward the beat-locked target — a smooth exponential
+                # correction, never a snap. The advance is clamped ≥ 0 so a
+                # dropped beat makes the chase hesitate, not jump backwards.
+                dt = now - p.last_tick
+                p.last_tick = now
+                if dt < 0.0:
+                    dt = 0.0
+                elif dt > PLL_DT_MAX:
+                    dt = PLL_DT_MAX
+                advance = dt * p.steps_per_second(bpm)
+                if beats_live:
+                    # target position (in steps) implied by the beat clock
+                    target = beat_clock * n * p.param
+                    err = target - (p.pos + advance)
+                    err = (err + n * 0.5) % n - n * 0.5   # shortest wrapped path
+                    advance += err * (dt / PLL_TAU if dt < PLL_TAU else 1.0)
+                    if advance < 0.0:
+                        advance = 0.0
+                p.pos = (p.pos + advance) % n
+                p.step = int(p.pos)
+                if p.step >= n:
+                    p.step = n - 1
+                progress = p.pos - p.step
+                nxt_idx = (p.step + 1) % n
             else:
-                progress = 0.0
+                # ── Free-run scheduler (timed + chaos patterns) ──
+                interval = p.step_interval(bpm)
+                # Snap forward if we've fallen more than 1s (or 100 steps) behind.
+                max_catchup = max(100, int(1.0 / interval)) if interval > 0 else 100
+                if interval > 0 and (now - p.next_time) > max(1.0, interval * max_catchup):
+                    p.next_time = now + interval
+                while now >= p.next_time:
+                    p.step = (p.step + p.direction) % n
+                    p.next_time += interval
+                    if p.reverse_on_beat:
+                        p.reverse_counter += 1
+                        if p.reverse_counter % 4 == 0:
+                            p.direction = -p.direction
+
+                # Fractional progress (0.0 at step start, 1.0 at next boundary).
+                if interval > 0:
+                    progress = 1.0 - (p.next_time - now) / interval
+                    if progress < 0.0:
+                        progress = 0.0
+                    elif progress > 1.0:
+                        progress = 1.0
+                else:
+                    progress = 0.0
+                nxt_idx = (p.step + p.direction) % n
 
             cur_step = p.steps[p.step]
-            nxt_idx = (p.step + p.direction) % len(p.steps)
             nxt_zones = p.step_dicts[nxt_idx]
 
             inv_p = 1.0 - progress
