@@ -41,6 +41,15 @@ MAPPED_REGION = NUM_CELLS * CELL_SIZE
 # Number of pixels on each side of a color boundary to blend over (scales with cell size)
 BLEND_WIDTH = max(1, CELL_SIZE // 6)
 
+# Sub-pixel scanner (VISION Phase 2). Motion cues are painted as soft triangular
+# intensity profiles at a *continuous* pixel position instead of crossfading
+# whole cell-blocks, so a moving light glides pixel-by-pixel with a constant
+# peak and width. The half-width equals one cell: a lone scanner is then a
+# ~1-cell bright core with soft shoulders, and adjacent heads in a tiled chase
+# (spaced one cell apart) form a partition of unity — their triangles sum to 1,
+# so the strip fills with no dark seams between colour segments.
+SCAN_HALFWIDTH = max(2, CELL_SIZE)
+
 # Byte-level constants for a black pixel
 _OFF_R = 0
 _OFF_G = 0
@@ -77,6 +86,11 @@ class LEDMapper:
 
         # Second working buffer for gradient blending pass
         self._blend = bytearray(MAPPED_REGION * 3)
+
+        # Sub-pixel scanner: heads accumulate (colour, coverage) here, then the
+        # motion layer is alpha-composited over the static base (see render()).
+        self._motion = bytearray(MAPPED_REGION * 3)
+        self._motion_alpha = [0.0] * MAPPED_REGION
 
         # Decay trails state: flat R,G,B per pixel
         self._trail = bytearray(MAPPED_REGION * 3)
@@ -133,7 +147,8 @@ class LEDMapper:
     def render(self, zone_bitmasks: list[int], zone_colors: dict | None = None,
                effects: dict | None = None, brightness: float = 1.0,
                reverse: bool = False,
-               zone_cell_levels: list[list[float]] | None = None) -> bytes:
+               zone_cell_levels: list[list[float]] | None = None,
+               motion_sources: list | None = None) -> bytes:
         """Render pixels from 4 zone bitmasks with optional effects.
 
         Args:
@@ -144,10 +159,14 @@ class LEDMapper:
             effects: Dict of active effects from cue engine.
             brightness: Global brightness 0.0-1.0 (baked into output).
             reverse: Mirror the output horizontally.
-            zone_cell_levels: 4 zones x 8 cells of float 0.0-1.0 brightness.
-                When provided, the engine's tick() has computed sub-cell
-                interpolation for smooth scanner motion. When None, levels
+            zone_cell_levels: 4 zones x 8 cells of float 0.0-1.0 brightness for
+                the *static* cell model (washes/spotlights). When None, levels
                 are derived from zone_bitmasks (binary on/off).
+            motion_sources: list of (zone, cell_pos, level) scanner heads from
+                the engine, where cell_pos is a continuous float in [0, 8).
+                Painted as soft profiles at a sub-pixel position and composited
+                over the static base. Zones a motion pattern owns arrive with
+                their cell levels zeroed, so the two models don't double-paint.
 
         Returns:
             Flat bytes of R,G,B,R,G,B,... for all LEDs with brightness applied.
@@ -295,6 +314,58 @@ class LEDMapper:
                             if pos < MAPPED_REGION:
                                 self._set_px(buf, pos, cr, cg, cb)
                             pos += 1
+
+        # ── Sub-pixel scanner motion (VISION Phase 2) ────────────
+        # Paint each scanner "head" as a soft triangular profile centred at a
+        # continuous pixel position, accumulating colour (additively) and
+        # coverage (alpha) into a motion layer, then composite that layer over
+        # the static base by its coverage. Because adjacent heads' triangles
+        # sum to 1, a tiled chase fills without dark seams while a lone scanner
+        # keeps a soft falloff; because heads add within the layer, crossing
+        # scanners mix colour. The float centre means motion glides pixel-by-
+        # pixel with a constant peak/width instead of the old cell-block throb.
+        if motion_sources:
+            mbuf = self._motion
+            malpha = self._motion_alpha
+            for k in range(MAPPED_REGION * 3):
+                mbuf[k] = 0
+            for i in range(MAPPED_REGION):
+                malpha[i] = 0.0
+            half = SCAN_HALFWIDTH
+            inv_half = 1.0 / half
+            for zone, cell_pos, level in motion_sources:
+                if level <= 0.0:
+                    continue
+                cr, cg, cb = zc[zone]
+                center = ((cell_pos + 0.5) * CELL_SIZE) % MAPPED_REGION
+                lo = int(math.ceil(center - half))
+                hi = int(math.floor(center + half))
+                for px in range(lo, hi + 1):
+                    d = px - center
+                    if d < 0.0:
+                        d = -d
+                    w = (1.0 - d * inv_half) * level
+                    if w <= 0.0:
+                        continue
+                    idx = px % MAPPED_REGION
+                    o = idx * 3
+                    v = mbuf[o] + int(cr * w);     mbuf[o]     = v if v < 255 else 255
+                    v = mbuf[o + 1] + int(cg * w); mbuf[o + 1] = v if v < 255 else 255
+                    v = mbuf[o + 2] + int(cb * w); mbuf[o + 2] = v if v < 255 else 255
+                    a = malpha[idx] + w
+                    malpha[idx] = a if a < 1.0 else 1.0
+            for i in range(MAPPED_REGION):
+                a = malpha[i]
+                if a <= 0.0:
+                    continue
+                o = i * 3
+                inv_a = 1.0 - a
+                r = int(buf[o] * inv_a) + mbuf[o]
+                g = int(buf[o + 1] * inv_a) + mbuf[o + 1]
+                b = int(buf[o + 2] * inv_a) + mbuf[o + 2]
+                buf[o]     = r if r < 255 else 255
+                buf[o + 1] = g if g < 255 else 255
+                buf[o + 2] = b if b < 255 else 255
 
         # ── Gradient recolour (beat oscillator) ──────────────────
         # Opt-in: recolour every lit pixel from the gradient by its position,
