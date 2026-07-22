@@ -395,6 +395,12 @@ STATUS_HTML = """\
     <div class="value" id="direction-val">Normal</div>
     <button class="test-btn" id="btn-direction" onclick="toggleDirection()" style="margin-top:0.5rem;font-size:0.75rem">Reverse</button>
   </div>
+  <div class="card" id="blur-card">
+    <div class="label">Blur Amount</div>
+    <div class="value" id="blur-pct">35%</div>
+    <input type="range" id="blur-slider" min="0" max="100" value="35" step="1"
+           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
+  </div>
 </div>
 
 <h3 style="margin-bottom:0.5rem">Zone Bitmasks</h3>
@@ -550,6 +556,31 @@ brightnessSlider.addEventListener('change', () => {
   sendBrightness(parseInt(brightnessSlider.value));
 });
 
+// Blur-amount slider — sends 0.0-1.0 (percent / 100) with the same debounce
+// as brightness. Fog lifts the blur further on top of this at render time.
+const blurSlider = document.getElementById('blur-slider');
+const blurPct = document.getElementById('blur-pct');
+let blurSendTimer = null;
+let blurUserDragging = false;
+
+function sendBlur(pct) {
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ blur_amount: pct / 100 }) });
+}
+
+blurSlider.addEventListener('input', () => {
+  blurUserDragging = true;
+  const pct = parseInt(blurSlider.value);
+  blurPct.textContent = pct + '%';
+  clearTimeout(blurSendTimer);
+  blurSendTimer = setTimeout(() => sendBlur(pct), 80);
+});
+blurSlider.addEventListener('change', () => {
+  blurUserDragging = false;
+  clearTimeout(blurSendTimer);
+  sendBlur(parseInt(blurSlider.value));
+});
+
 // Palette select
 const paletteSelect = document.getElementById('palette-select');
 let palettesPopulated = false;
@@ -625,6 +656,14 @@ function updateSettings(s) {
       brightnessSlider.value = s.brightness;
     }
     showBrightness(s.brightness);
+  }
+  // Sync blur slider from server value (skip while the user is dragging).
+  if (typeof s.blur_amount === 'number' && !blurUserDragging) {
+    const pct = Math.round(s.blur_amount * 100);
+    if (parseInt(blurSlider.value) !== pct) {
+      blurSlider.value = pct;
+    }
+    blurPct.textContent = pct + '%';
   }
   // Populate palette dropdown once
   if (!palettesPopulated && s.palettes) {
@@ -1063,6 +1102,14 @@ class StatusServer:
             self.settings.direction = str(body["direction"])
             if self.settings.direction != old_dir:
                 changed.append(f"direction={self.settings.direction}")
+        if "blur_amount" in body:
+            try:
+                old_blur = self.settings.blur_amount
+                self.settings.blur_amount = float(body["blur_amount"])
+                if self.settings.blur_amount != old_blur:
+                    changed.append(f"blur_amount={self.settings.blur_amount:.2f}")
+            except (ValueError, TypeError):
+                return 400, "Invalid blur_amount value"
         if "effects" in body:
             updates = body["effects"]
             if not isinstance(updates, dict):

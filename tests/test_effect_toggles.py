@@ -28,16 +28,20 @@ def _settings():
 
 # ── Registry / defaults ──────────────────────────────────────────
 
-def test_all_toggles_default_on():
+def test_toggles_default_to_their_registry_default():
+    # Each toggle defaults on unless its row opts out with default:False
+    # (mirror — an opt-in symmetric look the suppress-only gate reads as "off").
     s = _settings()
-    assert s.effects == {tid: True for tid in EFFECT_TOGGLES}
-    assert all(s.effect_enabled(tid) for tid in EFFECT_TOGGLES)
+    assert s.effects == {tid: meta.get("default", True)
+                         for tid, meta in EFFECT_TOGGLES.items()}
+    assert s.effect_enabled("blur") is True
+    assert s.effect_enabled("mirror") is False
 
 
 def test_registry_covers_the_reactive_layers():
     assert set(EFFECT_TOGGLES) == {
         "note_accents", "vocal_ribbon", "performer_bias", "post_processing",
-        "camera_cut"}
+        "camera_cut", "blur", "mirror"}
     # Every entry carries the UI + gating metadata the framework relies on.
     for meta in EFFECT_TOGGLES.values():
         assert {"label", "description", "key", "off"} <= set(meta)
@@ -47,6 +51,9 @@ def test_registry_covers_the_reactive_layers():
 
 def test_enabled_effects_pass_through_untouched():
     s = _settings()
+    # Enable every toggle (mirror defaults off) so only pass-through is tested.
+    for tid in EFFECT_TOGGLES:
+        s.set_effect(tid, True)
     fx = {"note_accents": [0.5, 0.0, 0.0, 0.0], "vocal_notes": [60.0, 0, 0, 0],
           "performers": 8, "post_processing": 5, "bpm": 120.0}
     before = dict(fx)
@@ -82,7 +89,8 @@ def test_unknown_effect_id_rejected():
     s = _settings()
     assert s.set_effect("does_not_exist", False) is False
     # A stray key in the effects dict is ignored by apply (no crash).
-    assert s.effects == {tid: True for tid in EFFECT_TOGGLES}
+    assert s.effects == {tid: meta.get("default", True)
+                         for tid, meta in EFFECT_TOGGLES.items()}
 
 
 # ── Persistence + snapshot ───────────────────────────────────────

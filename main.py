@@ -111,6 +111,10 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # colour-tint grades as a global palette modifier.
         self.engine.on_post_processing(pkt.post_processing)
 
+        # Fog/haze (Phase 6) — lifts the post-process blur toward a soft
+        # blur-glow floor while the venue haze is up.
+        self.engine.on_fog(pkt.fog_state)
+
         # Bonus FX flag — one-frame celebration burst on the strip.
         if pkt.bonus_effect:
             self.engine.on_bonus()
@@ -410,6 +414,10 @@ class RenderThread(threading.Thread):
             # Advance time-based patterns (zone bitmasks computed from
             # wall-clock time — immune to asyncio event-loop congestion)
             self._engine.tick(time.monotonic())
+
+            # Operator blur strength (dashboard slider) — fog stacks on top of
+            # this in the engine. Synced each frame so a drag lands live.
+            self._engine.set_blur_base(self._settings.blur_amount)
 
             # Get effects (consumes and clears transient flags)
             effects = self._engine.get_effects()
