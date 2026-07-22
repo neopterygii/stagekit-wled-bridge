@@ -160,6 +160,11 @@ host-side, tastefully, and composited on top of the existing cue look:
   two-cell slice (guitar|bass|drums|keys, left→right) as a convex whitening
   layer folded in with the sparkle/flash/bonus accents — so *where* the accent
   lands tells you *which* instrument played, and stacked hits never clip.
+  *Hardened after the first cut:* the accent is **lit-pixels only** (like
+  sparkle) so a busy part can't grey out a deliberate blackout, and a
+  **~7 Hz anti-strobe cap** (`NOTE_REFRESH_MIN`) turns a fast run into a
+  sustained glow instead of a flash-per-hit strobe — the flicker call-out from
+  the Phase 4 review.
 - **Vocal pitch ribbon** (`on_vocals`, vocals 18–33). Each sounding voice is a
   soft blob whose position tracks absolute MIDI pitch and whose hue is the pitch
   *class* from a cyclic chroma ramp (same note → same colour; an octave apart →

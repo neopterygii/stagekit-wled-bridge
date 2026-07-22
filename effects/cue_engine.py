@@ -50,7 +50,15 @@ BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
 # hit living in a single ~88 Hz packet still reads on the strip, then decays.
 # 1/32 note = 1/8 of a beat; the floor keeps it visible at very fast tempo.
 NOTE_HOLD_BEATS = 0.125      # 1/32 note = 1/8 beat
-NOTE_HOLD_FLOOR = 0.045      # seconds — minimum hold regardless of BPM
+NOTE_HOLD_FLOOR = 0.045      # seconds — minimum decay-tail length regardless of BPM
+
+# Anti-strobe cap. An isolated hit gets a crisp short accent; but a fast run
+# (hits closer together than this) would restart that flash on every hit and
+# read as a strobe. When a rising edge lands within NOTE_REFRESH_MIN of the
+# previous one, we instead *sustain* the lane as a steady glow — hold it lit
+# past the next expected hit and freeze the level — so the accent can't flash
+# faster than ~1/NOTE_REFRESH_MIN (≈7 Hz), well under the photosensitive band.
+NOTE_REFRESH_MIN = 0.14      # seconds — ~7 Hz max re-flash cadence
 
 # Beat-lock phase-locked loop (drives BPM-synced chase motion onto the beat).
 # The pattern free-runs on tempo, then each frame is pulled a fraction
@@ -225,6 +233,10 @@ class CueEngine:
         self._note_until = [0.0, 0.0, 0.0, 0.0]
         self._note_dur = [0.0, 0.0, 0.0, 0.0]
         self._note_level = [0.0, 0.0, 0.0, 0.0]
+        # Time of the last rising edge per instrument, for the anti-strobe cap
+        # (see NOTE_REFRESH_MIN). Seeded far in the past so the first hit always
+        # reads as isolated (a fresh flash), even at t≈0 in tests.
+        self._note_last_hit = [-1.0e9, -1.0e9, -1.0e9, -1.0e9]
 
         # Vocal/harmony pitch (Phase 4). MIDI pitch per voice (lead + 3
         # harmonies), 0.0 = no note sounding. Passed straight to the mapper,
@@ -599,12 +611,20 @@ class CueEngine:
         """Rising-edge note-hold accents (Phase 4).
 
         Each instrument's note bitmask is the set of currently-lit frets/pads.
-        A bit going 0→1 is a fresh hit; it (re)seeds that instrument's accent,
-        held for at least a 1/32 note (NOTE_HOLD_BEATS, floored at
-        NOTE_HOLD_FLOOR) so a hit that lives in one ~88 Hz packet still reads on
-        the strip, then decays. Simultaneous new bits (a chord/roll) seed a
-        slightly stronger accent. Held bits (no rising edge) don't re-trigger.
-        *now* is injectable for tests; production passes None.
+        A bit going 0→1 is a fresh hit. Two regimes keep it musical *and* safe:
+
+        - **Isolated hit** (≥ NOTE_REFRESH_MIN since the last one): a fresh,
+          crisp accent that decays over a 1/32 note (NOTE_HOLD_BEATS, floored at
+          NOTE_HOLD_FLOOR) — so a hit living in one ~88 Hz packet still reads.
+          Simultaneous new bits (a chord) seed a slightly stronger accent.
+        - **Rapid passage** (a hit within NOTE_REFRESH_MIN of the previous):
+          instead of restarting the flash on every hit — which would strobe —
+          sustain the lane as a steady glow, holding it lit past the next hit
+          and freezing the level. The accent then can't flash faster than
+          ~1/NOTE_REFRESH_MIN. See NOTE_REFRESH_MIN.
+
+        Held bits (no rising edge) don't re-trigger. *now* is injectable for
+        tests; production passes None.
         """
         if now is None:
             now = time.monotonic()
@@ -612,15 +632,27 @@ class CueEngine:
         dur = interval * NOTE_HOLD_BEATS
         if dur < NOTE_HOLD_FLOOR:
             dur = NOTE_HOLD_FLOOR
+        # Sustain window bridges the gaps between rapid hits so the glow never
+        # dips dark; always ≥ the decay tail so a slow-tempo tail isn't clipped.
+        sustain = dur if dur > NOTE_REFRESH_MIN else NOTE_REFRESH_MIN
         masks = (guitar, bass, drums, keys)
         for i in range(4):
             m = masks[i]
             new_bits = m & ~self._note_prev[i]
             self._note_prev[i] = m
-            if new_bits:
+            if not new_bits:
+                continue
+            gap = now - self._note_last_hit[i]
+            self._note_last_hit[i] = now
+            if gap >= NOTE_REFRESH_MIN:
+                # Isolated hit (or the first of a run): a fresh, crisp accent.
                 self._note_until[i] = now + dur
                 self._note_dur[i] = dur
                 self._note_level[i] = min(1.0, 0.55 + 0.15 * new_bits.bit_count())
+            else:
+                # Rapid passage: sustain the lane without restarting the flash,
+                # so it glows steadily rather than strobing at the hit rate.
+                self._note_until[i] = now + sustain
 
     def on_vocals(self, vocal: float, harmony0: float, harmony1: float,
                   harmony2: float):

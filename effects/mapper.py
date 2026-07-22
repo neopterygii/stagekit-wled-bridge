@@ -692,20 +692,28 @@ class LEDMapper:
         # four regions tile the whole mapped strip, so every pixel's coverage is
         # (re)written each frame — 0 where that instrument is silent. Convex MIX
         # (below) screen-combines it with the other accents instead of clipping.
+        #
+        # Lit-pixels only: coverage is applied where the scene is already lit,
+        # never on dark pixels — so a busy part can't grey out a deliberate
+        # blackout (matches sparkle; the other Phase-4 grades are lit-only too).
         if note_accents is not None:
             nalpha = self._note_layer.alpha
             region = NOTE_CELLS_PER_INSTRUMENT * CELL_SIZE
             any_on = False
             for inst in range(4):
                 a = NOTE_ACCENT_MAX * note_accents[inst]
-                if a > 0.0:
-                    any_on = True
                 start = inst * region
                 end = start + region
                 if end > MAPPED_REGION:
                     end = MAPPED_REGION
-                for i in range(start, end):
-                    nalpha[i] = a
+                if a > 0.0:
+                    any_on = True
+                    for i in range(start, end):
+                        o = i * 3
+                        nalpha[i] = a if (buf[o] | buf[o + 1] | buf[o + 2]) else 0.0
+                else:
+                    for i in range(start, end):
+                        nalpha[i] = 0.0
             self._note_layer.active = any_on
 
         # ── Composite accent overlays (VISION Phase 3) ───────────

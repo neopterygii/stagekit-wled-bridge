@@ -15,7 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from effects.cue_engine import CueEngine, NOTE_HOLD_FLOOR, NOTE_HOLD_BEATS  # noqa: E402
+from effects.cue_engine import (  # noqa: E402
+    CueEngine, NOTE_HOLD_FLOOR, NOTE_HOLD_BEATS, NOTE_REFRESH_MIN,
+)
 from effects.mapper import (  # noqa: E402
     LEDMapper, MAPPED_REGION, CELL_SIZE, NOTE_CELLS_PER_INSTRUMENT,
 )
@@ -50,14 +52,31 @@ def test_held_bit_does_not_retrigger():
     assert abs(eng._note_until[0] - dur) < 1e-9
 
 
-def test_new_bit_while_others_held_retriggers():
+def test_rapid_new_bit_sustains_not_reflashes():
     eng = CueEngine()
     eng.bpm = 120.0
-    eng.on_notes(0b0001, 0, 0, 0, now=0.0)
-    dur = eng._note_dur[0]
-    # bit 1 rises later while bit 0 is still held → reseed at the new time.
-    eng.on_notes(0b0011, 0, 0, 0, now=dur * 0.5)
-    assert abs(eng._note_until[0] - (dur * 0.5 + dur)) < 1e-9
+    eng.on_notes(0b0001, 0, 0, 0, now=0.0)         # isolated flash
+    # A new bit within NOTE_REFRESH_MIN → sustain (extend the hold past the
+    # short isolated decay), rather than restarting a fresh short accent.
+    t = NOTE_REFRESH_MIN * 0.5
+    eng.on_notes(0b0011, 0, 0, 0, now=t)
+    assert eng._note_until[0] >= t + NOTE_REFRESH_MIN - 1e-9
+
+
+def test_rapid_hits_never_dip_dark():
+    # Anti-strobe guarantee: once a run is established, each rapid hit holds the
+    # lane lit past the next hit, so it never strobes to black mid-run.
+    eng = CueEngine()
+    eng.bpm = 174.0
+    step = (60.0 / 174.0) / 4.0                     # ~86 ms 16th notes
+    t = 0.0
+    eng.on_notes(0b0001, 0, 0, 0, now=t)           # first (isolated) strike
+    for _ in range(10):
+        eng.on_notes(0, 0, 0, 0, now=t + step * 0.5)   # release (no rising edge)
+        t += step
+        eng.on_notes(0b0001, 0, 0, 0, now=t)           # rapid re-strike
+        # Hold reaches past the *next* strike → no dark gap between hits.
+        assert eng._note_until[0] >= t + step - 1e-9
 
 
 # ── Hold / decay envelope ────────────────────────────────────────
@@ -107,33 +126,47 @@ def test_chord_seeds_stronger_than_single():
 
 # ── Spatial placement in the mapper ──────────────────────────────
 
-def _render_with_notes(note_accents):
+def _render(note_accents, zones):
     m = LEDMapper(MAPPED_REGION)   # led_count == mapped region (no mirror tail)
     colors = {"red": (255, 0, 0), "green": (0, 255, 0),
               "blue": (0, 0, 255), "yellow": (255, 255, 0)}
-    # Dark scene so only the note accents light up.
-    return m.render([0, 0, 0, 0], zone_colors=colors,
+    return m.render(list(zones), zone_colors=colors,
                     effects={"note_accents": note_accents}, brightness=1.0)
 
 
-def test_instrument_lights_only_its_region():
+def _whiteness(px):
+    # Min channel — rises from 0 as a pixel whitens (0 for a pure primary).
+    n = len(px) // 3
+    return [min(px[i * 3], px[i * 3 + 1], px[i * 3 + 2]) for i in range(n)]
+
+
+_RED_WASH = (0xFF, 0, 0, 0)   # solid red across the whole strip → every pixel lit
+
+
+def test_instrument_whitens_only_its_region():
     region = NOTE_CELLS_PER_INSTRUMENT * CELL_SIZE
-    # Only drums (index 2) hit.
-    px = _render_with_notes([0.0, 0.0, 1.0, 0.0])
-    lum = _lum(px)
+    base = _render([0.0, 0.0, 0.0, 0.0], _RED_WASH)     # lit, no accents
+    px = _render([0.0, 0.0, 1.0, 0.0], _RED_WASH)       # drums only
+    w0, w1 = _whiteness(base), _whiteness(px)
     drum_lo, drum_hi = 2 * region, 3 * region
-    assert max(lum[drum_lo:drum_hi]) > 0            # drums region lit
-    # Every other region stays dark.
-    assert max(lum[:drum_lo]) == 0
-    assert max(lum[drum_hi:MAPPED_REGION]) == 0
+    # Drums region whitened (min channel lifted); every other region unchanged.
+    assert min(w1[drum_lo:drum_hi]) > max(w0[drum_lo:drum_hi])
+    assert w1[:drum_lo] == w0[:drum_lo]
+    assert w1[drum_hi:MAPPED_REGION] == w0[drum_hi:MAPPED_REGION]
 
 
-def test_no_accents_leaves_strip_dark():
-    px = _render_with_notes([0.0, 0.0, 0.0, 0.0])
+def test_accent_never_lights_a_blackout():
+    # The lit-only invariant: a hit over a dark strip stays fully dark, so a
+    # busy part can't grey out a deliberate blackout cue.
+    px = _render([1.0, 1.0, 1.0, 1.0], (0, 0, 0, 0))
     assert max(_lum(px)) == 0
 
 
+def test_no_accents_leaves_lit_scene_unchanged():
+    assert _render([0.0, 0.0, 0.0, 0.0], _RED_WASH) == _render(None, _RED_WASH)
+
+
 def test_stacked_accents_stay_bounded():
-    # All four instruments at full — whitening must never exceed 255.
-    px = _render_with_notes([1.0, 1.0, 1.0, 1.0])
+    # All four instruments at full over a lit scene — whitening must not clip.
+    px = _render([1.0, 1.0, 1.0, 1.0], _RED_WASH)
     assert max(_lum(px)) <= 255
