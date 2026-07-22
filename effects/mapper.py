@@ -57,6 +57,11 @@ CELL_SIZE = LED_COUNT // NUM_CELLS  # LEDs per cell (scales with strip length)
 
 MAPPED_REGION = NUM_CELLS * CELL_SIZE
 
+# Live-preview downsample resolution (VISION Phase 7). The composed frame and
+# each compositor layer are averaged down to this many cells for the operator
+# dashboard's strip/per-layer view. Capped at the strip length for short strips.
+PREVIEW_CELLS = min(60, MAPPED_REGION)
+
 # Number of pixels on each side of a color boundary to blend over (scales with cell size)
 BLEND_WIDTH = max(1, CELL_SIZE // 6)
 
@@ -276,6 +281,30 @@ class LEDMapper:
         # Timing for breathing
         self._start_time = time.monotonic()
 
+        # ── Live per-layer preview (VISION Phase 7) ──────────────
+        # When render() is called with preview=True, each compositor layer's
+        # effective contribution is averaged down to PREVIEW_CELLS and exposed
+        # via layer_preview() for the operator dashboard. All buffers here are
+        # pre-allocated; nothing is touched unless preview capture is requested,
+        # so an unwatched dashboard costs the render loop nothing.
+        cells = PREVIEW_CELLS
+        self._preview_cells = cells
+        self._wash_snap = bytearray(MAPPED_REGION * 3)   # wash before overlays
+        self._eff = bytearray(MAPPED_REGION * 3)         # scratch: effective RGB
+        # Ordered: wash (base), motion, then the accent stack, then vocal — the
+        # order the compositor folds them in. Each entry is (name, kind, layer).
+        self._preview_specs = (
+            ("wash",    "wash",    None),
+            ("motion",  "premult", self._motion_layer),
+            ("sparkle", "cov",     self._sparkle_layer),
+            ("flash",   "scalar",  self._flash_layer),
+            ("bonus",   "scalar",  self._bonus_layer),
+            ("note",    "cov",     self._note_layer),
+            ("vocal",   "premult", self._vocal_layer),
+        )
+        self._preview_rgb = {name: [0] * (cells * 3) for name, _, _ in self._preview_specs}
+        self._preview_on = {name: False for name, _, _ in self._preview_specs}
+
     @staticmethod
     def _set_px(buf: bytearray, i: int, r: int, g: int, b: int):
         o = i * 3
@@ -354,11 +383,91 @@ class LEDMapper:
         for k in range(n3):
             buf[k] = int(buf[k] * inv + src[k] * wet)
 
+    @staticmethod
+    def _downsample(src, n_src: int, cells: int, out: list) -> None:
+        """Average src (flat RGB, n_src pixels) into out (cells*3 ints), in place."""
+        for c in range(cells):
+            lo = c * n_src // cells
+            hi = (c + 1) * n_src // cells
+            if hi <= lo:
+                hi = lo + 1
+            sr = sg = sb = 0
+            for i in range(lo, hi):
+                o = i * 3
+                sr += src[o]
+                sg += src[o + 1]
+                sb += src[o + 2]
+            cnt = hi - lo
+            co = c * 3
+            out[co] = sr // cnt
+            out[co + 1] = sg // cnt
+            out[co + 2] = sb // cnt
+
+    @staticmethod
+    def downsample_rgb(src, n_src: int, cells: int) -> list:
+        """Average src down to a fresh cells*3 int list (for the composed strip)."""
+        out = [0] * (cells * 3)
+        LEDMapper._downsample(src, n_src, cells, out)
+        return out
+
+    def _capture_layer_preview(self) -> None:
+        """Fill the per-layer preview buffers with each layer's effective
+        contribution this frame (see PREVIEW_CELLS). Called only when render()
+        was asked for a preview."""
+        n = MAPPED_REGION
+        eff = self._eff
+        cells = self._preview_cells
+        for name, kind, layer in self._preview_specs:
+            if kind == "wash":
+                # The bare wash snapshot is already effective RGB.
+                self._preview_on[name] = True
+                self._downsample(self._wash_snap, n, cells, self._preview_rgb[name])
+                continue
+            if not layer.active:
+                self._preview_on[name] = False
+                continue
+            self._preview_on[name] = True
+            if kind == "premult":
+                # Motion/vocal buffers hold premultiplied colour = effective RGB.
+                self._downsample(layer.buf, n, cells, self._preview_rgb[name])
+            elif kind == "cov":
+                # White source modulated by per-pixel coverage * opacity → grey.
+                alpha = layer.alpha
+                op = layer.opacity
+                for i in range(n):
+                    v = int(255 * alpha[i] * op)
+                    v = v if v < 255 else 255
+                    o = i * 3
+                    eff[o] = eff[o + 1] = eff[o + 2] = v
+                self._downsample(eff, n, cells, self._preview_rgb[name])
+            else:  # scalar white (flash/bonus): uniform 255*opacity
+                v = min(255, max(0, int(255 * layer.opacity)))
+                out = self._preview_rgb[name]
+                for k in range(cells * 3):
+                    out[k] = v
+
+    def layer_preview(self) -> dict:
+        """Serializable per-layer preview from the most recent preview capture.
+
+        Only active layers carry pixel data; inactive layers report active=False
+        with an empty list so the dashboard can dim their row cheaply.
+        """
+        layers = []
+        for name, _, _ in self._preview_specs:
+            on = self._preview_on[name]
+            layers.append({
+                "name": name,
+                "active": on,
+                "rgb": self._preview_rgb[name] if on else [],
+            })
+        return {"cells": self._preview_cells, "layers": layers}
+
     def render(self, zone_bitmasks: list[int], zone_colors: dict | None = None,
                effects: dict | None = None, brightness: float = 1.0,
                reverse: bool = False,
                zone_cell_levels: list[list[float]] | None = None,
-               motion_sources: list | None = None) -> bytes:
+               motion_sources: list | None = None,
+               preview: bool = False) -> bytes:
         """Render pixels from 4 zone bitmasks with optional effects.
 
         Args:
@@ -602,6 +711,10 @@ class LEDMapper:
             motion_layer.active = True
         else:
             motion_layer.active = False
+        # Snapshot the bare wash before any overlays fold in, so the preview can
+        # show the base cue wash on its own row (one memcpy, only when watched).
+        if preview:
+            self._wash_snap[:] = buf
         # Alpha-over the motion layer onto the static base (premultiplied).
         Compositor.composite(buf, (motion_layer,))
 
@@ -1127,5 +1240,10 @@ class LEDMapper:
         mirror_bytes = (self.led_count - MAPPED_REGION) * 3
         if mirror_bytes > 0:
             out[mapped_bytes:mapped_bytes + mirror_bytes] = out[:mirror_bytes]
+
+        # Capture the per-layer dashboard preview from this frame's layer
+        # buffers (still holding their values — they clear on the next render).
+        if preview:
+            self._capture_layer_preview()
 
         return bytes(out)

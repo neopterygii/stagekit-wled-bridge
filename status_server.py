@@ -65,6 +65,8 @@ class StatusTracker:
         self.bpm = 0.0
         self.strobe_rate = 0
         self.zones = [0, 0, 0, 0]
+        self.beat_phase = 0.0    # continuous 0→1 phase within the current beat
+        self.bar_beat = 0        # beat index within the current bar (downbeat=0)
         self.packets_received = 0
         self.packets_per_sec = 0.0
         self.ddp_frames_sent = 0
@@ -90,6 +92,16 @@ class StatusTracker:
         self._sse_queues: list[asyncio.Queue] = []
 
     @property
+    def has_subscribers(self) -> bool:
+        """True when at least one dashboard SSE stream is open.
+
+        Read from the render thread to gate live-preview capture — an unwatched
+        dashboard costs the render loop nothing. Reading len() of the queue list
+        from another thread is GIL-safe.
+        """
+        return len(self._sse_queues) > 0
+
+    @property
     def connected(self) -> bool:
         """True if we've heard a YARG packet recently."""
         if self._last_packet_time == 0.0:
@@ -110,10 +122,15 @@ class StatusTracker:
         self.current_cue = cue_byte
         self.current_cue_name = _CUE_NAMES.get(cue_byte, f"UNKNOWN({cue_byte})")
 
-    def on_render(self, zones: list[int], strobe_rate: float, bpm: float, ddp_sent: bool = False):
+    def on_render(self, zones: list[int], strobe_rate: float, bpm: float, ddp_sent: bool = False,
+                  beat_phase: float | None = None, bar_beat: int | None = None):
         self.zones = list(zones)
         self.strobe_rate = strobe_rate
         self.bpm = bpm
+        if beat_phase is not None:
+            self.beat_phase = beat_phase
+        if bar_beat is not None:
+            self.bar_beat = bar_beat
         if ddp_sent:
             self.ddp_frames_sent += 1
 
@@ -166,6 +183,8 @@ class StatusTracker:
             "packets_per_sec": round(pps, 1),
             "ddp_frames_sent": self.ddp_frames_sent,
             "last_beat": self.last_beat,
+            "beat_phase": round(self.beat_phase, 3),
+            "bar_beat": self.bar_beat,
             "connected": self.connected,
             "test_active": self.test_active,
             "test_pattern": self.test_pattern,
@@ -186,6 +205,9 @@ class StatusTracker:
             d["settings"] = settings.snapshot()
         if self.render_thread:
             d["render"] = self.render_thread.render_stats()
+            preview = self.render_thread.preview_snapshot()
+            if preview:
+                d["preview"] = preview
         return d
 
     def subscribe(self) -> asyncio.Queue:
@@ -248,6 +270,23 @@ STATUS_HTML = """\
   .zone-label { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; margin-bottom: 4px;
                display: flex; align-items: center; gap: 6px; }
   .zone-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+
+  /* Live strip + per-layer preview (Phase 7) */
+  .strip-canvas { width: 100%; height: 34px; border-radius: 6px; border: 1px solid var(--border);
+                  image-rendering: pixelated; image-rendering: crisp-edges; display: block; }
+  .layer-rows { display: flex; flex-direction: column; gap: 4px; margin-top: 0.75rem; }
+  .layer-row { display: flex; align-items: center; gap: 0.6rem; transition: opacity 0.2s; }
+  .layer-row.idle { opacity: 0.32; }
+  .layer-row .layer-name { width: 70px; flex-shrink: 0; font-size: 0.72rem; color: var(--dim);
+                           text-transform: uppercase; letter-spacing: 0.04em; }
+  .layer-row .layer-canvas { flex: 1; height: 14px; border-radius: 4px; border: 1px solid var(--border);
+                             image-rendering: pixelated; image-rendering: crisp-edges; display: block;
+                             background: var(--bg); }
+
+  /* Beat indicator */
+  .beat-dot { display: inline-block; width: 14px; height: 14px; border-radius: 50%;
+              background: var(--yellow); box-shadow: 0 0 8px var(--yellow);
+              transition: opacity 0.05s linear, transform 0.05s linear; vertical-align: middle; }
 
   .log { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
          padding: 0.75rem; max-height: 300px; overflow-y: auto; font-family: 'SF Mono', Monaco,
@@ -331,6 +370,11 @@ STATUS_HTML = """\
     <div class="label">BPM</div>
     <div class="value" id="bpm">&mdash;</div>
   </div>
+  <div class="card" id="beat-card">
+    <div class="label">Beat</div>
+    <div class="value"><span class="beat-dot" id="beat-dot"></span> <span id="beat-num">&mdash;</span></div>
+    <div style="font-size:0.7rem;color:var(--dim);margin-top:0.35rem">beat in bar</div>
+  </div>
   <div class="card">
     <div class="label">Strobe</div>
     <div class="value" id="strobe">Off</div>
@@ -403,7 +447,11 @@ STATUS_HTML = """\
   </div>
 </div>
 
-<h3 style="margin-bottom:0.5rem">Zone Bitmasks</h3>
+<h3 style="margin-bottom:0.5rem">Live Strip</h3>
+<canvas id="strip-canvas" class="strip-canvas" width="60" height="1"></canvas>
+<div class="layer-rows" id="layer-rows"></div>
+
+<h3 style="margin:1rem 0 0.5rem">Zone Bitmasks</h3>
 <div id="zones"></div>
 
 <h3 style="margin:1rem 0 0.5rem">Effect Layers</h3>
@@ -847,6 +895,69 @@ bpmSlider.addEventListener('input', () => {
   sendTest('bpm', { bpm: parseInt(bpmSlider.value) });
 });
 
+// ── Live strip + per-layer preview ──────────────────────────────
+const LAYER_LABELS = { wash: 'Wash', motion: 'Motion', sparkle: 'Sparkle',
+  flash: 'Flash', bonus: 'Bonus', note: 'Notes', vocal: 'Vocals' };
+let layerRowsBuilt = false;
+
+function drawStripCanvas(canvas, cells, rgb) {
+  if (!canvas) return;
+  if (canvas.width !== cells) canvas.width = cells;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(cells, 1);
+  for (let i = 0; i < cells; i++) {
+    const o = i * 3, p = i * 4;
+    img.data[p]     = rgb && rgb.length ? (rgb[o] || 0) : 0;
+    img.data[p + 1] = rgb && rgb.length ? (rgb[o + 1] || 0) : 0;
+    img.data[p + 2] = rgb && rgb.length ? (rgb[o + 2] || 0) : 0;
+    img.data[p + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function buildLayerRows(layers, cells) {
+  const container = document.getElementById('layer-rows');
+  container.innerHTML = '';
+  for (const L of layers) {
+    const row = document.createElement('div');
+    row.className = 'layer-row';
+    row.id = 'layer-row-' + L.name;
+    const label = LAYER_LABELS[L.name] || L.name;
+    row.innerHTML = '<span class="layer-name">' + label + '</span>' +
+      '<canvas class="layer-canvas" id="layer-canvas-' + L.name + '" width="' + cells + '" height="1"></canvas>';
+    container.appendChild(row);
+  }
+  layerRowsBuilt = true;
+}
+
+function updatePreview(p) {
+  if (!p) return;
+  const cells = p.cells;
+  drawStripCanvas(document.getElementById('strip-canvas'), cells, p.strip);
+  if (!layerRowsBuilt && p.layers) buildLayerRows(p.layers, cells);
+  if (p.layers) {
+    for (const L of p.layers) {
+      const row = document.getElementById('layer-row-' + L.name);
+      if (row) row.classList.toggle('idle', !L.active);
+      drawStripCanvas(document.getElementById('layer-canvas-' + L.name), cells,
+                      L.active ? L.rgb : null);
+    }
+  }
+}
+
+function updateBeat(d) {
+  const dot = document.getElementById('beat-dot');
+  const num = document.getElementById('beat-num');
+  // beat_phase ramps 0→1 within each beat; (1-phase) gives a decaying pulse
+  // that flashes on each beat and fades toward the next.
+  const bp = typeof d.beat_phase === 'number' ? d.beat_phase : 1;
+  const pulse = 1 - bp;
+  const live = (d.connected || d.test_active) && d.bpm > 0;
+  dot.style.opacity = live ? (0.25 + 0.75 * pulse).toFixed(2) : '0.2';
+  dot.style.transform = 'scale(' + (live ? (0.75 + 0.45 * pulse) : 0.75).toFixed(2) + ')';
+  num.textContent = live ? ((d.bar_beat || 0) + 1) : '\\u2014';
+}
+
 function update(d) {
   const dot = document.getElementById('dot');
   const conn = document.getElementById('conn');
@@ -931,6 +1042,10 @@ function update(d) {
 
   // Update render performance stats
   if (d.render) updateRender(d.render);
+
+  // Update live strip / per-layer preview + beat indicator
+  updatePreview(d.preview);
+  updateBeat(d);
 
   // Update settings (brightness, palette)
   updateSettings(d.settings);
