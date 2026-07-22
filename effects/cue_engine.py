@@ -45,6 +45,13 @@ STROBE_RATES = {
 REVEAL_DURATION = 1.5        # Intro center-out reveal
 BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
 
+# Note-hold (VISION Phase 4). A YARG note bitmask edge (a fret/pad hit, offsets
+# 14-17) seeds a per-instrument accent that holds for at least a 1/32 note so a
+# hit living in a single ~88 Hz packet still reads on the strip, then decays.
+# 1/32 note = 1/8 of a beat; the floor keeps it visible at very fast tempo.
+NOTE_HOLD_BEATS = 0.125      # 1/32 note = 1/8 beat
+NOTE_HOLD_FLOOR = 0.045      # seconds — minimum hold regardless of BPM
+
 # Beat-lock phase-locked loop (drives BPM-synced chase motion onto the beat).
 # The pattern free-runs on tempo, then each frame is pulled a fraction
 # min(1, dt/PLL_TAU) of the way toward the beat-locked target — a smooth
@@ -209,7 +216,15 @@ class CueEngine:
         self._keyframe_event = asyncio.Event()
         self._last_beat_type = BeatByte.OFF
         self._last_keyframe_type = KeyframeByte.OFF
-        self._last_drum_notes = 0
+
+        # Note-hold accents (Phase 4). Rising-edge per-instrument hits, order
+        # [guitar, bass, drums, keys]. _note_prev holds the last bitmask for
+        # edge detection; _note_until/_note_dur/_note_level drive the decaying
+        # accent the mapper paints in each instrument's slice of the strip.
+        self._note_prev = [0, 0, 0, 0]
+        self._note_until = [0.0, 0.0, 0.0, 0.0]
+        self._note_dur = [0.0, 0.0, 0.0, 0.0]
+        self._note_level = [0.0, 0.0, 0.0, 0.0]
 
         # Beat oscillator: a continuous musical phase synthesized from BPM +
         # beat edges, so motion/colour can be driven off a smooth phase that is
@@ -303,6 +318,7 @@ class CueEngine:
         fx["bar_phase"] = self.bar_phase(now)
         fx["bar_beat"] = self._bar_beat
         fx["beat_clock"] = self.beat_clock(now)
+        fx["note_accents"] = self._note_accents(now)
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -560,8 +576,47 @@ class CueEngine:
         if keyframe_type != KeyframeByte.OFF:
             self._keyframe_event.set()
 
-    def on_drum(self, drum_notes: int):
-        self._last_drum_notes = drum_notes
+    def on_notes(self, guitar: int, bass: int, drums: int, keys: int,
+                 now: float | None = None):
+        """Rising-edge note-hold accents (Phase 4).
+
+        Each instrument's note bitmask is the set of currently-lit frets/pads.
+        A bit going 0→1 is a fresh hit; it (re)seeds that instrument's accent,
+        held for at least a 1/32 note (NOTE_HOLD_BEATS, floored at
+        NOTE_HOLD_FLOOR) so a hit that lives in one ~88 Hz packet still reads on
+        the strip, then decays. Simultaneous new bits (a chord/roll) seed a
+        slightly stronger accent. Held bits (no rising edge) don't re-trigger.
+        *now* is injectable for tests; production passes None.
+        """
+        if now is None:
+            now = time.monotonic()
+        interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+        dur = interval * NOTE_HOLD_BEATS
+        if dur < NOTE_HOLD_FLOOR:
+            dur = NOTE_HOLD_FLOOR
+        masks = (guitar, bass, drums, keys)
+        for i in range(4):
+            m = masks[i]
+            new_bits = m & ~self._note_prev[i]
+            self._note_prev[i] = m
+            if new_bits:
+                self._note_until[i] = now + dur
+                self._note_dur[i] = dur
+                self._note_level[i] = min(1.0, 0.55 + 0.15 * new_bits.bit_count())
+
+    def _note_accents(self, now: float) -> list[float]:
+        """Current decayed note-hold level per instrument (0.0 = none)."""
+        out = [0.0, 0.0, 0.0, 0.0]
+        for i in range(4):
+            dur = self._note_dur[i]
+            if dur <= 0.0:
+                continue
+            rem = self._note_until[i] - now
+            if rem <= 0.0:
+                continue
+            frac = rem / dur
+            out[i] = self._note_level[i] * (frac if frac < 1.0 else 1.0)
+        return out
 
     def on_strobe(self, strobe_byte: int):
         """Called when strobe state changes."""

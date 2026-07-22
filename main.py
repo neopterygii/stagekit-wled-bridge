@@ -92,8 +92,11 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # Keyframe events
         self.engine.on_keyframe(pkt.keyframe)
 
-        # Drum notes (for cues that listen for drums)
-        self.engine.on_drum(pkt.drum_notes)
+        # Note-hold accents (Phase 4) — rising-edge per-instrument hits
+        # (guitar/bass/drums/keys) light a brief accent in each instrument's
+        # slice of the strip.
+        self.engine.on_notes(pkt.guitar_notes, pkt.bass_notes,
+                             pkt.drum_notes, pkt.keys_notes)
 
         # Bonus FX flag — one-frame celebration burst on the strip.
         if pkt.bonus_effect:

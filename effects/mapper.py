@@ -11,9 +11,9 @@ Render pipeline (VISION Phase 3 — layer/slot compositor, see compositor.py):
   2. Motion      — sub-pixel scanner heads, alpha-over the wash (a layer)
   3. Scene shape — gradient recolour, decay trails, gradient-boundary blend,
                    sine breathing, glitch (in-place transforms on the scene)
-  4. Accents     — sparkle + initial-flash + bonus, each a convex whitening
-                   layer, composited together in ONE pass so they can't
-                   clip-fight in a shared buffer (the Phase-3 fix)
+  4. Accents     — sparkle + initial-flash + bonus + note-hold, each a convex
+                   whitening layer, composited together in ONE pass so they
+                   can't clip-fight in a shared buffer (the Phase-3 fix)
   5. Surge       — star-power lift/tint + shimmer, on lit pixels
   6. Masks/pump  — reveal/spotlight masks, beat-locked brightness pulse
   7. Output      — pause-dim + global brightness, reverse, wrap-around mirror
@@ -77,6 +77,15 @@ SP_CHARGE_TINT = 0.15         # max cool tint on lit pixels while only charging
 SP_SHIMMER_DENSITY = 0.05     # per-pixel cool-shimmer seeding probability/frame
 SP_SHIMMER_MULTI = 0.5        # extra shimmer per additional active player
 
+# ── Note-hold accents (VISION Phase 4) ───────────────────────────
+# A note/pad hit lights a brief whitening accent in that instrument's slice of
+# the strip. The four instruments (guitar, bass, drums, keys) tile the strip in
+# order, two of the eight cells each, so you can read *which* instrument played
+# by *where* the accent lands. Painted as a convex whitening layer composited
+# with the other accents (sparkle/flash/bonus), so stacked hits never clip.
+NOTE_ACCENT_MAX = 0.5                          # peak whitening coverage per hit
+NOTE_CELLS_PER_INSTRUMENT = NUM_CELLS // 4     # 2 cells each (gtr|bass|drum|keys)
+
 
 class LEDMapper:
     """Maps Stage Kit zone bitmask state to an RGB pixel buffer with effects.
@@ -113,10 +122,15 @@ class LEDMapper:
         self._sparkle_layer = Layer(MAPPED_REGION, MIX, per_pixel_alpha=True)
         self._flash_layer = Layer(MAPPED_REGION, MIX)
         self._bonus_layer = Layer(MAPPED_REGION, MIX)
-        for _lyr in (self._sparkle_layer, self._flash_layer, self._bonus_layer):
+        # Note-hold accent (Phase 4): a whitening layer keyed per instrument
+        # region by the engine's decaying note levels (see NOTE_ACCENT_MAX).
+        self._note_layer = Layer(MAPPED_REGION, MIX, per_pixel_alpha=True)
+        for _lyr in (self._sparkle_layer, self._flash_layer, self._bonus_layer,
+                     self._note_layer):
             for _k in range(len(_lyr.buf)):
                 _lyr.buf[_k] = 255                      # constant white source
-        self._accents = (self._sparkle_layer, self._flash_layer, self._bonus_layer)
+        self._accents = (self._sparkle_layer, self._flash_layer,
+                         self._bonus_layer, self._note_layer)
 
         # Decay trails state: flat R,G,B per pixel
         self._trail = bytearray(MAPPED_REGION * 3)
@@ -224,6 +238,10 @@ class LEDMapper:
         spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
         fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
 
+        # Note-hold accents (Phase 4): 4 decayed levels [gtr, bass, drum, keys]
+        # or None. Painted as a per-instrument whitening region below.
+        note_accents = effects.get("note_accents", None)
+
         # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
         sp_active = effects.get("sp_active", False)
         sp_amount = effects.get("sp_amount", 0.0)          # 0..1 (active players)
@@ -249,6 +267,7 @@ class LEDMapper:
         self._sparkle_layer.active = False
         self._flash_layer.active = False
         self._bonus_layer.active = False
+        self._note_layer.active = False
 
         # Resolve zone colors to flat ints once
         zc = [zone_colors[ZONE_NAMES[z]] for z in range(4)]
@@ -584,6 +603,28 @@ class LEDMapper:
         if bonus_t > 0.0:
             self._bonus_layer.opacity = bonus_t * 0.85
             self._bonus_layer.active = True
+
+        # ── Effect: Note-hold accents (Phase 4) ──────────────────
+        # Paint each instrument's decaying hit as a whitening accent across its
+        # two-cell slice of the strip (guitar|bass|drums|keys, left→right). The
+        # four regions tile the whole mapped strip, so every pixel's coverage is
+        # (re)written each frame — 0 where that instrument is silent. Convex MIX
+        # (below) screen-combines it with the other accents instead of clipping.
+        if note_accents is not None:
+            nalpha = self._note_layer.alpha
+            region = NOTE_CELLS_PER_INSTRUMENT * CELL_SIZE
+            any_on = False
+            for inst in range(4):
+                a = NOTE_ACCENT_MAX * note_accents[inst]
+                if a > 0.0:
+                    any_on = True
+                start = inst * region
+                end = start + region
+                if end > MAPPED_REGION:
+                    end = MAPPED_REGION
+                for i in range(start, end):
+                    nalpha[i] = a
+            self._note_layer.active = any_on
 
         # ── Composite accent overlays (VISION Phase 3) ───────────
         # Sparkle + flash + bonus fold onto the scene in one convex pass. MIX
