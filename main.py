@@ -92,8 +92,24 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # Keyframe events
         self.engine.on_keyframe(pkt.keyframe)
 
-        # Drum notes (for cues that listen for drums)
-        self.engine.on_drum(pkt.drum_notes)
+        # Note-hold accents (Phase 4) — rising-edge per-instrument hits
+        # (guitar/bass/drums/keys) light a brief accent in each instrument's
+        # slice of the strip.
+        self.engine.on_notes(pkt.guitar_notes, pkt.bass_notes,
+                             pkt.drum_notes, pkt.keys_notes)
+
+        # Vocal ribbon (Phase 4) — lead + harmony MIDI pitches drive a
+        # colour-by-pitch blob per sounding voice.
+        self.engine.on_vocals(pkt.vocal_note, pkt.harmony0_note,
+                              pkt.harmony1_note, pkt.harmony2_note)
+
+        # Performer highlight (Phase 4) — spotlight + singalong performer
+        # bitmasks bias the wash toward the featured performers' colours.
+        self.engine.on_performers(pkt.spotlight, pkt.singalong)
+
+        # Post-processing (Phase 4) — venue film grade; the mapper applies the
+        # colour-tint grades as a global palette modifier.
+        self.engine.on_post_processing(pkt.post_processing)
 
         # Bonus FX flag — one-frame celebration burst on the strip.
         if pkt.bonus_effect:
@@ -398,6 +414,9 @@ class RenderThread(threading.Thread):
             # Mapper scales frame-count effects (sparkle life) by FPS so
             # they hold their wall-clock duration at any render rate.
             effects["fps"] = fps
+            # Apply the dashboard's per-effect on/off switches — suppresses the
+            # render signal of any disabled toggle before the mapper sees it.
+            self._settings.apply_effect_toggles(effects)
 
             # Brightness baked into mapper output (Phase 2)
             brightness = self._settings.brightness / 255.0

@@ -11,12 +11,14 @@ Render pipeline (VISION Phase 3 — layer/slot compositor, see compositor.py):
   2. Motion      — sub-pixel scanner heads, alpha-over the wash (a layer)
   3. Scene shape — gradient recolour, decay trails, gradient-boundary blend,
                    sine breathing, glitch (in-place transforms on the scene)
-  4. Accents     — sparkle + initial-flash + bonus, each a convex whitening
-                   layer, composited together in ONE pass so they can't
-                   clip-fight in a shared buffer (the Phase-3 fix)
-  5. Surge       — star-power lift/tint + shimmer, on lit pixels
+  4. Accents     — sparkle + initial-flash + bonus + note-hold, each a convex
+                   whitening layer, composited together in ONE pass so they
+                   can't clip-fight in a shared buffer (the Phase-3 fix)
+  5. Surge       — star-power lift/tint + shimmer, on lit pixels; then the
+                   vocal pitch ribbon (colour-by-pitch blobs) alpha-over
   6. Masks/pump  — reveal/spotlight masks, beat-locked brightness pulse
-  7. Output      — pause-dim + global brightness, reverse, wrap-around mirror
+  7. Grade       — performer hue bias + post-processing colour grade
+  8. Output      — pause-dim + global brightness, reverse, wrap-around mirror
 
 Independent elements (wash, motion, sparkle, flash, bonus) render into their
 own pre-allocated buffers and are folded together by the Compositor with an
@@ -37,6 +39,13 @@ import time
 
 from config import LED_COUNT
 from effects.compositor import Layer, Compositor, MIX, MIX_PREMULT
+from effects.gradient import GRADIENTS
+from protocol.yarg_packet import Performer, PostProcessing
+
+# Chroma ramp for the vocal ribbon: pitch-class (0..1 across an octave) → hue.
+# The cyclic rainbow makes the octave wrap seamless (C just below the next C is
+# the same red), so a rising/falling line sweeps smoothly through the colours.
+VOCAL_CHROMA = GRADIENTS["rainbow"]
 
 # Zone ordering matches Stage Kit command IDs
 ZONE_NAMES = ["red", "green", "blue", "yellow"]
@@ -77,6 +86,72 @@ SP_CHARGE_TINT = 0.15         # max cool tint on lit pixels while only charging
 SP_SHIMMER_DENSITY = 0.05     # per-pixel cool-shimmer seeding probability/frame
 SP_SHIMMER_MULTI = 0.5        # extra shimmer per additional active player
 
+# ── Note-hold accents (VISION Phase 4) ───────────────────────────
+# A note/pad hit lights a brief whitening accent in that instrument's slice of
+# the strip. The four instruments (guitar, bass, drums, keys) tile the strip in
+# order, two of the eight cells each, so you can read *which* instrument played
+# by *where* the accent lands. Painted as a convex whitening layer composited
+# with the other accents (sparkle/flash/bonus), so stacked hits never clip.
+NOTE_ACCENT_MAX = 0.5                          # peak whitening coverage per hit
+NOTE_CELLS_PER_INSTRUMENT = NUM_CELLS // 4     # 2 cells each (gtr|bass|drum|keys)
+
+# ── Vocal pitch ribbon (VISION Phase 4) ──────────────────────────
+# Each sounding voice (lead + 3 harmonies) is painted as a soft colour blob: its
+# position along the strip tracks absolute MIDI pitch (low→left, high→right) and
+# its hue is the pitch *class* (note within the octave) sampled from a chroma
+# ramp — so the same note is always the same colour, an octave apart lands two
+# blobs of one hue at different places. Composited alpha-over the wash so it
+# reads as a translucent ribbon riding the vocal line, not a hard repaint.
+VOCAL_MIDI_LO = 36.0          # C2 — bottom of the mapped vocal range
+VOCAL_MIDI_HI = 84.0          # C6 — top of the mapped vocal range
+VOCAL_HALFWIDTH = max(2, (CELL_SIZE * 3) // 2)  # blob half-width (~1.5 cells)
+VOCAL_LEVEL = 0.7             # peak coverage of a voice blob
+
+# ── Performer highlight bias (VISION Phase 4) ────────────────────
+# Spotlight + singalong flag which performer(s) the venue is featuring; their
+# union biases the whole wash a little toward those performers' colours — a
+# gentle hue lean on the lit pixels (never a repaint, never lights a blackout).
+# One tasteful hue per performer, keyed by the Performer bitmask bit value.
+PERFORMER_COLORS = {
+    Performer.GUITAR:   (255, 140, 0),    # amber
+    Performer.BASS:     (180, 40, 255),   # violet
+    Performer.DRUMS:    (255, 50, 50),    # red
+    Performer.VOCALS:   (0, 210, 220),    # cyan
+    Performer.KEYBOARD: (60, 230, 120),   # green
+}
+PERFORMER_BIAS_STRENGTH = 0.18   # max blend toward the highlighted hue
+
+# ── Post-processing colour grades (VISION Phase 4) ───────────────
+# YARG's venue post-processing (offset 35) is a film grade. We apply only the
+# *colour* ones as a global palette modifier on lit pixels — the spatial/camera
+# ones (Bloom, Bright, Posterize, Mirror, Grainy, Scanline geometry, Trails)
+# have no colour meaning on a 1-D strip and are left out (pass-through).
+#
+# Every colour grade is expressed as one tuple (invert, sat, tr, tg, tb) and run
+# by a single loop: optionally invert, desaturate toward luma by (1 - sat), then
+# scale each channel by its tint multiplier. So SepiaTone is "full desaturate +
+# warm channel tint", Desaturated_Blue is "half desaturate + cool tint", etc.
+# Applied to lit pixels only, so a grade never lights a deliberate blackout.
+_PP = PostProcessing
+POST_GRADES = {
+    #                        invert  sat    tr     tg     tb
+    _PP.PHOTO_NEGATIVE:               (True,  1.0,  1.00,  1.00,  1.00),
+    _PP.PHOTO_NEGATIVE_RED_AND_BLACK: (True,  0.0,  1.10,  0.35,  0.35),
+    _PP.BLACK_AND_WHITE:              (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.CHOPPY_BLACK_AND_WHITE:       (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.POLARIZED_BLACK_AND_WHITE:    (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.SCANLINES_BLACK_AND_WHITE:    (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.SEPIA_TONE:                   (False, 0.0,  1.12,  0.92,  0.62),
+    _PP.SILVER_TONE:                  (False, 0.0,  0.98,  1.00,  1.08),
+    _PP.POLARIZED_RED_AND_BLUE:       (False, 0.2,  1.15,  0.60,  1.15),
+    _PP.DESATURATED_BLUE:             (False, 0.45, 0.82,  0.90,  1.15),
+    _PP.DESATURATED_RED:              (False, 0.45, 1.15,  0.85,  0.82),
+    _PP.TRAILS_DESATURATED:           (False, 0.50, 1.00,  1.00,  1.00),
+    _PP.CONTRAST_RED:                 (False, 0.9,  1.18,  0.82,  0.82),
+    _PP.CONTRAST_GREEN:               (False, 0.9,  0.82,  1.18,  0.82),
+    _PP.CONTRAST_BLUE:                (False, 0.9,  0.82,  0.82,  1.18),
+}
+
 
 class LEDMapper:
     """Maps Stage Kit zone bitmask state to an RGB pixel buffer with effects.
@@ -105,6 +180,10 @@ class LEDMapper:
         # coverage, then alpha-over the static base (MIX_PREMULT).
         self._motion_layer = Layer(MAPPED_REGION, MIX_PREMULT, per_pixel_alpha=True)
 
+        # Vocal ribbon (Phase 4): colour-by-pitch blobs, painted premultiplied
+        # like the motion layer and alpha-over'd onto the scene.
+        self._vocal_layer = Layer(MAPPED_REGION, MIX_PREMULT, per_pixel_alpha=True)
+
         # Accent overlays that brighten toward white — sparkle, initial flash,
         # bonus burst. Each is a constant-white buffer blended by a coverage
         # (per-pixel for sparkle, scalar for flash/bonus). Because MIX is convex
@@ -113,10 +192,15 @@ class LEDMapper:
         self._sparkle_layer = Layer(MAPPED_REGION, MIX, per_pixel_alpha=True)
         self._flash_layer = Layer(MAPPED_REGION, MIX)
         self._bonus_layer = Layer(MAPPED_REGION, MIX)
-        for _lyr in (self._sparkle_layer, self._flash_layer, self._bonus_layer):
+        # Note-hold accent (Phase 4): a whitening layer keyed per instrument
+        # region by the engine's decaying note levels (see NOTE_ACCENT_MAX).
+        self._note_layer = Layer(MAPPED_REGION, MIX, per_pixel_alpha=True)
+        for _lyr in (self._sparkle_layer, self._flash_layer, self._bonus_layer,
+                     self._note_layer):
             for _k in range(len(_lyr.buf)):
                 _lyr.buf[_k] = 255                      # constant white source
-        self._accents = (self._sparkle_layer, self._flash_layer, self._bonus_layer)
+        self._accents = (self._sparkle_layer, self._flash_layer,
+                         self._bonus_layer, self._note_layer)
 
         # Decay trails state: flat R,G,B per pixel
         self._trail = bytearray(MAPPED_REGION * 3)
@@ -224,6 +308,22 @@ class LEDMapper:
         spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
         fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
 
+        # Note-hold accents (Phase 4): 4 decayed levels [gtr, bass, drum, keys]
+        # or None. Painted as a per-instrument whitening region below.
+        note_accents = effects.get("note_accents", None)
+
+        # Vocal ribbon (Phase 4): MIDI pitch per voice [lead, h0, h1, h2] or
+        # None; 0.0 = silent. Painted as colour-by-pitch blobs below.
+        vocal_notes = effects.get("vocal_notes", None)
+
+        # Performer highlight (Phase 4): union of spotlight+singalong bitmasks.
+        # Biases lit pixels toward the highlighted performers' colours.
+        performers = effects.get("performers", 0)
+
+        # Post-processing grade (Phase 4): venue film grade byte. Only the
+        # colour grades in POST_GRADES do anything; others pass through.
+        post_grade = POST_GRADES.get(effects.get("post_processing", 0))
+
         # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
         sp_active = effects.get("sp_active", False)
         sp_amount = effects.get("sp_amount", 0.0)          # 0..1 (active players)
@@ -249,6 +349,7 @@ class LEDMapper:
         self._sparkle_layer.active = False
         self._flash_layer.active = False
         self._bonus_layer.active = False
+        self._note_layer.active = False
 
         # Resolve zone colors to flat ints once
         zc = [zone_colors[ZONE_NAMES[z]] for z in range(4)]
@@ -585,6 +686,36 @@ class LEDMapper:
             self._bonus_layer.opacity = bonus_t * 0.85
             self._bonus_layer.active = True
 
+        # ── Effect: Note-hold accents (Phase 4) ──────────────────
+        # Paint each instrument's decaying hit as a whitening accent across its
+        # two-cell slice of the strip (guitar|bass|drums|keys, left→right). The
+        # four regions tile the whole mapped strip, so every pixel's coverage is
+        # (re)written each frame — 0 where that instrument is silent. Convex MIX
+        # (below) screen-combines it with the other accents instead of clipping.
+        #
+        # Lit-pixels only: coverage is applied where the scene is already lit,
+        # never on dark pixels — so a busy part can't grey out a deliberate
+        # blackout (matches sparkle; the other Phase-4 grades are lit-only too).
+        if note_accents is not None:
+            nalpha = self._note_layer.alpha
+            region = NOTE_CELLS_PER_INSTRUMENT * CELL_SIZE
+            any_on = False
+            for inst in range(4):
+                a = NOTE_ACCENT_MAX * note_accents[inst]
+                start = inst * region
+                end = start + region
+                if end > MAPPED_REGION:
+                    end = MAPPED_REGION
+                if a > 0.0:
+                    any_on = True
+                    for i in range(start, end):
+                        o = i * 3
+                        nalpha[i] = a if (buf[o] | buf[o + 1] | buf[o + 2]) else 0.0
+                else:
+                    for i in range(start, end):
+                        nalpha[i] = 0.0
+            self._note_layer.active = any_on
+
         # ── Composite accent overlays (VISION Phase 3) ───────────
         # Sparkle + flash + bonus fold onto the scene in one convex pass. MIX
         # screen-combines, so any number active together stay bounded and
@@ -648,6 +779,91 @@ class LEDMapper:
                     buf[o + 1] = int(buf[o + 1] * inv_t + tg * tint_t)
                     buf[o + 2] = int(buf[o + 2] * inv_t + tb * tint_t)
 
+        # ── Effect: Vocal pitch ribbon (Phase 4) ─────────────────
+        # Paint each sounding voice as a soft triangular blob: centre = absolute
+        # pitch mapped along the strip, colour = pitch class from the chroma
+        # ramp. Accumulate premultiplied colour + coverage (like the scanner
+        # heads), then alpha-over the scene — so blobs of the same hue add and
+        # crossing voices blend, but the ribbon never overshoots 255.
+        if vocal_notes is not None:
+            active_voices = False
+            for pitch in vocal_notes:
+                if pitch > 0.0:
+                    active_voices = True
+                    break
+            if active_voices:
+                vlayer = self._vocal_layer
+                vbuf = vlayer.buf
+                valpha = vlayer.alpha
+                for k in range(MAPPED_REGION * 3):
+                    vbuf[k] = 0
+                for i in range(MAPPED_REGION):
+                    valpha[i] = 0.0
+                half = VOCAL_HALFWIDTH
+                inv_half = 1.0 / half
+                span = VOCAL_MIDI_HI - VOCAL_MIDI_LO
+                for pitch in vocal_notes:
+                    if pitch <= 0.0:
+                        continue
+                    pos01 = (pitch - VOCAL_MIDI_LO) / span
+                    if pos01 < 0.0:
+                        pos01 = 0.0
+                    elif pos01 > 1.0:
+                        pos01 = 1.0
+                    center = pos01 * (MAPPED_REGION - 1)
+                    # Hue from pitch class (note within the octave).
+                    cr, cg, cb = VOCAL_CHROMA.color_at((pitch % 12.0) / 12.0)
+                    lo = int(math.ceil(center - half))
+                    hi = int(math.floor(center + half))
+                    if lo < 0:
+                        lo = 0
+                    if hi > MAPPED_REGION - 1:
+                        hi = MAPPED_REGION - 1
+                    for px in range(lo, hi + 1):
+                        d = px - center
+                        if d < 0.0:
+                            d = -d
+                        w = (1.0 - d * inv_half) * VOCAL_LEVEL
+                        if w <= 0.0:
+                            continue
+                        o = px * 3
+                        v = vbuf[o] + int(cr * w);     vbuf[o]     = v if v < 255 else 255
+                        v = vbuf[o + 1] + int(cg * w); vbuf[o + 1] = v if v < 255 else 255
+                        v = vbuf[o + 2] + int(cb * w); vbuf[o + 2] = v if v < 255 else 255
+                        a = valpha[px] + w
+                        valpha[px] = a if a < 1.0 else 1.0
+                vlayer.active = True
+                Compositor.composite(buf, (vlayer,))
+
+        # ── Effect: Performer highlight bias (Phase 4) ───────────
+        # Lean the lit pixels toward the highlighted performers' average hue.
+        # A gentle convex MIX on already-lit pixels only, so it tints the wash
+        # without lifting a blackout or overshooting. Off when nobody's flagged.
+        if performers:
+            tr = tg = tb = 0
+            count = 0
+            for bit, (pr, pg, pb) in PERFORMER_COLORS.items():
+                if performers & bit:
+                    tr += pr
+                    tg += pg
+                    tb += pb
+                    count += 1
+            if count:
+                tr //= count
+                tg //= count
+                tb //= count
+                t = PERFORMER_BIAS_STRENGTH
+                inv_t = 1.0 - t
+                tr_t = tr * t
+                tg_t = tg * t
+                tb_t = tb * t
+                for i in range(MAPPED_REGION):
+                    o = i * 3
+                    if buf[o] | buf[o + 1] | buf[o + 2]:
+                        buf[o]     = int(buf[o] * inv_t + tr_t)
+                        buf[o + 1] = int(buf[o + 1] * inv_t + tg_t)
+                        buf[o + 2] = int(buf[o + 2] * inv_t + tb_t)
+
         # ── Effect: Reveal mask (Intro) ─────────────────────────
         # Pixels light up sequentially from the strip centre outward as
         # reveal_progress climbs 0.0 → 1.0 (wall-clock driven by the
@@ -685,6 +901,38 @@ class LEDMapper:
                         buf[o] = r if r < 255 else 255
                         buf[o + 1] = g if g < 255 else 255
                         buf[o + 2] = b if b < 255 else 255
+
+        # ── Effect: Post-processing colour grade (Phase 4) ───────
+        # Global palette modifier from the venue film grade. One loop handles
+        # every grade: optional invert, desaturate toward luma by (1 - sat),
+        # then per-channel tint. Lit pixels only — a grade never lifts a
+        # blackout. Runs last (after masks/pulse) so it grades the final look.
+        if post_grade is not None:
+            invert, sat, tr, tg, tb = post_grade
+            inv_sat = 1.0 - sat
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                r = buf[o]
+                g = buf[o + 1]
+                b = buf[o + 2]
+                if not (r | g | b):
+                    continue
+                if invert:
+                    r = 255 - r
+                    g = 255 - g
+                    b = 255 - b
+                if inv_sat > 0.0:
+                    # luma ≈ 0.30R + 0.59G + 0.11B (integer weights /256)
+                    luma = (r * 77 + g * 150 + b * 29) >> 8
+                    r = int(r * sat + luma * inv_sat)
+                    g = int(g * sat + luma * inv_sat)
+                    b = int(b * sat + luma * inv_sat)
+                r = int(r * tr)
+                g = int(g * tg)
+                b = int(b * tb)
+                buf[o]     = r if r < 255 else 255
+                buf[o + 1] = g if g < 255 else 255
+                buf[o + 2] = b if b < 255 else 255
 
         # ── Apply brightness + write to output buffer ────────────
         # Pause dims everything to 35% so the strip doesn't go fully dark

@@ -47,10 +47,10 @@ Every field, and what it should drive. **Bold** = implemented today.
 | **Star power (47+, v4)** | per-player overdrive amount + active | **charging cool tint → active "surge"** (lift + cool blend + shimmer) |
 | **Camera cut (44–46, v3)** | who the camera is on + priority | *parsed & shown on status page*; future: subtle subject color/region bias + a cut accent |
 | FogState (36) | haze on/off | lower contrast / add a soft blur-glow floor while foggy |
-| PostProcessing (35) | 40+ film grades | apply the *color-tint* ones (Desaturated_Blue, Contrast_Red, SepiaTone, B&W…) as a global palette modifier; ignore camera-only grades |
-| Note bitmasks (14–17) | per-fret/pad hits | rising-edge accents with a **note-hold** min (1/32 note) so transient hits are visible (YALCY DMX) |
-| Vocal/Harmony pitch (18–33) | MIDI pitch, 0=none | map pitch→gradient position for a vocal shimmer / pitch ribbon |
-| Spotlight / Singalong (42,43) | performer bitmask | bias a region/hue toward the highlighted performer(s) |
+| **PostProcessing (35)** | 40+ film grades | **apply the color-tint ones** (Desaturated_Blue, Contrast_Red, SepiaTone, B&W…) as a global palette modifier; camera-only grades pass through |
+| **Note bitmasks (14–17)** | per-fret/pad hits | **rising-edge accents with a note-hold min (1/32 note)** so transient hits are visible, painted per-instrument (YALCY DMX) |
+| **Vocal/Harmony pitch (18–33)** | MIDI pitch, 0=none | **pitch→ribbon blob**: position by absolute pitch, hue by pitch class (chroma) |
+| **Spotlight / Singalong (42,43)** | performer bitmask | **hue bias** toward the highlighted performer(s) |
 | VenueSize (8) | small/large | density branching (sparser vs denser patterns), as YALCY does per-cue |
 | SongSection (13) | Verse/Chorus/… | slow palette/energy bias per section |
 | AutoGenVenueTrack (41) | chart has no authored venue | shown on status page (AUTO); could soften/idealize the look |
@@ -124,19 +124,80 @@ Who does what best, and where it lands in our code:
   screen-combine instead of clip-fighting in a shared buffer. Whole-image
   modifiers (breathing, glitch, surge, masks, beat-pulse, brightness) stay as
   ordered transforms. See "Current focus" below.
-- [ ] **4. Note-hold + performer/vocal reactivity + post-processing colour
-  tints** — use the already-parsed-but-unused signals (notes 14–17, vocals
-  18–33, spotlight/singalong 42–43, post-processing 35).
+- [x] **4. Note-hold + performer/vocal reactivity + post-processing colour
+  tints** *(implemented on `feat/note-vocal-reactivity`)* — the four
+  parsed-but-unused signal groups now drive light: per-instrument **note-hold**
+  accents (rising edge → ≥1/32-note hold → decay, painted in each instrument's
+  strip slice), a **vocal pitch ribbon** (per-voice blob, position = absolute
+  pitch, hue = pitch class), a **performer highlight bias** (spotlight/singalong
+  union tints the wash toward the featured performers' hues), and
+  **post-processing colour grades** (B&W/sepia/silver/negative/desaturated/
+  contrast tints applied as a global palette modifier; camera-only grades pass
+  through). See "Current focus" below.
 - [ ] **5. Camera-cut lighting** — subtle subject colour/region bias + a cut
   accent (data already parsed).
 - [ ] **6. Blur/mirror post-process polish** — the LedFx filter chain.
 - [ ] **7. Status dashboard pass** — evolve the status page (`status_server.py`)
   from a status readout into a live operator dashboard: render/DDP throughput and
   stall stats, per-signal telemetry (cue, BPM, beat clock, strobe, star power,
-  camera subject, section), and a live strip / per-layer preview. Read-only,
-  driven off the data the tracker and engine already expose.
+  camera subject, section), and a live strip / per-layer preview. Mostly
+  read-only, driven off the data the tracker and engine already expose.
+  *Groundwork landed:* a registry-driven **effect-toggle framework**
+  (`settings.EFFECT_TOGGLES` + `apply_effect_toggles()`), with per-layer on/off
+  switches already on the dashboard for the four Phase 4 reactivity layers.
+  Adding a toggle is one registry row (label/description + the effects key it
+  suppresses) — the render loop, persistence, and dashboard switches are
+  generic, so new layers get a switch for free.
 
-## Current focus — Phase 3: layer/slot compositor
+## Current focus — Phase 4: note / vocal / performer / post-processing reactivity
+
+**Problem.** Four signal groups YARG broadcasts were parsed but thrown away, so
+the strip ignored the notes being played, the vocal line, who the venue was
+featuring, and the film grade — the light didn't react to the *performance*, only
+to the authored cue.
+
+**The work (implemented, `feat/note-vocal-reactivity`).** Each group is consumed
+host-side, tastefully, and composited on top of the existing cue look:
+
+- **Note-hold accents** (`on_notes`, notes 14–17). A note bitmask bit going 0→1
+  is a fresh fret/pad hit; the engine holds it for at least a 1/32 note
+  (tempo-scaled, floored) so a hit living in one ~88 Hz packet still reads, then
+  decays. The mapper paints each instrument's decaying accent in its own
+  two-cell slice (guitar|bass|drums|keys, left→right) as a convex whitening
+  layer folded in with the sparkle/flash/bonus accents — so *where* the accent
+  lands tells you *which* instrument played, and stacked hits never clip.
+  *Hardened after the first cut:* the accent is **lit-pixels only** (like
+  sparkle) so a busy part can't grey out a deliberate blackout, and a
+  **~7 Hz anti-strobe cap** (`NOTE_REFRESH_MIN`) turns a fast run into a
+  sustained glow instead of a flash-per-hit strobe — the flicker call-out from
+  the Phase 4 review.
+- **Vocal pitch ribbon** (`on_vocals`, vocals 18–33). Each sounding voice is a
+  soft blob whose position tracks absolute MIDI pitch and whose hue is the pitch
+  *class* from a cyclic chroma ramp (same note → same colour; an octave apart →
+  two same-hue blobs at different places). Painted premultiplied like the
+  scanner heads and alpha-over'd, so voices blend without overshooting.
+- **Performer highlight bias** (`on_performers`, spotlight/singalong 42–43).
+  Their union leans the lit wash toward the featured performers' colours (one
+  hue each) via a gentle convex MIX on lit pixels only — a hue lean, never a
+  repaint, never lifting a blackout.
+- **Post-processing colour grade** (`on_post_processing`, offset 35). Only the
+  colour grades act, via one loop over an `(invert, sat, tint)` table
+  (`POST_GRADES`): B&W, sepia, silver, photo-negative, desaturated blue/red,
+  contrast R/G/B, duotone. Camera-only grades (Bloom/Bright/Posterize/Mirror/
+  Grainy/Scanline geometry/Trails) carry no colour meaning on a 1-D strip and
+  pass through. Applied last, to lit pixels only.
+
+Hot-path discipline preserved: new layer/alpha buffers allocated once; inactive
+effects skipped by a gate or a `None` signal. Verified: unit tests pin each
+feature and its blackout-safe / bounded invariants
+(`tests/test_note_hold.py`, `test_vocal_ribbon.py`, `test_performer_bias.py`,
+`test_post_processing.py`), and a render-only bench at LED_COUNT=120 shows the
+**common in-song frame at parity** with the pre-Phase-4 render (~517 vs ~515
+µs/frame here) — the always-on note-accent zero-fill is ~2 µs — while the
+pathological all-four-effects-at-once frame is ~896 µs, still ≈3.6% of the 25 ms
+budget at 40 FPS.
+
+## Foundation — Phase 3: layer/slot compositor
 
 **Problem.** `LEDMapper.render()` was a flat pass-chain: one shared RGB buffer
 that ~13 effects read and overwrote in a fixed order. When several *overlays*
@@ -189,4 +250,7 @@ heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
 - **Phase 2 (merged):** continuous sub-pixel scanner rendering
   (`tests/test_scanner.py`).
 - **Phase 3 (`feat/layer-compositor`):** the layer/slot compositor above.
-- The later roadmap phases (4–7) are **future work**.
+- **Phase 4 (`feat/note-vocal-reactivity`):** note-hold accents, vocal pitch
+  ribbon, performer highlight bias, and post-processing colour grades — the four
+  parsed-but-unused signal groups now drive light (see "Current focus" above).
+- The later roadmap phases (5–7) are **future work**.
