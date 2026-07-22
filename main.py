@@ -414,6 +414,9 @@ class RenderThread(threading.Thread):
             # Mapper scales frame-count effects (sparkle life) by FPS so
             # they hold their wall-clock duration at any render rate.
             effects["fps"] = fps
+            # Apply the dashboard's per-effect on/off switches — suppresses the
+            # render signal of any disabled toggle before the mapper sees it.
+            self._settings.apply_effect_toggles(effects)
 
             # Brightness baked into mapper output (Phase 2)
             brightness = self._settings.brightness / 255.0

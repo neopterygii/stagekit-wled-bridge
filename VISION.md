@@ -140,8 +140,14 @@ Who does what best, and where it lands in our code:
 - [ ] **7. Status dashboard pass** — evolve the status page (`status_server.py`)
   from a status readout into a live operator dashboard: render/DDP throughput and
   stall stats, per-signal telemetry (cue, BPM, beat clock, strobe, star power,
-  camera subject, section), and a live strip / per-layer preview. Read-only,
-  driven off the data the tracker and engine already expose.
+  camera subject, section), and a live strip / per-layer preview. Mostly
+  read-only, driven off the data the tracker and engine already expose.
+  *Groundwork landed:* a registry-driven **effect-toggle framework**
+  (`settings.EFFECT_TOGGLES` + `apply_effect_toggles()`), with per-layer on/off
+  switches already on the dashboard for the four Phase 4 reactivity layers.
+  Adding a toggle is one registry row (label/description + the effects key it
+  suppresses) — the render loop, persistence, and dashboard switches are
+  generic, so new layers get a switch for free.
 
 ## Current focus — Phase 4: note / vocal / performer / post-processing reactivity
 

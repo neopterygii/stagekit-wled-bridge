@@ -141,11 +141,44 @@ PALETTES = {
 
 VALID_FPS = (10, 15, 20, 25, 30, 40, 50, 60)
 
+# ── Runtime-toggleable render effects ───────────────────────────────
+# The framework backing the dashboard's per-effect on/off switches. Each entry
+# is one toggle: `label`/`description` drive the UI (the dashboard renders the
+# switches from this registry, so it needs no per-effect code), and `key`/`off`
+# tell the render loop how to suppress it — when the toggle is off,
+# apply_effect_toggles() forces effects[`key`] to `off` before the mapper sees
+# it. Adding a new toggle is one row here + emitting its key from the engine;
+# the mapper and dashboard need no change.
+EFFECT_TOGGLES = {
+    "note_accents": {
+        "label": "Note Accents",
+        "description": "Per-instrument whitening flash on note/pad hits.",
+        "key": "note_accents", "off": None,
+    },
+    "vocal_ribbon": {
+        "label": "Vocal Ribbon",
+        "description": "Colour-by-pitch blobs tracking the vocal + harmony lines.",
+        "key": "vocal_notes", "off": None,
+    },
+    "performer_bias": {
+        "label": "Performer Highlight",
+        "description": "Bias the wash toward the spotlighted performer's colour.",
+        "key": "performers", "off": 0,
+    },
+    "post_processing": {
+        "label": "Post-Processing Grade",
+        "description": "Venue film colour grades (sepia, B&W, channel tints…).",
+        "key": "post_processing", "off": 0,
+    },
+}
+
 DEFAULT_SETTINGS = {
     "brightness": 255,
     "palette": "default",
     "fps": 40,
     "direction": "normal",
+    # Every effect toggle defaults to on.
+    "effects": {tid: True for tid in EFFECT_TOGGLES},
 }
 
 
@@ -156,6 +189,9 @@ class BridgeSettings:
         self._path = path
         self._lock = threading.Lock()
         self._data = dict(DEFAULT_SETTINGS)
+        # Deep-copy the nested effects dict so instances (and the module-level
+        # DEFAULT_SETTINGS) don't share one mutable object.
+        self._data["effects"] = dict(DEFAULT_SETTINGS["effects"])
         self._writable = self._probe_writable()
         if not self._writable:
             log.warning(
@@ -190,6 +226,11 @@ class BridgeSettings:
             self._data["fps"] = stored["fps"]
         if stored.get("direction") in ("normal", "reverse"):
             self._data["direction"] = stored["direction"]
+        stored_effects = stored.get("effects")
+        if isinstance(stored_effects, dict):
+            for tid in EFFECT_TOGGLES:
+                if isinstance(stored_effects.get(tid), bool):
+                    self._data["effects"][tid] = stored_effects[tid]
 
     def _save(self):
         if not self._writable:
@@ -265,6 +306,42 @@ class BridgeSettings:
         with self._lock:
             return dict(PALETTES[self._data["palette"]]["colors"])
 
+    # ── Effect toggles ─────────────────────────────────────────────
+    @property
+    def effects(self) -> dict[str, bool]:
+        """Current on/off state of every effect toggle (a copy)."""
+        with self._lock:
+            return dict(self._data["effects"])
+
+    def effect_enabled(self, effect_id: str) -> bool:
+        """Whether a single effect toggle is on (unknown id → True)."""
+        with self._lock:
+            return self._data["effects"].get(effect_id, True)
+
+    def set_effect(self, effect_id: str, enabled: bool) -> bool:
+        """Enable/disable one effect toggle. Returns False for an unknown id."""
+        if effect_id not in EFFECT_TOGGLES:
+            return False
+        with self._lock:
+            self._data["effects"][effect_id] = bool(enabled)
+            self._save()
+        return True
+
+    def apply_effect_toggles(self, effects: dict) -> dict:
+        """Suppress the render signal of any disabled effect toggle.
+
+        Called each frame by the render thread on the fresh effects dict from
+        the engine, *before* it reaches the mapper: for every toggle that's off,
+        force its `key` to the `off` value the mapper reads as "inactive".
+        Enabled effects pass through untouched. Mutates and returns `effects`.
+        """
+        with self._lock:
+            states = dict(self._data["effects"])
+        for tid, meta in EFFECT_TOGGLES.items():
+            if not states.get(tid, True):
+                effects[meta["key"]] = meta["off"]
+        return effects
+
     def snapshot(self) -> dict:
         """Return current settings for the status page."""
         with self._lock:
@@ -277,4 +354,9 @@ class BridgeSettings:
                 "fps": self._data["fps"],
                 "fps_options": list(VALID_FPS),
                 "direction": self._data["direction"],
+                "effects": dict(self._data["effects"]),
+                "effect_toggles": {
+                    tid: {"label": m["label"], "description": m["description"]}
+                    for tid, m in EFFECT_TOGGLES.items()
+                },
             }

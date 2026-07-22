@@ -276,6 +276,23 @@ STATUS_HTML = """\
   .test-btn.strobe-btn:hover { background: var(--yellow); color: var(--bg); }
   .test-btn.strobe-btn.active { background: var(--yellow); color: var(--bg); }
 
+  /* Effect-layer toggle switches */
+  .toggle-grid { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .toggle-item { display: flex; align-items: center; gap: 0.75rem; background: var(--bg);
+                 border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.75rem;
+                 min-width: 240px; flex: 1; }
+  .toggle-item .toggle-text { flex: 1; }
+  .toggle-item .toggle-label { font-size: 0.85rem; font-weight: 600; }
+  .toggle-item .toggle-desc { font-size: 0.7rem; color: var(--dim); margin-top: 0.15rem; }
+  .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider-sw { position: absolute; cursor: pointer; inset: 0; background: var(--border);
+               transition: 0.15s; border-radius: 22px; }
+  .slider-sw:before { position: absolute; content: ""; height: 16px; width: 16px; left: 3px;
+                      bottom: 3px; background: var(--dim); transition: 0.15s; border-radius: 50%; }
+  .switch input:checked + .slider-sw { background: var(--accent); }
+  .switch input:checked + .slider-sw:before { transform: translateX(16px); background: #fff; }
+
   .bpm-control { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; }
   .bpm-control label { font-size: 0.75rem; color: var(--dim); text-transform: uppercase; }
   .bpm-control input[type=range] { flex: 1; accent-color: var(--accent); }
@@ -382,6 +399,12 @@ STATUS_HTML = """\
 
 <h3 style="margin-bottom:0.5rem">Zone Bitmasks</h3>
 <div id="zones"></div>
+
+<h3 style="margin:1rem 0 0.5rem">Effect Layers</h3>
+<div class="test-panel">
+  <div class="section-label">Reactivity Toggles</div>
+  <div class="toggle-grid" id="effect-toggles"></div>
+</div>
 
 <h3 style="margin:1rem 0 0.5rem">Test Patterns</h3>
 <div class="test-panel">
@@ -547,6 +570,30 @@ function updatePalettePreview(colors) {
   }
 }
 
+// Effect-layer toggles — built once from the registry the server sends, then
+// their checked state is synced from each snapshot.
+let effectsPopulated = false;
+function setEffect(id, on) {
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ effects: { [id]: on } }) });
+}
+function buildEffectToggles(toggles, states) {
+  const container = document.getElementById('effect-toggles');
+  container.innerHTML = '';
+  for (const [id, meta] of Object.entries(toggles)) {
+    const on = !states || states[id] !== false;
+    const item = document.createElement('div');
+    item.className = 'toggle-item';
+    item.innerHTML = '<div class="toggle-text"><div class="toggle-label">' + meta.label +
+      '</div><div class="toggle-desc">' + meta.description + '</div></div>' +
+      '<label class="switch"><input type="checkbox" data-effect="' + id + '"' +
+      (on ? ' checked' : '') + '><span class="slider-sw"></span></label>';
+    const input = item.querySelector('input');
+    input.addEventListener('change', () => setEffect(id, input.checked));
+    container.appendChild(item);
+  }
+}
+
 // FPS buttons
 let fpsPopulated = false;
 function setFps(val) {
@@ -613,6 +660,17 @@ function updateSettings(s) {
     fpsPopulated = true;
   }
   if (s.fps) highlightFps(s.fps);
+  // Effect toggles — build once, then keep the switches in sync with server state
+  if (!effectsPopulated && s.effect_toggles) {
+    buildEffectToggles(s.effect_toggles, s.effects);
+    effectsPopulated = true;
+  }
+  if (s.effects) {
+    for (const [id, on] of Object.entries(s.effects)) {
+      const input = document.querySelector('#effect-toggles input[data-effect="' + id + '"]');
+      if (input && input.checked !== on) input.checked = on;
+    }
+  }
   // Sync direction
   if (s.direction) {
     const label = s.direction === 'reverse' ? 'Reverse' : 'Normal';
@@ -1005,6 +1063,14 @@ class StatusServer:
             self.settings.direction = str(body["direction"])
             if self.settings.direction != old_dir:
                 changed.append(f"direction={self.settings.direction}")
+        if "effects" in body:
+            updates = body["effects"]
+            if not isinstance(updates, dict):
+                return 400, "Invalid effects payload"
+            for tid, on in updates.items():
+                if not self.settings.set_effect(tid, bool(on)):
+                    return 400, f"Unknown effect: {tid}"
+                changed.append(f"{tid}={'on' if on else 'off'}")
         if not changed:
             return 200, "No change"
         return 200, "Updated: " + ", ".join(changed)
