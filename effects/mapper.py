@@ -39,6 +39,7 @@ import time
 from config import LED_COUNT
 from effects.compositor import Layer, Compositor, MIX, MIX_PREMULT
 from effects.gradient import GRADIENTS
+from protocol.yarg_packet import Performer
 
 # Chroma ramp for the vocal ribbon: pitch-class (0..1 across an octave) → hue.
 # The cyclic rainbow makes the octave wrap seamless (C just below the next C is
@@ -104,6 +105,20 @@ VOCAL_MIDI_LO = 36.0          # C2 — bottom of the mapped vocal range
 VOCAL_MIDI_HI = 84.0          # C6 — top of the mapped vocal range
 VOCAL_HALFWIDTH = max(2, (CELL_SIZE * 3) // 2)  # blob half-width (~1.5 cells)
 VOCAL_LEVEL = 0.7             # peak coverage of a voice blob
+
+# ── Performer highlight bias (VISION Phase 4) ────────────────────
+# Spotlight + singalong flag which performer(s) the venue is featuring; their
+# union biases the whole wash a little toward those performers' colours — a
+# gentle hue lean on the lit pixels (never a repaint, never lights a blackout).
+# One tasteful hue per performer, keyed by the Performer bitmask bit value.
+PERFORMER_COLORS = {
+    Performer.GUITAR:   (255, 140, 0),    # amber
+    Performer.BASS:     (180, 40, 255),   # violet
+    Performer.DRUMS:    (255, 50, 50),    # red
+    Performer.VOCALS:   (0, 210, 220),    # cyan
+    Performer.KEYBOARD: (60, 230, 120),   # green
+}
+PERFORMER_BIAS_STRENGTH = 0.18   # max blend toward the highlighted hue
 
 
 class LEDMapper:
@@ -268,6 +283,10 @@ class LEDMapper:
         # Vocal ribbon (Phase 4): MIDI pitch per voice [lead, h0, h1, h2] or
         # None; 0.0 = silent. Painted as colour-by-pitch blobs below.
         vocal_notes = effects.get("vocal_notes", None)
+
+        # Performer highlight (Phase 4): union of spotlight+singalong bitmasks.
+        # Biases lit pixels toward the highlighted performers' colours.
+        performers = effects.get("performers", 0)
 
         # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
         sp_active = effects.get("sp_active", False)
@@ -771,6 +790,35 @@ class LEDMapper:
                         valpha[px] = a if a < 1.0 else 1.0
                 vlayer.active = True
                 Compositor.composite(buf, (vlayer,))
+
+        # ── Effect: Performer highlight bias (Phase 4) ───────────
+        # Lean the lit pixels toward the highlighted performers' average hue.
+        # A gentle convex MIX on already-lit pixels only, so it tints the wash
+        # without lifting a blackout or overshooting. Off when nobody's flagged.
+        if performers:
+            tr = tg = tb = 0
+            count = 0
+            for bit, (pr, pg, pb) in PERFORMER_COLORS.items():
+                if performers & bit:
+                    tr += pr
+                    tg += pg
+                    tb += pb
+                    count += 1
+            if count:
+                tr //= count
+                tg //= count
+                tb //= count
+                t = PERFORMER_BIAS_STRENGTH
+                inv_t = 1.0 - t
+                tr_t = tr * t
+                tg_t = tg * t
+                tb_t = tb * t
+                for i in range(MAPPED_REGION):
+                    o = i * 3
+                    if buf[o] | buf[o + 1] | buf[o + 2]:
+                        buf[o]     = int(buf[o] * inv_t + tr_t)
+                        buf[o + 1] = int(buf[o + 1] * inv_t + tg_t)
+                        buf[o + 2] = int(buf[o + 2] * inv_t + tb_t)
 
         # ── Effect: Reveal mask (Intro) ─────────────────────────
         # Pixels light up sequentially from the strip centre outward as

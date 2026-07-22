@@ -103,6 +103,10 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.engine.on_vocals(pkt.vocal_note, pkt.harmony0_note,
                               pkt.harmony1_note, pkt.harmony2_note)
 
+        # Performer highlight (Phase 4) — spotlight + singalong performer
+        # bitmasks bias the wash toward the featured performers' colours.
+        self.engine.on_performers(pkt.spotlight, pkt.singalong)
+
         # Bonus FX flag — one-frame celebration burst on the strip.
         if pkt.bonus_effect:
             self.engine.on_bonus()

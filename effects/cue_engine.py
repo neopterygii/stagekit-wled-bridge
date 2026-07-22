@@ -231,6 +231,12 @@ class CueEngine:
         # which paints a colour-by-pitch "ribbon" blob per active voice.
         self._vocal_notes = [0.0, 0.0, 0.0, 0.0]
 
+        # Performer highlight (Phase 4). Spotlight + singalong are performer
+        # bitmasks (offsets 42-43); their union biases the wash toward the
+        # highlighted performers' colours in the mapper.
+        self._spotlight = 0
+        self._singalong = 0
+
         # Beat oscillator: a continuous musical phase synthesized from BPM +
         # beat edges, so motion/colour can be driven off a smooth phase that is
         # quantised to but continuous *within* the beat (LedFx's beat/bar
@@ -325,6 +331,7 @@ class CueEngine:
         fx["beat_clock"] = self.beat_clock(now)
         fx["note_accents"] = self._note_accents(now)
         fx["vocal_notes"] = self._vocal_notes
+        fx["performers"] = self._spotlight | self._singalong
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -619,6 +626,15 @@ class CueEngine:
         never sees a half-updated set.
         """
         self._vocal_notes = [vocal, harmony0, harmony1, harmony2]
+
+    def on_performers(self, spotlight: int, singalong: int):
+        """Store the spotlight + singalong performer bitmasks (Phase 4).
+
+        Sustained state; their union is surfaced to the mapper each frame to
+        bias the wash toward the highlighted performers' colours.
+        """
+        self._spotlight = spotlight
+        self._singalong = singalong
 
     def _note_accents(self, now: float) -> list[float]:
         """Current decayed note-hold level per instrument (0.0 = none)."""
