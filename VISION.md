@@ -157,12 +157,24 @@ Who does what best, and where it lands in our code:
   switch for free from the registry-driven grid, and blur adds a **Blur Amount
   slider** (persisted `blur_amount` setting → `CueEngine.set_blur_base()`) so the
   base strength can be dialled live against the real strip — fog stacks on top.
-- [ ] **7. Status dashboard pass** — evolve the status page (`status_server.py`)
+- [~] **7. Status dashboard pass** *(in progress on `feat/status-dashboard`)* —
+  evolve the status page (`status_server.py`)
   from a status readout into a live operator dashboard: render/DDP throughput and
   stall stats, per-signal telemetry (cue, BPM, beat clock, strobe, star power,
   camera subject, section), and a live strip / per-layer preview. Mostly
   read-only, driven off the data the tracker and engine already expose.
-  *Groundwork landed:* a registry-driven **effect-toggle framework**
+  *Landed on `feat/status-dashboard`:* a **live strip preview** — the frame
+  actually sent (so strobe/cross-fade show) downsampled to `PREVIEW_CELLS` and
+  drawn on a canvas — plus a **per-layer preview** row for each compositor layer
+  (wash / motion / sparkle / flash / bonus / notes / vocals), each showing that
+  layer's *effective contribution* this frame; and a **beat-clock indicator**
+  (pulse from the engine's `beat_phase`, beat-in-bar from `bar_beat`). The
+  preview is captured in the mapper only when `render(preview=True)` and the
+  render loop only asks when the dashboard has an open SSE subscriber
+  (`tracker.has_subscribers`), throttled to ~11 Hz — so an unwatched dashboard
+  costs the render loop nothing and a watched one adds ~0.1% of the frame budget
+  amortized (`tests/test_preview.py`).
+  *Earlier groundwork:* a registry-driven **effect-toggle framework**
   (`settings.EFFECT_TOGGLES` + `apply_effect_toggles()`), with per-layer on/off
   switches already on the dashboard for the four Phase 4 reactivity layers.
   Adding a toggle is one registry row (label/description + the effects key it

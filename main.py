@@ -28,7 +28,7 @@ from protocol.yarg_packet import parse_packet, CueByte, KNOWN_DATAGRAM_VERSIONS
 from protocol.ddp_sender import DDPSender
 from protocol.wled_api import WLEDApi
 from effects.cue_engine import CueEngine
-from effects.mapper import LEDMapper
+from effects.mapper import LEDMapper, MAPPED_REGION, PREVIEW_CELLS
 from status_server import StatusTracker, StatusServer
 from settings import BridgeSettings
 
@@ -375,6 +375,17 @@ class RenderThread(threading.Thread):
         self._last_cue_change_at = 0.0
         self._FADE_DURATION = 0.25  # seconds
 
+        # Live dashboard preview (VISION Phase 7). Captured only while someone
+        # is watching (tracker.has_subscribers) and throttled to ~11 Hz — the
+        # render loop runs faster than the dashboard needs, so we don't pay the
+        # downsample cost on every frame. The composed strip is downsampled from
+        # the final sent frame (so strobe/cross-fade show); the per-layer rows
+        # come from the mapper's layer_preview().
+        self._PREVIEW_INTERVAL = 0.09  # seconds between preview captures
+        self._last_preview_at = 0.0
+        self._preview_strip: list = []
+        self._preview_layers: dict | None = None
+
     def run(self):
         self._active = True
         last_frame_time = time.perf_counter()
@@ -431,6 +442,12 @@ class RenderThread(threading.Thread):
             # Brightness baked into mapper output (Phase 2)
             brightness = self._settings.brightness / 255.0
 
+            # Live-preview gate: only capture when the dashboard is open and the
+            # throttle interval has elapsed, so the mapper does the per-layer
+            # downsample only when it will actually be shown.
+            want_preview = (self._tracker.has_subscribers and
+                            (frame_start - self._last_preview_at) >= self._PREVIEW_INTERVAL)
+
             # Render pixels
             reverse = self._settings.direction == "reverse"
             pixel_data = self._mapper.render(
@@ -441,6 +458,7 @@ class RenderThread(threading.Thread):
                 reverse=reverse,
                 zone_cell_levels=self._engine.zone_cell_levels,
                 motion_sources=self._engine.motion_sources,
+                preview=want_preview,
             )
 
             # Apply strobe (replace with pre-allocated black)
@@ -488,8 +506,18 @@ class RenderThread(threading.Thread):
             self._tracker.on_render(self._engine.zones,
                                     self._engine.strobe_rate,
                                     self._engine.bpm,
-                                    ddp_sent=ddp_sent)
+                                    ddp_sent=ddp_sent,
+                                    beat_phase=effects.get("beat_phase", 0.0),
+                                    bar_beat=effects.get("bar_beat", 0))
             self._frames_rendered += 1
+
+            # Live preview: downsample the frame actually sent (captures strobe
+            # blackout and cross-fade) and grab the mapper's per-layer rows.
+            if want_preview:
+                self._preview_strip = LEDMapper.downsample_rgb(
+                    pixel_data, MAPPED_REGION, PREVIEW_CELLS)
+                self._preview_layers = self._mapper.layer_preview()
+                self._last_preview_at = frame_start
 
             # Rolling stats
             frame_end = time.perf_counter()
@@ -519,6 +547,17 @@ class RenderThread(threading.Thread):
 
     def stop(self):
         self._active = False
+
+    def preview_snapshot(self) -> dict | None:
+        """Latest live strip + per-layer preview for the dashboard, or None if
+        nothing has been captured yet (no one watching)."""
+        if not self._preview_strip:
+            return None
+        return {
+            "cells": PREVIEW_CELLS,
+            "strip": self._preview_strip,
+            "layers": self._preview_layers["layers"] if self._preview_layers else [],
+        }
 
     def render_stats(self) -> dict:
         """Rolling timing stats for diagnostics / status page."""
