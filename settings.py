@@ -170,6 +170,11 @@ EFFECT_TOGGLES = {
         "description": "Venue film colour grades (sepia, B&W, channel tints…).",
         "key": "post_processing", "off": 0,
     },
+    "camera_cut": {
+        "label": "Camera Cuts",
+        "description": "Bias the wash toward the on-camera player + a directed-cut accent.",
+        "key": "camera", "off": None,
+    },
 }
 
 DEFAULT_SETTINGS = {

@@ -121,6 +121,51 @@ PERFORMER_COLORS = {
 }
 PERFORMER_BIAS_STRENGTH = 0.18   # max blend toward the highlighted hue
 
+# ── Camera-cut lighting (VISION Phase 5) ─────────────────────────
+# The venue camera's current subject biases the wash toward that player: a
+# gentle brightness lift + hue lean confined to the player's *region* of the
+# strip, so you can read who the camera is on. A directed cut adds a brief
+# global bloom on top.
+#
+# A subject maps to a logical player "channel"; a channel maps to a physical
+# region. Today every channel tiles ONE strip in CAMERA_CHANNEL_ORDER (drums
+# leftmost, vocals rightmost). That order is deliberate: a future multi-strip
+# rig — planned as a quad — can bookend with the drum and vocal strips and put
+# the other instruments between, by swapping only _camera_region(); the subject→
+# channel table, hues, and bias maths stay put.
+CAMERA_CHANNEL_ORDER = ("drums", "guitar", "bass", "keys", "vocals")
+
+# Per-channel hues reuse the Performer palette so the two features read the same.
+CAMERA_CHANNEL_COLORS = {
+    "drums":  PERFORMER_COLORS[Performer.DRUMS],
+    "guitar": PERFORMER_COLORS[Performer.GUITAR],
+    "bass":   PERFORMER_COLORS[Performer.BASS],
+    "keys":   PERFORMER_COLORS[Performer.KEYBOARD],
+    "vocals": PERFORMER_COLORS[Performer.VOCALS],
+}
+
+# Which channel(s) each camera subject features (CameraCutSubject id → names).
+# Whole-stage / crowd / "everyone-but" / random shots carry no single-subject
+# bias and are simply absent here (→ no region bias, just any cut accent).
+CAMERA_SUBJECT_CHANNELS = {
+    7: ("guitar",), 8: ("guitar",), 9: ("guitar",), 10: ("guitar",),
+    11: ("drums",), 12: ("drums",), 13: ("drums",), 14: ("drums",), 15: ("drums",),
+    16: ("bass",), 17: ("bass",), 18: ("bass",), 19: ("bass",),
+    20: ("vocals",), 21: ("vocals",), 22: ("vocals",),
+    23: ("keys",), 24: ("keys",), 25: ("keys",), 26: ("keys",),
+    27: ("drums", "vocals"), 28: ("bass", "drums"), 29: ("drums", "guitar"),
+    30: ("bass", "vocals"), 31: ("bass", "vocals"),
+    32: ("guitar", "vocals"), 33: ("guitar", "vocals"),
+    34: ("keys", "vocals"), 35: ("keys", "vocals"),
+    36: ("bass", "guitar"), 37: ("bass", "guitar"),
+    38: ("bass", "keys"), 39: ("bass", "keys"),
+    40: ("guitar", "keys"), 41: ("guitar", "keys"),
+}
+
+CAMERA_BIAS_STRENGTH = 0.22   # max hue lean toward the on-camera player's colour
+CAMERA_BIAS_LIFT = 0.12       # max brightness lift on that player's region
+CAMERA_CUT_LIFT = 0.18        # directed-cut bloom: peak brightness lift, lit px
+
 # ── Post-processing colour grades (VISION Phase 4) ───────────────
 # YARG's venue post-processing (offset 35) is a film grade. We apply only the
 # *colour* ones as a global palette modifier on lit pixels — the spatial/camera
@@ -241,6 +286,17 @@ class LEDMapper:
         return max(0, mid - half), min(MAPPED_REGION, mid + half)
 
     @staticmethod
+    def _camera_region(idx: int) -> tuple[int, int]:
+        """(lo, hi) strip region owned by camera channel `idx` today.
+
+        Even tiling of the mapped strip in CAMERA_CHANNEL_ORDER (single-strip
+        layout). This is the one place a future multi-strip rig changes: map the
+        channel to a whole strip instead of a slice.
+        """
+        n = len(CAMERA_CHANNEL_ORDER)
+        return MAPPED_REGION * idx // n, MAPPED_REGION * (idx + 1) // n
+
+    @staticmethod
     def _mask_outside(buf: bytearray, lo: int, hi: int):
         """Zero all pixels outside [lo, hi)."""
         for i in range(lo):
@@ -323,6 +379,11 @@ class LEDMapper:
         # Post-processing grade (Phase 4): venue film grade byte. Only the
         # colour grades in POST_GRADES do anything; others pass through.
         post_grade = POST_GRADES.get(effects.get("post_processing", 0))
+
+        # Camera cut (Phase 5): (subject_id, bias_gain, cut_t) or None. The
+        # subject biases its player's strip region/hue (eased in by bias_gain
+        # after a cut); cut_t is a brief directed-cut bloom. None = toggled off.
+        camera = effects.get("camera", None)
 
         # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
         sp_active = effects.get("sp_active", False)
@@ -863,6 +924,46 @@ class LEDMapper:
                         buf[o]     = int(buf[o] * inv_t + tr_t)
                         buf[o + 1] = int(buf[o + 1] * inv_t + tg_t)
                         buf[o + 2] = int(buf[o + 2] * inv_t + tb_t)
+
+        # ── Effect: Camera-cut lighting (Phase 5) ────────────────
+        # Bias the wash toward the on-camera player: within that player's region
+        # of the strip, lift brightness a touch and lean the hue toward its
+        # colour — a gentle convex MIX on lit pixels only (never lifts a
+        # blackout), eased in by bias_gain so the band doesn't snap as the
+        # director cuts. A directed cut adds a short global bloom (cut_t) on top.
+        # Regions are disjoint slices, so multi-channel shots (e.g. GuitarVocals)
+        # tint two bands without double-painting.
+        if camera is not None:
+            subject, bias_gain, cut_t = camera
+            channels = CAMERA_SUBJECT_CHANNELS.get(subject)
+            if channels and bias_gain > 0.0:
+                lift = 1.0 + CAMERA_BIAS_LIFT * bias_gain
+                t = CAMERA_BIAS_STRENGTH * bias_gain
+                inv_t = 1.0 - t
+                for name in channels:
+                    cr, cg, cb = CAMERA_CHANNEL_COLORS[name]
+                    cr_t, cg_t, cb_t = cr * t, cg * t, cb * t
+                    lo, hi = self._camera_region(CAMERA_CHANNEL_ORDER.index(name))
+                    for i in range(lo, hi):
+                        o = i * 3
+                        if buf[o] | buf[o + 1] | buf[o + 2]:
+                            r = int((buf[o] * inv_t + cr_t) * lift)
+                            g = int((buf[o + 1] * inv_t + cg_t) * lift)
+                            b = int((buf[o + 2] * inv_t + cb_t) * lift)
+                            buf[o] = r if r < 255 else 255
+                            buf[o + 1] = g if g < 255 else 255
+                            buf[o + 2] = b if b < 255 else 255
+            if cut_t > 0.0:
+                env = 1.0 + CAMERA_CUT_LIFT * cut_t
+                for i in range(MAPPED_REGION):
+                    o = i * 3
+                    if buf[o] | buf[o + 1] | buf[o + 2]:
+                        r = int(buf[o] * env)
+                        g = int(buf[o + 1] * env)
+                        b = int(buf[o + 2] * env)
+                        buf[o] = r if r < 255 else 255
+                        buf[o + 1] = g if g < 255 else 255
+                        buf[o + 2] = b if b < 255 else 255
 
         # ── Effect: Reveal mask (Intro) ─────────────────────────
         # Pixels light up sequentially from the strip centre outward as

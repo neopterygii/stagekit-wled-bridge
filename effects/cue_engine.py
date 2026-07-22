@@ -11,7 +11,8 @@ effects for a modern LED strip look.
 import asyncio
 import time
 
-from protocol.yarg_packet import CueByte, BeatByte, KeyframeByte, StrobeSpeed
+from protocol.yarg_packet import (
+    CueByte, BeatByte, KeyframeByte, StrobeSpeed, CameraCutPriority)
 from effects.gradient import GRADIENTS
 
 # Bitmask constants matching YALCY
@@ -44,6 +45,10 @@ STROBE_RATES = {
 # Animation durations in seconds (wall-clock, independent of render FPS)
 REVEAL_DURATION = 1.5        # Intro center-out reveal
 BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
+
+# ── Camera-cut lighting (VISION Phase 5) ─────────────────────────
+CAMERA_CUT_DURATION = 0.28   # seconds — one-shot accent decay on a *directed* cut
+CAMERA_EASE = 0.30           # seconds — subject bias fades in over this after a cut
 
 # Note-hold (VISION Phase 4). A YARG note bitmask edge (a fret/pad hit, offsets
 # 14-17) seeds a per-instrument accent that holds for at least a 1/32 note so a
@@ -253,6 +258,15 @@ class CueEngine:
         # the mapper applies the colour-tint ones as a global palette modifier.
         self._post_processing = 0
 
+        # Camera cut (v3 datagram, Phase 5). The subject is sustained state —
+        # it biases the wash toward the on-camera player's strip region + hue.
+        # _camera_changed_at eases that bias in after each cut so the band
+        # doesn't snap as the director cuts; _camera_cut_at arms a brief
+        # one-shot accent, but only on a *directed* cut. -1 = no subject yet.
+        self._camera_subject = -1
+        self._camera_changed_at = 0.0
+        self._camera_cut_at = 0.0
+
         # Beat oscillator: a continuous musical phase synthesized from BPM +
         # beat edges, so motion/colour can be driven off a smooth phase that is
         # quantised to but continuous *within* the beat (LedFx's beat/bar
@@ -349,6 +363,8 @@ class CueEngine:
         fx["vocal_notes"] = self._vocal_notes
         fx["performers"] = self._spotlight | self._singalong
         fx["post_processing"] = self._post_processing
+        fx["camera"] = (self._camera_subject,
+                        self._camera_gain(now), self._camera_accent(now))
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -677,6 +693,41 @@ class CueEngine:
         """Store the venue post-processing grade byte (Phase 4)."""
         self._post_processing = post_processing
 
+    def on_camera_cut(self, subject: int, priority: int,
+                      now: float | None = None):
+        """Camera-cut lighting (Phase 5).
+
+        Called on each *change* of camera subject. The subject is stored as
+        sustained state — the mapper biases the wash toward that player's strip
+        region + hue — and the change time arms a short bias ease-in so the band
+        fades rather than snaps. A *directed* cut (priority Directed) also arms a
+        brief one-shot accent; the constant auto-cuts (priority Normal) update
+        the subject silently. *now* is injectable for tests; production passes
+        None.
+        """
+        if now is None:
+            now = time.monotonic()
+        self._camera_subject = subject
+        self._camera_changed_at = now
+        if priority == CameraCutPriority.DIRECTED:
+            self._camera_cut_at = now
+
+    def _camera_accent(self, now: float) -> float:
+        """Directed-cut accent 1.0 → 0.0; 0.0 = expired or never fired."""
+        if self._camera_cut_at <= 0.0:
+            return 0.0
+        rem = self._camera_cut_at + CAMERA_CUT_DURATION - now
+        if rem <= 0.0:
+            return 0.0
+        return rem / CAMERA_CUT_DURATION
+
+    def _camera_gain(self, now: float) -> float:
+        """Subject-bias ease-in 0.0 → 1.0 over CAMERA_EASE after a cut."""
+        if self._camera_changed_at <= 0.0:
+            return 0.0
+        t = (now - self._camera_changed_at) / CAMERA_EASE
+        return t if t < 1.0 else 1.0
+
     def _note_accents(self, now: float) -> list[float]:
         """Current decayed note-hold level per instrument (0.0 = none)."""
         out = [0.0, 0.0, 0.0, 0.0]
@@ -730,6 +781,10 @@ class CueEngine:
                 self._bonus_until += delta
             if self._beat_at > 0.0:
                 self._beat_at += delta
+            if self._camera_cut_at > 0.0:
+                self._camera_cut_at += delta
+            if self._camera_changed_at > 0.0:
+                self._camera_changed_at += delta
         self.paused = paused
 
     def on_cue(self, cue_byte: int):

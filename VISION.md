@@ -45,7 +45,7 @@ Every field, and what it should drive. **Bold** = implemented today.
 | **BonusEffect (40)** | one-shot big moment | **white celebration burst** (`bonus_t`) |
 | **Paused (7) / Scene (6)** | game state | **pause dim + motion freeze**; scene shown on status page |
 | **Star power (47+, v4)** | per-player overdrive amount + active | **charging cool tint → active "surge"** (lift + cool blend + shimmer) |
-| **Camera cut (44–46, v3)** | who the camera is on + priority | *parsed & shown on status page*; future: subtle subject color/region bias + a cut accent |
+| **Camera cut (44–46, v3)** | who the camera is on + priority | **subject region + hue bias** (eased in per cut, lit-pixels only) toward the on-camera player; a **directed cut** adds a brief global bloom; shown on status page |
 | FogState (36) | haze on/off | lower contrast / add a soft blur-glow floor while foggy |
 | **PostProcessing (35)** | 40+ film grades | **apply the color-tint ones** (Desaturated_Blue, Contrast_Red, SepiaTone, B&W…) as a global palette modifier; camera-only grades pass through |
 | **Note bitmasks (14–17)** | per-fret/pad hits | **rising-edge accents with a note-hold min (1/32 note)** so transient hits are visible, painted per-instrument (YALCY DMX) |
@@ -134,8 +134,14 @@ Who does what best, and where it lands in our code:
   **post-processing colour grades** (B&W/sepia/silver/negative/desaturated/
   contrast tints applied as a global palette modifier; camera-only grades pass
   through). See "Current focus" below.
-- [ ] **5. Camera-cut lighting** — subtle subject colour/region bias + a cut
-  accent (data already parsed).
+- [x] **5. Camera-cut lighting** *(implemented on `feat/camera-cut-lighting`)* —
+  the camera subject biases the wash toward the on-camera player's strip region
+  + hue (a gentle brightness lift + convex hue lean on lit pixels only, eased in
+  after each cut so the band doesn't snap), and a *directed* cut adds a brief
+  global bloom; constant auto-cuts move the subject silently. Subjects map to
+  logical player *channels* tiled across the strip (drums…vocals), structured so
+  a future multi-strip rig swaps only `_camera_region()`. One dashboard toggle
+  ("Camera Cuts").
 - [ ] **6. Blur/mirror post-process polish** — the LedFx filter chain.
 - [ ] **7. Status dashboard pass** — evolve the status page (`status_server.py`)
   from a status readout into a live operator dashboard: render/DDP throughput and
