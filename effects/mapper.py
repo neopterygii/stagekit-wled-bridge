@@ -17,7 +17,8 @@ Render pipeline (VISION Phase 3 — layer/slot compositor, see compositor.py):
   5. Surge       — star-power lift/tint + shimmer, on lit pixels; then the
                    vocal pitch ribbon (colour-by-pitch blobs) alpha-over
   6. Masks/pump  — reveal/spotlight masks, beat-locked brightness pulse
-  7. Output      — pause-dim + global brightness, reverse, wrap-around mirror
+  7. Grade       — performer hue bias + post-processing colour grade
+  8. Output      — pause-dim + global brightness, reverse, wrap-around mirror
 
 Independent elements (wash, motion, sparkle, flash, bonus) render into their
 own pre-allocated buffers and are folded together by the Compositor with an
@@ -39,7 +40,7 @@ import time
 from config import LED_COUNT
 from effects.compositor import Layer, Compositor, MIX, MIX_PREMULT
 from effects.gradient import GRADIENTS
-from protocol.yarg_packet import Performer
+from protocol.yarg_packet import Performer, PostProcessing
 
 # Chroma ramp for the vocal ribbon: pitch-class (0..1 across an octave) → hue.
 # The cyclic rainbow makes the octave wrap seamless (C just below the next C is
@@ -119,6 +120,37 @@ PERFORMER_COLORS = {
     Performer.KEYBOARD: (60, 230, 120),   # green
 }
 PERFORMER_BIAS_STRENGTH = 0.18   # max blend toward the highlighted hue
+
+# ── Post-processing colour grades (VISION Phase 4) ───────────────
+# YARG's venue post-processing (offset 35) is a film grade. We apply only the
+# *colour* ones as a global palette modifier on lit pixels — the spatial/camera
+# ones (Bloom, Bright, Posterize, Mirror, Grainy, Scanline geometry, Trails)
+# have no colour meaning on a 1-D strip and are left out (pass-through).
+#
+# Every colour grade is expressed as one tuple (invert, sat, tr, tg, tb) and run
+# by a single loop: optionally invert, desaturate toward luma by (1 - sat), then
+# scale each channel by its tint multiplier. So SepiaTone is "full desaturate +
+# warm channel tint", Desaturated_Blue is "half desaturate + cool tint", etc.
+# Applied to lit pixels only, so a grade never lights a deliberate blackout.
+_PP = PostProcessing
+POST_GRADES = {
+    #                        invert  sat    tr     tg     tb
+    _PP.PHOTO_NEGATIVE:               (True,  1.0,  1.00,  1.00,  1.00),
+    _PP.PHOTO_NEGATIVE_RED_AND_BLACK: (True,  0.0,  1.10,  0.35,  0.35),
+    _PP.BLACK_AND_WHITE:              (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.CHOPPY_BLACK_AND_WHITE:       (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.POLARIZED_BLACK_AND_WHITE:    (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.SCANLINES_BLACK_AND_WHITE:    (False, 0.0,  1.00,  1.00,  1.00),
+    _PP.SEPIA_TONE:                   (False, 0.0,  1.12,  0.92,  0.62),
+    _PP.SILVER_TONE:                  (False, 0.0,  0.98,  1.00,  1.08),
+    _PP.POLARIZED_RED_AND_BLUE:       (False, 0.2,  1.15,  0.60,  1.15),
+    _PP.DESATURATED_BLUE:             (False, 0.45, 0.82,  0.90,  1.15),
+    _PP.DESATURATED_RED:              (False, 0.45, 1.15,  0.85,  0.82),
+    _PP.TRAILS_DESATURATED:           (False, 0.50, 1.00,  1.00,  1.00),
+    _PP.CONTRAST_RED:                 (False, 0.9,  1.18,  0.82,  0.82),
+    _PP.CONTRAST_GREEN:               (False, 0.9,  0.82,  1.18,  0.82),
+    _PP.CONTRAST_BLUE:                (False, 0.9,  0.82,  0.82,  1.18),
+}
 
 
 class LEDMapper:
@@ -287,6 +319,10 @@ class LEDMapper:
         # Performer highlight (Phase 4): union of spotlight+singalong bitmasks.
         # Biases lit pixels toward the highlighted performers' colours.
         performers = effects.get("performers", 0)
+
+        # Post-processing grade (Phase 4): venue film grade byte. Only the
+        # colour grades in POST_GRADES do anything; others pass through.
+        post_grade = POST_GRADES.get(effects.get("post_processing", 0))
 
         # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
         sp_active = effects.get("sp_active", False)
@@ -857,6 +893,38 @@ class LEDMapper:
                         buf[o] = r if r < 255 else 255
                         buf[o + 1] = g if g < 255 else 255
                         buf[o + 2] = b if b < 255 else 255
+
+        # ── Effect: Post-processing colour grade (Phase 4) ───────
+        # Global palette modifier from the venue film grade. One loop handles
+        # every grade: optional invert, desaturate toward luma by (1 - sat),
+        # then per-channel tint. Lit pixels only — a grade never lifts a
+        # blackout. Runs last (after masks/pulse) so it grades the final look.
+        if post_grade is not None:
+            invert, sat, tr, tg, tb = post_grade
+            inv_sat = 1.0 - sat
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                r = buf[o]
+                g = buf[o + 1]
+                b = buf[o + 2]
+                if not (r | g | b):
+                    continue
+                if invert:
+                    r = 255 - r
+                    g = 255 - g
+                    b = 255 - b
+                if inv_sat > 0.0:
+                    # luma ≈ 0.30R + 0.59G + 0.11B (integer weights /256)
+                    luma = (r * 77 + g * 150 + b * 29) >> 8
+                    r = int(r * sat + luma * inv_sat)
+                    g = int(g * sat + luma * inv_sat)
+                    b = int(b * sat + luma * inv_sat)
+                r = int(r * tr)
+                g = int(g * tg)
+                b = int(b * tb)
+                buf[o]     = r if r < 255 else 255
+                buf[o + 1] = g if g < 255 else 255
+                buf[o + 2] = b if b < 255 else 255
 
         # ── Apply brightness + write to output buffer ────────────
         # Pause dims everything to 35% so the strip doesn't go fully dark

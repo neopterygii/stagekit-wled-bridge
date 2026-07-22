@@ -237,6 +237,10 @@ class CueEngine:
         self._spotlight = 0
         self._singalong = 0
 
+        # Post-processing grade (Phase 4). The venue film grade (offset 35);
+        # the mapper applies the colour-tint ones as a global palette modifier.
+        self._post_processing = 0
+
         # Beat oscillator: a continuous musical phase synthesized from BPM +
         # beat edges, so motion/colour can be driven off a smooth phase that is
         # quantised to but continuous *within* the beat (LedFx's beat/bar
@@ -332,6 +336,7 @@ class CueEngine:
         fx["note_accents"] = self._note_accents(now)
         fx["vocal_notes"] = self._vocal_notes
         fx["performers"] = self._spotlight | self._singalong
+        fx["post_processing"] = self._post_processing
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -635,6 +640,10 @@ class CueEngine:
         """
         self._spotlight = spotlight
         self._singalong = singalong
+
+    def on_post_processing(self, post_processing: int):
+        """Store the venue post-processing grade byte (Phase 4)."""
+        self._post_processing = post_processing
 
     def _note_accents(self, now: float) -> list[float]:
         """Current decayed note-hold level per instrument (0.0 = none)."""

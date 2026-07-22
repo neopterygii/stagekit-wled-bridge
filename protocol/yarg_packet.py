@@ -152,6 +152,50 @@ class Performer:
     KEYBOARD = 16
 
 
+class PostProcessing:
+    """Venue post-processing grade (offset 35).
+
+    The wire byte is YARG's `PostProcessingType` cast to a byte
+    (DataStreamController writes `(byte) message.PostProcessing`). The values
+    below are 0-indexed sequential, matching YALCY's canonical `PostProcessingByte`
+    enum — the reference receiver reads the same offset we do. (Not the spread
+    0/4/14…255 numbering in YARG's sACN interpreter, which is a separate DMX-only
+    mapping.) The bridge only acts on the colour-tint grades (see mapper
+    POST_GRADES); camera-only grades — Bloom/Bright/Posterize/Mirror/Grainy/
+    Scanlines geometry/Trails — carry no colour change and pass through.
+    """
+    DEFAULT = 0
+    BLOOM = 1
+    BRIGHT = 2
+    CONTRAST = 3
+    POSTERIZE = 4
+    PHOTO_NEGATIVE = 5
+    MIRROR = 6
+    BLACK_AND_WHITE = 7
+    SEPIA_TONE = 8
+    SILVER_TONE = 9
+    CHOPPY_BLACK_AND_WHITE = 10
+    PHOTO_NEGATIVE_RED_AND_BLACK = 11
+    POLARIZED_BLACK_AND_WHITE = 12
+    POLARIZED_RED_AND_BLUE = 13
+    DESATURATED_BLUE = 14
+    DESATURATED_RED = 15
+    CONTRAST_RED = 16
+    CONTRAST_GREEN = 17
+    CONTRAST_BLUE = 18
+    GRAINY_FILM = 19
+    GRAINY_CHROMATIC_ABBERATION = 20
+    SCANLINES = 21
+    SCANLINES_BLACK_AND_WHITE = 22
+    SCANLINES_BLUE = 23
+    SCANLINES_SECURITY = 24
+    TRAILS = 25
+    TRAILS_LONG = 26
+    TRAILS_DESATURATED = 27
+    TRAILS_FLICKERY = 28
+    TRAILS_SPACEY = 29
+
+
 class CameraCutPriority:
     """Camera-cut priority (offset 45)."""
     NORMAL = 0

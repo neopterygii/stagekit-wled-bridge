@@ -107,6 +107,10 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # bitmasks bias the wash toward the featured performers' colours.
         self.engine.on_performers(pkt.spotlight, pkt.singalong)
 
+        # Post-processing (Phase 4) — venue film grade; the mapper applies the
+        # colour-tint grades as a global palette modifier.
+        self.engine.on_post_processing(pkt.post_processing)
+
         # Bonus FX flag — one-frame celebration burst on the strip.
         if pkt.bonus_effect:
             self.engine.on_bonus()
