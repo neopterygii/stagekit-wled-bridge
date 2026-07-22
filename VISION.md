@@ -113,64 +113,67 @@ Who does what best, and where it lands in our code:
   gradient palettes recoloured onto the strip with a beat-locked scroll (demo:
   VERSE); BPM-synced chases hard-locked to the beat via a smooth PLL that coasts
   through dropped beats.
-- [x] **2. Continuous sub-pixel scanner rendering** *(implemented on
-  `feat/sub-pixel-scanner`, not yet merged)* — motion cues paint a soft
-  triangular profile at a continuous float position; peak and width stay
-  constant while the head glides pixel-by-pixel. See "Current focus" below.
-- [ ] **3. Layer/slot compositor** — restructure the mapper so overlays
-  (wash / motion / strobe / star-power) compose cleanly.
+- [x] **2. Continuous sub-pixel scanner rendering** *(merged to main)* — motion
+  cues paint a soft triangular profile at a continuous float position; peak and
+  width stay constant while the head glides pixel-by-pixel.
+- [x] **3. Layer/slot compositor** *(implemented on `feat/layer-compositor`)* —
+  independent elements (wash, motion, sparkle, flash, bonus) render into their
+  own pre-allocated buffers and are folded together by a `Compositor` with
+  explicit blend modes (REPLACE / ADD / MIX / MIX_LIT / MIX_PREMULT); the
+  whitening accents compose convexly in one pass, so overlapping overlays
+  screen-combine instead of clip-fighting in a shared buffer. Whole-image
+  modifiers (breathing, glitch, surge, masks, beat-pulse, brightness) stay as
+  ordered transforms. See "Current focus" below.
 - [ ] **4. Note-hold + performer/vocal reactivity + post-processing colour
   tints** — use the already-parsed-but-unused signals (notes 14–17, vocals
   18–33, spotlight/singalong 42–43, post-processing 35).
 - [ ] **5. Camera-cut lighting** — subtle subject colour/region bias + a cut
   accent (data already parsed).
 - [ ] **6. Blur/mirror post-process polish** — the LedFx filter chain.
+- [ ] **7. Status dashboard pass** — evolve the status page (`status_server.py`)
+  from a status readout into a live operator dashboard: render/DDP throughput and
+  stall stats, per-signal telemetry (cue, BPM, beat clock, strobe, star power,
+  camera subject, section), and a live strip / per-layer preview. Read-only,
+  driven off the data the tracker and engine already expose.
 
-## Current focus — Phase 2: continuous sub-pixel scanner
+## Current focus — Phase 3: layer/slot compositor
 
-**Problem (established empirically 2026-07-21).** Chases aren't fluid. The
-scanner is modelled as 8 StageKit cells → 8 fixed 15-LED blocks (at
-LED_COUNT=120), and motion is a *linear brightness crossfade between whole
-blocks*. Measured:
-- Cell-aligned frame: one 15-LED block at full brightness (peak **255**).
-- Mid-transition frame: **two** adjacent blocks each at 50% → peak drops to
-  **127** and the lit width balloons **15 → 30 LEDs**, then sharpens back.
-- Position is quantised to 15-LED block boundaries — it never glides
-  pixel-by-pixel.
+**Problem.** `LEDMapper.render()` was a flat pass-chain: one shared RGB buffer
+that ~13 effects read and overwrote in a fixed order. When several *overlays*
+were active at once — star-power lift + beat-pulse + bonus burst + sparkle —
+they stacked in code order and each clamped independently, so bright frames
+clipped to white in an order-dependent way ("overlays fighting inside one flat
+buffer"). Whitening accents were the worst offenders: three sequential
+blend-toward-white passes over-whitened a lit pixel until its wash colour was
+lost.
 
-So a moving scanner *throbs and smears* (peak −50%, width 2×, every handoff)
-instead of gliding. Affects **all** chases (timed and beat-locked); MENU just
-exposes it (slow, isolated single scanner). Note the beat-lock PLL already
-computes a **continuous float `pos`** per pattern, but the render path
-immediately quantises it back to `int(step)` + a cell crossfade — the precision
-exists and is thrown away.
-
-**The fix (implemented).** A motion renderer paints a soft triangular profile
-centred at a *continuous float position* on the pixel array — gliding
-pixel-by-pixel with constant peak and width, decoupled from the 8-cell grid
-(the LedFx `scan.py` model). The cell/zone model is kept for StageKit-authentic
-*static* cues; *motion* cues (scanners/chases/comets) are expressed as
-**position + profile + width**, fed by the `pos`/`beat_clock` the engine already
-computes.
+**The fix (implemented, `feat/layer-compositor`).** A small compositor
+(`effects/compositor.py`): each independent element renders into its own
+pre-allocated buffer — a `Layer` — and `Compositor.composite()` folds the active
+layers together with an explicit blend mode + opacity (REPLACE / ADD / MIX /
+MIX_LIT / MIX_PREMULT). The key property: **MIX is convex**, so stacking two
+MIX-toward-white layers screen-combines (`t = 1-(1-t₁)(1-t₂)`) and can never
+overshoot 255 — the whitening accents stop clipping and the fold is
+order-independent.
 
 How it fits together:
-- `_TimePattern.motion_heads(cur, nxt, progress)` turns the continuous pattern
-  position into gliding "heads" — one per lit StageKit cell, matched between
-  steps by the least-travel cyclic rotation and interpolated along the shorter
-  way round the ring (so a 7→0 hop moves +1, not −7).
-- `CueEngine.tick` builds `motion_sources` (a flat `(zone, cell_pos, level)`
-  list) each frame and **zeros the cell levels of motion-owned zones**, so the
-  two render models never double-paint.
-- `LEDMapper.render` paints each head as a triangular profile (half-width = one
-  cell) into a motion layer, accumulating colour additively and coverage as an
-  alpha, then alpha-composites that layer over the static base. Adjacent heads
-  form a partition of unity (tiled chases fill with no dark seam), crossing
-  scanners mix colour, and a lone scanner keeps a soft falloff over any wash.
+- Layers: **wash** (zone→pixel base, REPLACE) → **motion** (scanner heads,
+  MIX_PREMULT — the Phase-2 premultiplied alpha-over, unchanged) → **accents**
+  (sparkle per-pixel + initial-flash + bonus, all convex MIX toward white,
+  composited in ONE pass).
+- Transforms (whole-image, kept as ordered in-place passes because they aren't
+  independent colour sources): gradient recolour, decay trails, gradient-boundary
+  blend, breathing, glitch, star-power lift/tint + shimmer, reveal/spotlight
+  masks, beat-pulse, pause-dim + brightness, reverse, wrap-around mirror.
+- Strobe stays the top-level black-frame gate in `main.py` (a possible future
+  "top layer").
 
-Verified: the MENU scanner holds peak ≈245 (was 255→127) and width ≈one cell
-(was 15→30) while gliding; a beat-locked CHORUS chase glides with <0.02 px/frame
-centroid jitter; the tiled BigRockEnding chase has no dark seams. Tests:
-`tests/test_scanner.py`. Branch: `feat/sub-pixel-scanner`.
+Hot-path discipline preserved: all layer buffers/alpha arrays allocated once;
+inactive layers skipped by a dirty flag. Verified: all Phase-2 scanner invariants
+hold (`tests/test_scanner.py`), stacked whitening screen-combines and stays
+bounded / order-independent (`tests/test_compositor.py`), and a bench of the
+heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
+≈342 µs/frame — a touch faster, three accent passes became one composite).
 
 ## Status (implemented today, on main)
 - 33 lighting cues → zone/effect patterns; software strobe; beat flash/sparkle/
@@ -183,5 +186,7 @@ centroid jitter; the tiled BigRockEnding chase has no dark seams. Tests:
   on-beat brightness pump (CHORUS, BigRockEnding); phase-locked chase motion
   (smooth PLL + free-run fallback); eased gradient palettes with beat-locked
   scroll (`effects/gradient.py`; demo on VERSE).
-- Everything above under "Current focus" and the later roadmap phases is
-  **future work**.
+- **Phase 2 (merged):** continuous sub-pixel scanner rendering
+  (`tests/test_scanner.py`).
+- **Phase 3 (`feat/layer-compositor`):** the layer/slot compositor above.
+- The later roadmap phases (4–7) are **future work**.
