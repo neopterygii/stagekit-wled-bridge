@@ -134,7 +134,7 @@ Who does what best, and where it lands in our code:
   **post-processing colour grades** (B&W/sepia/silver/negative/desaturated/
   contrast tints applied as a global palette modifier; camera-only grades pass
   through). See "Current focus" below.
-- [x] **5. Camera-cut lighting** *(implemented on `feat/camera-cut-lighting`)* —
+- [x] **5. Camera-cut lighting** *(merged to main)* —
   the camera subject biases the wash toward the on-camera player's strip region
   + hue (a gentle brightness lift + convex hue lean on lit pixels only, eased in
   after each cut so the band doesn't snap), and a *directed* cut adds a brief
@@ -142,8 +142,8 @@ Who does what best, and where it lands in our code:
   logical player *channels* tiled across the strip (drums…vocals), structured so
   a future multi-strip rig swaps only `_camera_region()`. One dashboard toggle
   ("Camera Cuts").
-- [x] **6. Blur/mirror post-process polish** *(implemented on
-  `feat/blur-mirror-postprocess`)* — an LedFx-style filter chain on the composed
+- [x] **6. Blur/mirror post-process polish** *(merged to main)* — an
+  LedFx-style filter chain on the composed
   frame just before brightness, in the documented order **blur → mirror(max) →
   brightness → background**. A light 1-D Gaussian **blur** (two passes of a
   [1,2,1]/4 kernel, wet-mixed by strength) bleeds light into dark neighbours so
@@ -157,7 +157,7 @@ Who does what best, and where it lands in our code:
   switch for free from the registry-driven grid, and blur adds a **Blur Amount
   slider** (persisted `blur_amount` setting → `CueEngine.set_blur_base()`) so the
   base strength can be dialled live against the real strip — fog stacks on top.
-- [~] **7. Status dashboard pass** *(in progress on `feat/status-dashboard`)* —
+- [x] **7. Status dashboard pass** *(merged to main)* —
   evolve the status page (`status_server.py`)
   from a status readout into a live operator dashboard: render/DDP throughput and
   stall stats, per-signal telemetry (cue, BPM, beat clock, strobe, star power,
@@ -285,4 +285,11 @@ heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
 - **Phase 4 (`feat/note-vocal-reactivity`):** note-hold accents, vocal pitch
   ribbon, performer highlight bias, and post-processing colour grades — the four
   parsed-but-unused signal groups now drive light (see "Current focus" above).
-- The later roadmap phases (5–7) are **future work**.
+- **Phase 5 (merged):** camera-cut lighting (`tests/test_camera_cut.py`).
+- **Phase 6 (merged):** blur/mirror post-process polish + fog-lifted blur
+  (`tests/test_blur_mirror.py`).
+- **Phase 7 (merged):** live strip / per-layer / beat-clock dashboard preview
+  (`tests/test_preview.py`). Remaining dashboard backlog (not yet built): richer
+  per-signal telemetry cards and a dedicated song-section readout.
+- Roadmap phases 0–7 are all **merged to main**. The live Tower container still
+  needs a re-pull/recreate to run anything past Phase 2 (see deploy note).
