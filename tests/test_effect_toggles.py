@@ -34,9 +34,10 @@ def test_all_toggles_default_on():
     assert all(s.effect_enabled(tid) for tid in EFFECT_TOGGLES)
 
 
-def test_registry_covers_the_four_phase4_layers():
+def test_registry_covers_the_reactive_layers():
     assert set(EFFECT_TOGGLES) == {
-        "note_accents", "vocal_ribbon", "performer_bias", "post_processing"}
+        "note_accents", "vocal_ribbon", "performer_bias", "post_processing",
+        "camera_cut"}
     # Every entry carries the UI + gating metadata the framework relies on.
     for meta in EFFECT_TOGGLES.values():
         assert {"label", "description", "key", "off"} <= set(meta)

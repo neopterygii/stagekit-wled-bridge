@@ -124,9 +124,11 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.engine.on_star_power(
             pkt.sp_active, pkt.sp_amount, pkt.sp_charge, pkt.sp_active_count)
 
-        # Camera cut (v3) — parse-only for now: surface the subject on the
-        # status page on change; not yet wired into lighting.
+        # Camera cut (v3, Phase 5) — on a subject change, bias the wash toward
+        # the on-camera player (region + hue) and, on a directed cut, fire a
+        # brief accent. Also surfaced on the status page.
         if pkt.camera_cut_subject != self._last_camera_subject:
+            self.engine.on_camera_cut(pkt.camera_cut_subject, pkt.camera_cut_priority)
             self.tracker.on_camera_cut(pkt.camera_cut_subject, pkt.camera_cut_priority)
             self._last_camera_subject = pkt.camera_cut_subject
 
