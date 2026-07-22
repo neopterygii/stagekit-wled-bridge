@@ -226,6 +226,11 @@ class CueEngine:
         self._note_dur = [0.0, 0.0, 0.0, 0.0]
         self._note_level = [0.0, 0.0, 0.0, 0.0]
 
+        # Vocal/harmony pitch (Phase 4). MIDI pitch per voice (lead + 3
+        # harmonies), 0.0 = no note sounding. Passed straight to the mapper,
+        # which paints a colour-by-pitch "ribbon" blob per active voice.
+        self._vocal_notes = [0.0, 0.0, 0.0, 0.0]
+
         # Beat oscillator: a continuous musical phase synthesized from BPM +
         # beat edges, so motion/colour can be driven off a smooth phase that is
         # quantised to but continuous *within* the beat (LedFx's beat/bar
@@ -319,6 +324,7 @@ class CueEngine:
         fx["bar_beat"] = self._bar_beat
         fx["beat_clock"] = self.beat_clock(now)
         fx["note_accents"] = self._note_accents(now)
+        fx["vocal_notes"] = self._vocal_notes
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -603,6 +609,16 @@ class CueEngine:
                 self._note_until[i] = now + dur
                 self._note_dur[i] = dur
                 self._note_level[i] = min(1.0, 0.55 + 0.15 * new_bits.bit_count())
+
+    def on_vocals(self, vocal: float, harmony0: float, harmony1: float,
+                  harmony2: float):
+        """Store the current vocal + harmony MIDI pitches (Phase 4).
+
+        0.0 means no note is sounding for that voice. Sustained state read by
+        the mapper each frame; atomic rebind (a fresh list) so the render thread
+        never sees a half-updated set.
+        """
+        self._vocal_notes = [vocal, harmony0, harmony1, harmony2]
 
     def _note_accents(self, now: float) -> list[float]:
         """Current decayed note-hold level per instrument (0.0 = none)."""

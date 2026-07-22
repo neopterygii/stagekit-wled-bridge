@@ -14,7 +14,8 @@ Render pipeline (VISION Phase 3 — layer/slot compositor, see compositor.py):
   4. Accents     — sparkle + initial-flash + bonus + note-hold, each a convex
                    whitening layer, composited together in ONE pass so they
                    can't clip-fight in a shared buffer (the Phase-3 fix)
-  5. Surge       — star-power lift/tint + shimmer, on lit pixels
+  5. Surge       — star-power lift/tint + shimmer, on lit pixels; then the
+                   vocal pitch ribbon (colour-by-pitch blobs) alpha-over
   6. Masks/pump  — reveal/spotlight masks, beat-locked brightness pulse
   7. Output      — pause-dim + global brightness, reverse, wrap-around mirror
 
@@ -37,6 +38,12 @@ import time
 
 from config import LED_COUNT
 from effects.compositor import Layer, Compositor, MIX, MIX_PREMULT
+from effects.gradient import GRADIENTS
+
+# Chroma ramp for the vocal ribbon: pitch-class (0..1 across an octave) → hue.
+# The cyclic rainbow makes the octave wrap seamless (C just below the next C is
+# the same red), so a rising/falling line sweeps smoothly through the colours.
+VOCAL_CHROMA = GRADIENTS["rainbow"]
 
 # Zone ordering matches Stage Kit command IDs
 ZONE_NAMES = ["red", "green", "blue", "yellow"]
@@ -86,6 +93,18 @@ SP_SHIMMER_MULTI = 0.5        # extra shimmer per additional active player
 NOTE_ACCENT_MAX = 0.5                          # peak whitening coverage per hit
 NOTE_CELLS_PER_INSTRUMENT = NUM_CELLS // 4     # 2 cells each (gtr|bass|drum|keys)
 
+# ── Vocal pitch ribbon (VISION Phase 4) ──────────────────────────
+# Each sounding voice (lead + 3 harmonies) is painted as a soft colour blob: its
+# position along the strip tracks absolute MIDI pitch (low→left, high→right) and
+# its hue is the pitch *class* (note within the octave) sampled from a chroma
+# ramp — so the same note is always the same colour, an octave apart lands two
+# blobs of one hue at different places. Composited alpha-over the wash so it
+# reads as a translucent ribbon riding the vocal line, not a hard repaint.
+VOCAL_MIDI_LO = 36.0          # C2 — bottom of the mapped vocal range
+VOCAL_MIDI_HI = 84.0          # C6 — top of the mapped vocal range
+VOCAL_HALFWIDTH = max(2, (CELL_SIZE * 3) // 2)  # blob half-width (~1.5 cells)
+VOCAL_LEVEL = 0.7             # peak coverage of a voice blob
+
 
 class LEDMapper:
     """Maps Stage Kit zone bitmask state to an RGB pixel buffer with effects.
@@ -113,6 +132,10 @@ class LEDMapper:
         # Motion (sub-pixel scanner): heads accumulate premultiplied colour +
         # coverage, then alpha-over the static base (MIX_PREMULT).
         self._motion_layer = Layer(MAPPED_REGION, MIX_PREMULT, per_pixel_alpha=True)
+
+        # Vocal ribbon (Phase 4): colour-by-pitch blobs, painted premultiplied
+        # like the motion layer and alpha-over'd onto the scene.
+        self._vocal_layer = Layer(MAPPED_REGION, MIX_PREMULT, per_pixel_alpha=True)
 
         # Accent overlays that brighten toward white — sparkle, initial flash,
         # bonus burst. Each is a constant-white buffer blended by a coverage
@@ -241,6 +264,10 @@ class LEDMapper:
         # Note-hold accents (Phase 4): 4 decayed levels [gtr, bass, drum, keys]
         # or None. Painted as a per-instrument whitening region below.
         note_accents = effects.get("note_accents", None)
+
+        # Vocal ribbon (Phase 4): MIDI pitch per voice [lead, h0, h1, h2] or
+        # None; 0.0 = silent. Painted as colour-by-pitch blobs below.
+        vocal_notes = effects.get("vocal_notes", None)
 
         # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
         sp_active = effects.get("sp_active", False)
@@ -688,6 +715,62 @@ class LEDMapper:
                     buf[o] = int(buf[o] * inv_t + tr * tint_t)
                     buf[o + 1] = int(buf[o + 1] * inv_t + tg * tint_t)
                     buf[o + 2] = int(buf[o + 2] * inv_t + tb * tint_t)
+
+        # ── Effect: Vocal pitch ribbon (Phase 4) ─────────────────
+        # Paint each sounding voice as a soft triangular blob: centre = absolute
+        # pitch mapped along the strip, colour = pitch class from the chroma
+        # ramp. Accumulate premultiplied colour + coverage (like the scanner
+        # heads), then alpha-over the scene — so blobs of the same hue add and
+        # crossing voices blend, but the ribbon never overshoots 255.
+        if vocal_notes is not None:
+            active_voices = False
+            for pitch in vocal_notes:
+                if pitch > 0.0:
+                    active_voices = True
+                    break
+            if active_voices:
+                vlayer = self._vocal_layer
+                vbuf = vlayer.buf
+                valpha = vlayer.alpha
+                for k in range(MAPPED_REGION * 3):
+                    vbuf[k] = 0
+                for i in range(MAPPED_REGION):
+                    valpha[i] = 0.0
+                half = VOCAL_HALFWIDTH
+                inv_half = 1.0 / half
+                span = VOCAL_MIDI_HI - VOCAL_MIDI_LO
+                for pitch in vocal_notes:
+                    if pitch <= 0.0:
+                        continue
+                    pos01 = (pitch - VOCAL_MIDI_LO) / span
+                    if pos01 < 0.0:
+                        pos01 = 0.0
+                    elif pos01 > 1.0:
+                        pos01 = 1.0
+                    center = pos01 * (MAPPED_REGION - 1)
+                    # Hue from pitch class (note within the octave).
+                    cr, cg, cb = VOCAL_CHROMA.color_at((pitch % 12.0) / 12.0)
+                    lo = int(math.ceil(center - half))
+                    hi = int(math.floor(center + half))
+                    if lo < 0:
+                        lo = 0
+                    if hi > MAPPED_REGION - 1:
+                        hi = MAPPED_REGION - 1
+                    for px in range(lo, hi + 1):
+                        d = px - center
+                        if d < 0.0:
+                            d = -d
+                        w = (1.0 - d * inv_half) * VOCAL_LEVEL
+                        if w <= 0.0:
+                            continue
+                        o = px * 3
+                        v = vbuf[o] + int(cr * w);     vbuf[o]     = v if v < 255 else 255
+                        v = vbuf[o + 1] + int(cg * w); vbuf[o + 1] = v if v < 255 else 255
+                        v = vbuf[o + 2] + int(cb * w); vbuf[o + 2] = v if v < 255 else 255
+                        a = valpha[px] + w
+                        valpha[px] = a if a < 1.0 else 1.0
+                vlayer.active = True
+                Compositor.composite(buf, (vlayer,))
 
         # ── Effect: Reveal mask (Intro) ─────────────────────────
         # Pixels light up sequentially from the strip centre outward as

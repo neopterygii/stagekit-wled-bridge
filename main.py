@@ -98,6 +98,11 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.engine.on_notes(pkt.guitar_notes, pkt.bass_notes,
                              pkt.drum_notes, pkt.keys_notes)
 
+        # Vocal ribbon (Phase 4) — lead + harmony MIDI pitches drive a
+        # colour-by-pitch blob per sounding voice.
+        self.engine.on_vocals(pkt.vocal_note, pkt.harmony0_note,
+                              pkt.harmony1_note, pkt.harmony2_note)
+
         # Bonus FX flag — one-frame celebration burst on the strip.
         if pkt.bonus_effect:
             self.engine.on_bonus()
