@@ -18,7 +18,8 @@ Render pipeline (VISION Phase 3 — layer/slot compositor, see compositor.py):
                    vocal pitch ribbon (colour-by-pitch blobs) alpha-over
   6. Masks/pump  — reveal/spotlight masks, beat-locked brightness pulse
   7. Grade       — performer hue bias + post-processing colour grade
-  8. Output      — pause-dim + global brightness, reverse, wrap-around mirror
+  8. Post-proc   — blur (fog-lifted Gaussian smoothing) → mirror(max) fold
+  9. Output      — pause-dim + global brightness, reverse, wrap-around fill
 
 Independent elements (wash, motion, sparkle, flash, bonus) render into their
 own pre-allocated buffers and are folded together by the Compositor with an
@@ -58,6 +59,13 @@ MAPPED_REGION = NUM_CELLS * CELL_SIZE
 
 # Number of pixels on each side of a color boundary to blend over (scales with cell size)
 BLEND_WIDTH = max(1, CELL_SIZE // 6)
+
+# Post-process blur (VISION Phase 6). The engine emits a 0..1 wet strength; the
+# mapper owns the kernel width — BLUR_PASSES iterations of a 3-tap [1,2,1]/4
+# Gaussian on a working copy, wet-mixed back over the crisp buffer. Two passes
+# give a soft ~2-pixel radius that smooths discrete cue events without smearing
+# the strip to mush; edges clamp (replicate) so light bleeds inward, not off.
+BLUR_PASSES = 2
 
 # Sub-pixel scanner (VISION Phase 2). Motion cues are painted as soft triangular
 # intensity profiles at a *continuous* pixel position instead of crossfading
@@ -216,6 +224,11 @@ class LEDMapper:
         # Second working buffer for gradient blending pass
         self._blend = bytearray(MAPPED_REGION * 3)
 
+        # Ping-pong buffers for the post-process blur (Phase 6), pre-allocated
+        # so the per-frame kernel passes never allocate.
+        self._blur_a = bytearray(MAPPED_REGION * 3)
+        self._blur_b = bytearray(MAPPED_REGION * 3)
+
         # ── Compositor layers (VISION Phase 3) ───────────────────
         # Independent elements render into their own buffers and are folded
         # onto the wash by the compositor with explicit blend modes, instead
@@ -310,6 +323,37 @@ class LEDMapper:
             buf[o + 1] = 0
             buf[o + 2] = 0
 
+    def _blur(self, buf: bytearray, wet: float):
+        """Wet-mix a 1-D Gaussian blur of the mapped region into ``buf``.
+
+        BLUR_PASSES iterations of a 3-tap [1,2,1]/4 kernel per channel (edges
+        clamp) build a soft blur on a ping-pong copy, then each channel is
+        lerped back over the crisp buffer by ``wet`` (0 = no change, 1 = fully
+        blurred). Runs on all pixels so lit regions bleed into dark neighbours;
+        an all-black frame blurs to black, so a blackout is never lifted.
+        """
+        if wet <= 0.0:
+            return
+        if wet > 1.0:
+            wet = 1.0
+        n3 = MAPPED_REGION * 3
+        src = self._blur_a
+        dst = self._blur_b
+        src[:n3] = buf[:n3]
+        last = MAPPED_REGION - 1
+        for _ in range(BLUR_PASSES):
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                lo = o if i == 0 else o - 3          # clamp at the left edge
+                ro = o if i == last else o + 3       # clamp at the right edge
+                dst[o]     = (src[lo]     + 2 * src[o]     + src[ro])     >> 2
+                dst[o + 1] = (src[lo + 1] + 2 * src[o + 1] + src[ro + 1]) >> 2
+                dst[o + 2] = (src[lo + 2] + 2 * src[o + 2] + src[ro + 2]) >> 2
+            src, dst = dst, src
+        inv = 1.0 - wet
+        for k in range(n3):
+            buf[k] = int(buf[k] * inv + src[k] * wet)
+
     def render(self, zone_bitmasks: list[int], zone_colors: dict | None = None,
                effects: dict | None = None, brightness: float = 1.0,
                reverse: bool = False,
@@ -384,6 +428,12 @@ class LEDMapper:
         # subject biases its player's strip region/hue (eased in by bias_gain
         # after a cut); cut_t is a brief directed-cut bloom. None = toggled off.
         camera = effects.get("camera", None)
+
+        # Post-process chain (Phase 6). blur is a 0..1 wet strength (0 = off);
+        # mirror folds the strip into a left-right symmetric look. Both applied
+        # in the Output stage in the order blur → mirror → brightness.
+        blur_amount = effects.get("blur", 0.0)
+        mirror = effects.get("mirror", False)
 
         # Star power (v4). sp_active → surge; sp_charge → pre-activation glow.
         sp_active = effects.get("sp_active", False)
@@ -1034,6 +1084,23 @@ class LEDMapper:
                 buf[o]     = r if r < 255 else 255
                 buf[o + 1] = g if g < 255 else 255
                 buf[o + 2] = b if b < 255 else 255
+
+        # ── Post-process chain: blur → mirror(max) → brightness ──
+        # LedFx-style filter chain (Phase 6), on the fully-composed frame just
+        # before brightness. A light Gaussian blur bleeds light into neighbours
+        # so discrete cue events read as smooth stage light; mirror folds the
+        # strip symmetric. Blurring all-black stays black, so a blackout is safe.
+        if blur_amount > 0.0:
+            self._blur(buf, blur_amount)
+        if mirror:
+            half = MAPPED_REGION // 2
+            for i in range(half):
+                o = i * 3
+                p = (MAPPED_REGION - 1 - i) * 3
+                for c in range(3):
+                    m = buf[o + c] if buf[o + c] >= buf[p + c] else buf[p + c]
+                    buf[o + c] = m
+                    buf[p + c] = m
 
         # ── Apply brightness + write to output buffer ────────────
         # Pause dims everything to 35% so the strip doesn't go fully dark

@@ -50,6 +50,14 @@ BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
 CAMERA_CUT_DURATION = 0.28   # seconds — one-shot accent decay on a *directed* cut
 CAMERA_EASE = 0.30           # seconds — subject bias fades in over this after a cut
 
+# ── Blur post-process (VISION Phase 6) ───────────────────────────
+# The engine emits the blur *strength* (0..1 wet mix; the mapper owns the kernel
+# width). A light base is always on so discrete cue events read as smooth stage
+# light; venue fog/haze (parsed at offset 36) lifts it toward a soft blur-glow
+# floor while the haze is up.
+BLUR_BASE = 0.35             # wet mix applied every frame (0 = crisp, 1 = full blur)
+BLUR_FOG_BOOST = 0.30        # extra wet mix while fog_state is on
+
 # Note-hold (VISION Phase 4). A YARG note bitmask edge (a fret/pad hit, offsets
 # 14-17) seeds a per-instrument accent that holds for at least a 1/32 note so a
 # hit living in a single ~88 Hz packet still reads on the strip, then decays.
@@ -258,6 +266,14 @@ class CueEngine:
         # the mapper applies the colour-tint ones as a global palette modifier.
         self._post_processing = 0
 
+        # Fog/haze (offset 36, Phase 6). While the venue haze is up we lift the
+        # post-process blur toward a soft blur-glow floor.
+        self._fog = False
+        # Operator blur strength (dashboard slider, synced from settings each
+        # frame). The always-on base the fog boost stacks on; defaults to
+        # BLUR_BASE so a bare engine (tests) still emits the documented value.
+        self._blur_base = BLUR_BASE
+
         # Camera cut (v3 datagram, Phase 5). The subject is sustained state —
         # it biases the wash toward the on-camera player's strip region + hue.
         # _camera_changed_at eases that bias in after each cut so the band
@@ -365,6 +381,11 @@ class CueEngine:
         fx["post_processing"] = self._post_processing
         fx["camera"] = (self._camera_subject,
                         self._camera_gain(now), self._camera_accent(now))
+        # Post-process chain (Phase 6). blur is a strength the mapper wet-mixes;
+        # mirror is the capability signal — the dashboard toggle gates it (off by
+        # default), so we emit True and let apply_effect_toggles() decide.
+        fx["blur"] = self._blur_base + (BLUR_FOG_BOOST if self._fog else 0.0)
+        fx["mirror"] = True
 
         # Clear transient flags after consumption
         self._beat_flash = False
@@ -692,6 +713,14 @@ class CueEngine:
     def on_post_processing(self, post_processing: int):
         """Store the venue post-processing grade byte (Phase 4)."""
         self._post_processing = post_processing
+
+    def on_fog(self, foggy: bool):
+        """Store venue fog/haze state (Phase 6) — lifts the post-process blur."""
+        self._fog = bool(foggy)
+
+    def set_blur_base(self, amount: float):
+        """Set the operator blur strength (0..1); fog stacks on top of it."""
+        self._blur_base = max(0.0, min(1.0, float(amount)))
 
     def on_camera_cut(self, subject: int, priority: int,
                       now: float | None = None):

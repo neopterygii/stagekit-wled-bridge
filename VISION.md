@@ -142,7 +142,21 @@ Who does what best, and where it lands in our code:
   logical player *channels* tiled across the strip (drums…vocals), structured so
   a future multi-strip rig swaps only `_camera_region()`. One dashboard toggle
   ("Camera Cuts").
-- [ ] **6. Blur/mirror post-process polish** — the LedFx filter chain.
+- [x] **6. Blur/mirror post-process polish** *(implemented on
+  `feat/blur-mirror-postprocess`)* — an LedFx-style filter chain on the composed
+  frame just before brightness, in the documented order **blur → mirror(max) →
+  brightness → background**. A light 1-D Gaussian **blur** (two passes of a
+  [1,2,1]/4 kernel, wet-mixed by strength) bleeds light into dark neighbours so
+  discrete cue events read as smooth stage light; venue **fog/haze** (offset 36,
+  parsed but previously unused) lifts the wet mix toward a soft blur-glow floor
+  while the haze is up. **mirror(max)** folds the strip into a left-right
+  symmetric look, taking the brighter of each pair. Both ride the Phase-7
+  effect-toggle framework: blur is a suppressible always-on look; mirror is an
+  opt-in effect (default off) expressed via a new `default:False` registry field,
+  so the suppress-only gate reads as "off until enabled". Both get a dashboard
+  switch for free from the registry-driven grid, and blur adds a **Blur Amount
+  slider** (persisted `blur_amount` setting → `CueEngine.set_blur_base()`) so the
+  base strength can be dialled live against the real strip — fog stacks on top.
 - [ ] **7. Status dashboard pass** — evolve the status page (`status_server.py`)
   from a status readout into a live operator dashboard: render/DDP throughput and
   stall stats, per-signal telemetry (cue, BPM, beat clock, strobe, star power,

@@ -175,6 +175,23 @@ EFFECT_TOGGLES = {
         "description": "Bias the wash toward the on-camera player + a directed-cut accent.",
         "key": "camera", "off": None,
     },
+    # Post-process chain (Phase 6): blur → mirror → brightness → background.
+    # Both gate a signal the engine emits every frame; when the toggle is off,
+    # apply_effect_toggles() forces the key to `off`. Blur defaults on (a light
+    # always-on smoothing look); mirror is an opt-in symmetric look, so it uses
+    # `default: False` — the framework's suppress-only gate then reads as "off
+    # until enabled" (the engine emits mirror=True as the capability, the toggle
+    # decides whether it lands).
+    "blur": {
+        "label": "Blur",
+        "description": "Soft Gaussian blur so cue events read as smooth stage light (stronger under fog).",
+        "key": "blur", "off": 0.0,
+    },
+    "mirror": {
+        "label": "Mirror",
+        "description": "Fold the strip into a left–right symmetric look (max of each half).",
+        "key": "mirror", "off": False, "default": False,
+    },
 }
 
 DEFAULT_SETTINGS = {
@@ -182,8 +199,12 @@ DEFAULT_SETTINGS = {
     "palette": "default",
     "fps": 40,
     "direction": "normal",
-    # Every effect toggle defaults to on.
-    "effects": {tid: True for tid in EFFECT_TOGGLES},
+    # Post-process blur strength 0.0-1.0 (Phase 6). Operator taste knob for the
+    # always-on Gaussian smoothing; fog lifts it further at render time. Default
+    # mirrors the engine's BLUR_BASE. The Blur toggle still gates it on/off.
+    "blur_amount": 0.35,
+    # Each toggle defaults on unless its registry row opts out with default:False.
+    "effects": {tid: meta.get("default", True) for tid, meta in EFFECT_TOGGLES.items()},
 }
 
 
@@ -231,6 +252,8 @@ class BridgeSettings:
             self._data["fps"] = stored["fps"]
         if stored.get("direction") in ("normal", "reverse"):
             self._data["direction"] = stored["direction"]
+        if isinstance(stored.get("blur_amount"), (int, float)):
+            self._data["blur_amount"] = max(0.0, min(1.0, float(stored["blur_amount"])))
         stored_effects = stored.get("effects")
         if isinstance(stored_effects, dict):
             for tid in EFFECT_TOGGLES:
@@ -290,6 +313,18 @@ class BridgeSettings:
             return
         with self._lock:
             self._data["fps"] = value
+            self._save()
+
+    @property
+    def blur_amount(self) -> float:
+        with self._lock:
+            return self._data["blur_amount"]
+
+    @blur_amount.setter
+    def blur_amount(self, value: float):
+        value = max(0.0, min(1.0, float(value)))
+        with self._lock:
+            self._data["blur_amount"] = value
             self._save()
 
     @property
@@ -359,6 +394,7 @@ class BridgeSettings:
                 "fps": self._data["fps"],
                 "fps_options": list(VALID_FPS),
                 "direction": self._data["direction"],
+                "blur_amount": self._data["blur_amount"],
                 "effects": dict(self._data["effects"]),
                 "effect_toggles": {
                     tid: {"label": m["label"], "description": m["description"]}
