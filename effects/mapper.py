@@ -6,13 +6,21 @@ post-processing effects inspired by LedFx/WLED.
 The strip is divided into 8 cells (LED_COUNT // 8 LEDs each).
 Any remainder LEDs mirror from the start for visual wrap-around.
 
-Effects layer (applied after base zone→pixel mapping):
-  - Decay trails: pixels fade to black over N frames instead of instant off
-  - Sine breathing: brightness modulates on a sine wave synced to BPM
-  - Sparkle overlay: random pixels flash white on beat events
-  - Additive blending: overlapping zone colors blend additively
-  - Gradient wipe: fills sweep pixel-by-pixel instead of cell-snapping
-  - Glitch overlay: random cell segments briefly invert color
+Render pipeline (VISION Phase 3 — layer/slot compositor, see compositor.py):
+  1. Wash        — zone→pixel base + solid-zone fill (the primary look)
+  2. Motion      — sub-pixel scanner heads, alpha-over the wash (a layer)
+  3. Scene shape — gradient recolour, decay trails, gradient-boundary blend,
+                   sine breathing, glitch (in-place transforms on the scene)
+  4. Accents     — sparkle + initial-flash + bonus, each a convex whitening
+                   layer, composited together in ONE pass so they can't
+                   clip-fight in a shared buffer (the Phase-3 fix)
+  5. Surge       — star-power lift/tint + shimmer, on lit pixels
+  6. Masks/pump  — reveal/spotlight masks, beat-locked brightness pulse
+  7. Output      — pause-dim + global brightness, reverse, wrap-around mirror
+
+Independent elements (wash, motion, sparkle, flash, bonus) render into their
+own pre-allocated buffers and are folded together by the Compositor with an
+explicit blend mode + opacity; whole-image modifiers stay as ordered transforms.
 
 Performance notes (Phase 2 optimisation):
   All per-pixel work operates on flat pre-allocated bytearrays using integer
@@ -28,6 +36,7 @@ import random
 import time
 
 from config import LED_COUNT
+from effects.compositor import Layer, Compositor, MIX, MIX_PREMULT
 
 # Zone ordering matches Stage Kit command IDs
 ZONE_NAMES = ["red", "green", "blue", "yellow"]
@@ -87,10 +96,27 @@ class LEDMapper:
         # Second working buffer for gradient blending pass
         self._blend = bytearray(MAPPED_REGION * 3)
 
-        # Sub-pixel scanner: heads accumulate (colour, coverage) here, then the
-        # motion layer is alpha-composited over the static base (see render()).
-        self._motion = bytearray(MAPPED_REGION * 3)
-        self._motion_alpha = [0.0] * MAPPED_REGION
+        # ── Compositor layers (VISION Phase 3) ───────────────────
+        # Independent elements render into their own buffers and are folded
+        # onto the wash by the compositor with explicit blend modes, instead
+        # of each mutating one shared buffer in sequence (see compositor.py).
+        #
+        # Motion (sub-pixel scanner): heads accumulate premultiplied colour +
+        # coverage, then alpha-over the static base (MIX_PREMULT).
+        self._motion_layer = Layer(MAPPED_REGION, MIX_PREMULT, per_pixel_alpha=True)
+
+        # Accent overlays that brighten toward white — sparkle, initial flash,
+        # bonus burst. Each is a constant-white buffer blended by a coverage
+        # (per-pixel for sparkle, scalar for flash/bonus). Because MIX is convex
+        # they screen-combine and never clip, however many fire at once — this
+        # is the "stop the overlays fighting" fix. Composited in one pass.
+        self._sparkle_layer = Layer(MAPPED_REGION, MIX, per_pixel_alpha=True)
+        self._flash_layer = Layer(MAPPED_REGION, MIX)
+        self._bonus_layer = Layer(MAPPED_REGION, MIX)
+        for _lyr in (self._sparkle_layer, self._flash_layer, self._bonus_layer):
+            for _k in range(len(_lyr.buf)):
+                _lyr.buf[_k] = 255                      # constant white source
+        self._accents = (self._sparkle_layer, self._flash_layer, self._bonus_layer)
 
         # Decay trails state: flat R,G,B per pixel
         self._trail = bytearray(MAPPED_REGION * 3)
@@ -218,6 +244,12 @@ class LEDMapper:
 
         buf = self._buf
 
+        # Reset accent-layer activity for this frame; their effect blocks below
+        # set it True and fill coverage. Composited together before the surge.
+        self._sparkle_layer.active = False
+        self._flash_layer.active = False
+        self._bonus_layer.active = False
+
         # Resolve zone colors to flat ints once
         zc = [zone_colors[ZONE_NAMES[z]] for z in range(4)]
 
@@ -324,9 +356,10 @@ class LEDMapper:
         # keeps a soft falloff; because heads add within the layer, crossing
         # scanners mix colour. The float centre means motion glides pixel-by-
         # pixel with a constant peak/width instead of the old cell-block throb.
+        motion_layer = self._motion_layer
         if motion_sources:
-            mbuf = self._motion
-            malpha = self._motion_alpha
+            mbuf = motion_layer.buf
+            malpha = motion_layer.alpha
             for k in range(MAPPED_REGION * 3):
                 mbuf[k] = 0
             for i in range(MAPPED_REGION):
@@ -354,18 +387,11 @@ class LEDMapper:
                     v = mbuf[o + 2] + int(cb * w); mbuf[o + 2] = v if v < 255 else 255
                     a = malpha[idx] + w
                     malpha[idx] = a if a < 1.0 else 1.0
-            for i in range(MAPPED_REGION):
-                a = malpha[i]
-                if a <= 0.0:
-                    continue
-                o = i * 3
-                inv_a = 1.0 - a
-                r = int(buf[o] * inv_a) + mbuf[o]
-                g = int(buf[o + 1] * inv_a) + mbuf[o + 1]
-                b = int(buf[o + 2] * inv_a) + mbuf[o + 2]
-                buf[o]     = r if r < 255 else 255
-                buf[o + 1] = g if g < 255 else 255
-                buf[o + 2] = b if b < 255 else 255
+            motion_layer.active = True
+        else:
+            motion_layer.active = False
+        # Alpha-over the motion layer onto the static base (premultiplied).
+        Compositor.composite(buf, (motion_layer,))
 
         # ── Gradient recolour (beat oscillator) ──────────────────
         # Opt-in: recolour every lit pixel from the gradient by its position,
@@ -499,25 +525,25 @@ class LEDMapper:
                         sparkle[i] = sparkle_life
 
             life_div = float(sparkle_life)
+            salpha = self._sparkle_layer.alpha
             for i in range(MAPPED_REGION):
                 if sparkle[i] > 0:
                     o = i * 3
                     # Clamp: live sparkles may outlast a shrunk life_div
                     # after a downbeat or an FPS change.
                     t = min(1.0, sparkle[i] / life_div)
+                    # Whitening coverage for the accent layer (MIX toward white):
+                    # 0.7t on lit pixels, a fainter 0.4t seed on dark ones —
+                    # matches the old look, but composited convexly so stacked
+                    # accents can't clip. Applied in the accent composite below.
                     if buf[o] or buf[o + 1] or buf[o + 2]:
-                        # Blend toward white
-                        t07 = t * 0.7
-                        inv = 1.0 - t07
-                        buf[o]     = int(buf[o] * inv + 255 * t07)
-                        buf[o + 1] = int(buf[o + 1] * inv + 255 * t07)
-                        buf[o + 2] = int(buf[o + 2] * inv + 255 * t07)
+                        salpha[i] = t * 0.7
                     else:
-                        v = int(255 * t * 0.4)
-                        buf[o] = v
-                        buf[o + 1] = v
-                        buf[o + 2] = v
+                        salpha[i] = t * 0.4
                     sparkle[i] -= 1
+                else:
+                    salpha[i] = 0.0
+            self._sparkle_layer.active = True
 
         # ── Effect: Glitch overlay ───────────────────────────────
         if glitch_prob > 0.0:
@@ -541,38 +567,31 @@ class LEDMapper:
                     glitch[cell] -= 1
 
         # ── Effect: Initial flash ────────────────────────────────
+        # Whole-strip white flash on the first frames of a cue, as a convex
+        # whitening overlay (MIX white by flash_t): on lit pixels it blends
+        # toward white, on dark ones it lifts to grey — same as the old pass.
         if initial_flash > 0:
-            flash_t = min(initial_flash / 3.0, 1.0)
-            inv = 1.0 - flash_t
-            white_v = int(255 * flash_t)
-            for i in range(MAPPED_REGION):
-                o = i * 3
-                if buf[o] or buf[o + 1] or buf[o + 2]:
-                    buf[o]     = int(buf[o] * inv + 255 * flash_t)
-                    buf[o + 1] = int(buf[o + 1] * inv + 255 * flash_t)
-                    buf[o + 2] = int(buf[o + 2] * inv + 255 * flash_t)
-                else:
-                    buf[o] = white_v
-                    buf[o + 1] = white_v
-                    buf[o + 2] = white_v
+            self._flash_layer.opacity = min(initial_flash / 3.0, 1.0)
+            self._flash_layer.active = True
 
         # ── Effect: Bonus burst (YARG bonus_effect) ──────────────
         # White celebration flash that rolls over the strip whenever YARG
         # flags a big-moment bonus. bonus_t decays 1.0 → 0.0 over the
-        # engine's BONUS_BURST_DURATION (wall-clock, FPS-independent).
+        # engine's BONUS_BURST_DURATION (wall-clock, FPS-independent). Rendered
+        # as a convex whitening overlay (MIX white by 0.85*bonus_t): on dark
+        # pixels this reproduces the old grey burst; on lit pixels it whitens
+        # without the old add-then-clamp that clipped when it stacked.
         if bonus_t > 0.0:
-            burst_w = int(255 * bonus_t * 0.85)
-            inv = 1.0 - bonus_t * 0.7
-            for i in range(MAPPED_REGION):
-                o = i * 3
-                if buf[o] | buf[o + 1] | buf[o + 2]:
-                    buf[o]     = min(255, int(buf[o] * inv + burst_w))
-                    buf[o + 1] = min(255, int(buf[o + 1] * inv + burst_w))
-                    buf[o + 2] = min(255, int(buf[o + 2] * inv + burst_w))
-                else:
-                    buf[o] = burst_w
-                    buf[o + 1] = burst_w
-                    buf[o + 2] = burst_w
+            self._bonus_layer.opacity = bonus_t * 0.85
+            self._bonus_layer.active = True
+
+        # ── Composite accent overlays (VISION Phase 3) ───────────
+        # Sparkle + flash + bonus fold onto the scene in one convex pass. MIX
+        # screen-combines, so any number active together stay bounded and
+        # order-independent — the whitening overlays no longer clip-fight in a
+        # single shared buffer (the core Phase-3 fix). Runs before the surge so
+        # star-power still lifts/tints the final lit picture.
+        Compositor.composite(buf, self._accents)
 
         # ── Effect: Star-power surge (v4) ────────────────────────
         # "Tasteful surge": while a player has overdrive active, lift the wash
