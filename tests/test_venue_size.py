@@ -19,6 +19,7 @@ Run: python -m pytest tests/test_venue_size.py -v
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -31,6 +32,7 @@ from effects.cue_engine import (  # noqa: E402
 from protocol.yarg_packet import CueByte, VenueSizeByte  # noqa: E402
 from status_server import StatusTracker  # noqa: E402
 from settings import BridgeSettings  # noqa: E402
+import main as bridge_main  # noqa: E402
 
 # Authored CHORUS red chase: opposing pairs (see cue_engine._launch_cue).
 _CHORUS_RED = [ZERO | FOUR, ONE | 0x20, 0x04 | 0x40, 0x08 | 0x80]
@@ -264,15 +266,23 @@ def test_every_transformed_cue_mask_is_venue_safe():
 
 # ── Operator intensity knob ──────────────────────────────────────
 
-def test_venue_intensity_zero_is_bit_exact():
-    # Dialled to 0, the whole density branch is off: transform gated out and
-    # sparkle unscaled, even with a Small-venue byte set.
+def test_venue_sparkle_intensity_zero_leaves_chase_toggle_independent():
+    # The continuous slider controls sparkle only. Chase density is discrete
+    # and remains enabled until its dedicated toggle is switched off.
     eng = CueEngine()
     eng.on_venue_size(VenueSizeByte.SMALL)
     eng.set_venue_intensity(0.0)
     eng.on_cue(CueByte.CHORUS)
-    assert _pattern_masks(eng) == _CHORUS_RED
+    assert _pattern_masks(eng) == [ZERO, ONE, 0x04, 0x08]
     assert eng.get_effects()["sparkle"] == 0.10
+
+
+def test_venue_pattern_toggle_off_is_bit_exact():
+    eng = CueEngine()
+    eng.on_venue_size(VenueSizeByte.SMALL)
+    eng.set_venue_patterns_enabled(False)
+    eng.on_cue(CueByte.CHORUS)
+    assert _pattern_masks(eng) == _CHORUS_RED
 
 
 def test_venue_intensity_scales_sparkle_deviation():
@@ -306,7 +316,7 @@ def test_venue_intensity_is_clamped():
 def test_venue_intensity_setting_defaults_clamps_persists(tmp_path):
     path = str(tmp_path / "settings.json")
     s = BridgeSettings(path=path)
-    assert s.venue_intensity == 1.0            # default = full authored branch
+    assert s.venue_intensity == 1.0            # default = full sparkle branch
     s.venue_intensity = 2.0
     assert s.venue_intensity == 1.0            # clamped high
     s.venue_intensity = -0.5
@@ -314,3 +324,53 @@ def test_venue_intensity_setting_defaults_clamps_persists(tmp_path):
     s.venue_intensity = 0.4
     assert BridgeSettings(path=path).venue_intensity == 0.4   # survives reload
     assert s.snapshot()["venue_intensity"] == 0.4
+
+
+def test_venue_pattern_toggle_defaults_and_persists(tmp_path):
+    path = str(tmp_path / "settings.json")
+    s = BridgeSettings(path=path)
+    assert s.effect_enabled("venue_patterns")
+    assert s.set_effect("venue_patterns", False)
+    assert not BridgeSettings(path=path).effect_enabled("venue_patterns")
+
+
+# ── Protocol ordering ─────────────────────────────────────────────
+
+def test_protocol_applies_venue_before_cue_from_same_packet(monkeypatch):
+    calls = []
+
+    class Engine:
+        bpm = 120.0
+
+        def on_venue_size(self, value):
+            calls.append(("venue", value))
+
+        def on_cue(self, value):
+            calls.append(("cue", value))
+
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: None
+
+    class Sink:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: None
+
+    pkt = SimpleNamespace(
+        datagram_version=1, bpm=120.0,
+        venue_size=VenueSizeByte.SMALL, lighting_cue=CueByte.CHORUS,
+        strobe_state=0, beat=0, keyframe=0,
+        guitar_notes=0, bass_notes=0, drum_notes=0, keys_notes=0,
+        vocal_note=0.0, harmony0_note=0.0, harmony1_note=0.0,
+        harmony2_note=0.0, spotlight=0, singalong=0, post_processing=0,
+        fog_state=False, song_section=0, bonus_effect=False, paused=1,
+        sp_active=False, sp_amount=0.0, sp_charge=0.0, sp_active_count=0,
+        camera_cut_subject=0, camera_cut_priority=0, scene=0, auto_gen=False,
+    )
+    monkeypatch.setattr(bridge_main, "parse_packet", lambda _data: pkt)
+    protocol = bridge_main.YARGProtocol(Engine(), Sink(), Sink())
+    protocol.datagram_received(b"packet", ("127.0.0.1", 36107))
+
+    assert calls[:2] == [
+        ("venue", VenueSizeByte.SMALL),
+        ("cue", CueByte.CHORUS),
+    ]

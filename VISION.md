@@ -197,10 +197,11 @@ Who does what best, and where it lands in our code:
   warm as a convex hue lean on lit pixels only, with a per-section energy scale
   on the beat-pump depth and breathing swing, eased in over 1 s
   (`tests/test_song_section.py`; dedicated Song Section card on the dashboard).
-  The venue-density and section-bias magnitudes are **operator-tunable** (0-100%
-  dashboard sliders, persisted like the blur knob) since the defaults are
-  aesthetic and unvalidated on hardware — 0% is bit-exact off, 100% the full
-  branch.
+  Venue chase density is a discrete persisted toggle; venue sparkle and
+  section-bias magnitudes are **operator-tunable** (0-100% dashboard sliders,
+  persisted like the blur knob). This keeps the chase control honest—mask
+  transforms cannot vary continuously—while preserving a continuous taste
+  knob for sparkle.
 
 ## Current focus — Phase 4: note / vocal / performer / post-processing reactivity
 

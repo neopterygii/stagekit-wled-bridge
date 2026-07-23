@@ -41,7 +41,7 @@ def test_toggles_default_to_their_registry_default():
 def test_registry_covers_the_reactive_layers():
     assert set(EFFECT_TOGGLES) == {
         "note_accents", "vocal_ribbon", "performer_bias", "post_processing",
-        "camera_cut", "blur", "mirror"}
+        "camera_cut", "venue_patterns", "blur", "mirror"}
     # Every entry carries the UI + gating metadata the framework relies on.
     for meta in EFFECT_TOGGLES.values():
         assert {"label", "description", "key", "off"} <= set(meta)
@@ -78,6 +78,8 @@ def test_each_toggle_maps_to_the_mapper_off_value():
     # off values must equal what the mapper treats as "inactive".
     s = _settings()
     for tid, meta in EFFECT_TOGGLES.items():
+        if meta["key"] is None:
+            continue  # engine-stage toggle, not a mapper signal
         s2 = _settings()
         s2.set_effect(tid, False)
         fx = {meta["key"]: "LIVE"}

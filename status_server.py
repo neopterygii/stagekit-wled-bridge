@@ -463,7 +463,7 @@ STATUS_HTML = """\
            style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
   </div>
   <div class="card" id="venue-intensity-card">
-    <div class="label">Venue Density</div>
+    <div class="label">Venue Sparkle</div>
     <div class="value" id="venue-intensity-pct">100%</div>
     <input type="range" id="venue-intensity-slider" min="0" max="100" value="100" step="1"
            style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
@@ -658,7 +658,7 @@ blurSlider.addEventListener('change', () => {
   sendBlur(parseInt(blurSlider.value));
 });
 
-// Intensity sliders (venue density, section bias) — same 0-100% → 0.0-1.0
+// Intensity sliders (venue sparkle, section bias) — same 0-100% → 0.0-1.0
 // debounced POST as blur. Each returns its dragging-flag getter so the live
 // update() poll can skip syncing the slider back while the user drags it.
 function wireIntensitySlider(sliderId, pctId, settingsKey) {

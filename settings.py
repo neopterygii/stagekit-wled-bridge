@@ -147,8 +147,8 @@ VALID_FPS = (10, 15, 20, 25, 30, 40, 50, 60)
 # switches from this registry, so it needs no per-effect code), and `key`/`off`
 # tell the render loop how to suppress it — when the toggle is off,
 # apply_effect_toggles() forces effects[`key`] to `off` before the mapper sees
-# it. Adding a new toggle is one row here + emitting its key from the engine;
-# the mapper and dashboard need no change.
+# it. A `key` of None marks a toggle consumed directly by the engine instead.
+# The dashboard renders both kinds from this registry.
 EFFECT_TOGGLES = {
     "note_accents": {
         "label": "Note Accents",
@@ -174,6 +174,12 @@ EFFECT_TOGGLES = {
         "label": "Camera Cuts",
         "description": "Bias the wash toward the on-camera player + a directed-cut accent.",
         "key": "camera", "off": None,
+    },
+    "venue_patterns": {
+        "label": "Venue Chase Density",
+        "description": "Use sparse/dense chase masks for small/large venues; takes effect on the next cue.",
+        # Consumed by the cue engine at pattern launch, not by the mapper.
+        "key": None, "off": None,
     },
     # Post-process chain (Phase 6): blur → mirror → brightness → background.
     # Both gate a signal the engine emits every frame; when the toggle is off,
@@ -203,10 +209,8 @@ DEFAULT_SETTINGS = {
     # always-on Gaussian smoothing; fog lifts it further at render time. Default
     # mirrors the engine's BLUR_BASE. The Blur toggle still gates it on/off.
     "blur_amount": 0.35,
-    # Venue-size density intensity 0.0-1.0 (Phase 8). Operator taste knob for
-    # how strongly the venue-size byte branches pattern/sparkle density; 0 = off
-    # (authored look bit-exact), 1 = full YALCY-style branch. Baked defaults are
-    # unvalidated on hardware, so this stays dial-able from the dashboard.
+    # Venue-size sparkle intensity 0.0-1.0 (Phase 8). Chase-mask density is a
+    # discrete choice exposed separately as the venue_patterns effect toggle.
     "venue_intensity": 1.0,
     # Song-section bias intensity 0.0-1.0 (Phase 8). Scales the verse/chorus
     # hue-lean + energy bias; 0 = off (bit-exact), 1 = full.
@@ -414,7 +418,7 @@ class BridgeSettings:
         with self._lock:
             states = dict(self._data["effects"])
         for tid, meta in EFFECT_TOGGLES.items():
-            if not states.get(tid, True):
+            if meta["key"] is not None and not states.get(tid, True):
                 effects[meta["key"]] = meta["off"]
         return effects
 

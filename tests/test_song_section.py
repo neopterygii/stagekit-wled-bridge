@@ -97,11 +97,11 @@ def test_none_and_unknown_sections_are_identity():
 
 def test_section_change_resolves_bias_knobs():
     eng = CueEngine()
-    eng.on_song_section(SongSectionByte.CHORUS)
-    hue, gain, energy = eng.get_effects()["section"]
+    eng.on_song_section(SongSectionByte.CHORUS, now=100.0)
+    hue, gain, energy = eng._section_state(100.0 + SECTION_EASE)
     assert hue == _CHORUS_HUE
     assert energy == _CHORUS_ENERGY
-    assert 0.0 <= gain <= 1.0
+    assert gain == 1.0
 
 
 def test_verse_energy_settles_chorus_lifts():
@@ -113,9 +113,44 @@ def test_verse_energy_settles_chorus_lifts():
 def test_section_gain_eases_in_then_holds():
     eng = CueEngine()
     eng.on_song_section(SongSectionByte.VERSE, now=100.0)
-    assert eng._section_gain(100.0) == 0.0                    # snaps to 0
+    assert eng._section_gain(100.0) == 0.0
     assert 0.0 < eng._section_gain(100.0 + SECTION_EASE / 2) < 1.0
     assert eng._section_gain(100.0 + SECTION_EASE + 5.0) == 1.0
+
+
+def test_section_to_section_transition_is_continuous():
+    eng = CueEngine()
+    eng.on_song_section(SongSectionByte.VERSE, now=100.0)
+    changed_at = 100.0 + SECTION_EASE
+    verse_state = eng._section_state(changed_at)
+
+    eng.on_song_section(SongSectionByte.CHORUS, now=changed_at)
+    assert eng._section_state(changed_at) == verse_state
+
+    hue, gain, energy = eng._section_state(changed_at + SECTION_EASE / 2)
+    assert hue == tuple(
+        int(round((a + b) / 2)) for a, b in zip(_VERSE_HUE, _CHORUS_HUE)
+    )
+    assert gain == 1.0
+    assert abs(energy - (_VERSE_ENERGY + _CHORUS_ENERGY) / 2) < 1e-9
+    assert eng._section_state(changed_at + SECTION_EASE) == (
+        _CHORUS_HUE, 1.0, _CHORUS_ENERGY)
+
+
+def test_section_to_none_eases_back_to_identity():
+    eng = CueEngine()
+    eng.on_song_section(SongSectionByte.CHORUS, now=100.0)
+    changed_at = 100.0 + SECTION_EASE
+    eng.on_song_section(SongSectionByte.NONE, now=changed_at)
+
+    assert eng._section_state(changed_at) == (
+        _CHORUS_HUE, 1.0, _CHORUS_ENERGY)
+    hue, gain, energy = eng._section_state(changed_at + SECTION_EASE / 2)
+    assert hue == _CHORUS_HUE
+    assert gain == 0.5
+    assert abs(energy - (1.0 + _CHORUS_ENERGY) / 2) < 1e-9
+    assert eng._section_state(changed_at + SECTION_EASE) == (
+        _CHORUS_HUE, 0.0, 1.0)
 
 
 def test_pause_shifts_section_timer():

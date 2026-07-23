@@ -76,6 +76,12 @@ class YARGProtocol(asyncio.DatagramProtocol):
         if pkt.bpm > 0:
             self.engine.bpm = pkt.bpm
 
+        # Venue size is cue-launch context, so update it before dispatching a
+        # cue from the same packet. Pattern transforms happen only at launch.
+        if pkt.venue_size != self._last_venue_size:
+            self.engine.on_venue_size(pkt.venue_size)
+            self._last_venue_size = pkt.venue_size
+
         # Lighting cue change
         if pkt.lighting_cue != self._last_cue:
             self.engine.on_cue(pkt.lighting_cue)
@@ -116,13 +122,6 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # Fog/haze (Phase 6) — lifts the post-process blur toward a soft
         # blur-glow floor while the venue haze is up.
         self.engine.on_fog(pkt.fog_state)
-
-        # Venue size (offset 8) — branches pattern + sparkle density per cue.
-        # YARG only changes the byte on chart load, so this is change-gated;
-        # the new density takes effect at the next cue launch (as in YALCY).
-        if pkt.venue_size != self._last_venue_size:
-            self.engine.on_venue_size(pkt.venue_size)
-            self._last_venue_size = pkt.venue_size
 
         # Song section (offset 13) — slow palette/energy bias per section.
         # YARG only changes the byte on a Verse/Chorus lighting event, so this
@@ -448,10 +447,12 @@ class RenderThread(threading.Thread):
             # this in the engine. Synced each frame so a drag lands live.
             self._engine.set_blur_base(self._settings.blur_amount)
 
-            # Venue-density + song-section intensity (dashboard sliders) —
-            # scale the Phase 8 signal biases; synced each frame so a drag
-            # lands live (the venue transform re-reads the knob at next cue).
+            # Venue sparkle + song-section intensity (dashboard sliders), plus
+            # the discrete venue chase toggle. Synced each frame; chase-mask
+            # changes take effect at the next cue launch.
             self._engine.set_venue_intensity(self._settings.venue_intensity)
+            self._engine.set_venue_patterns_enabled(
+                self._settings.effect_enabled("venue_patterns"))
             self._engine.set_section_intensity(self._settings.section_intensity)
 
             # Get effects (consumes and clears transient flags)

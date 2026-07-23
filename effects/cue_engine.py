@@ -362,13 +362,13 @@ class CueEngine:
         # _mask_transform is applied to pattern steps at cue launch (never
         # per frame); NoVenue/unknown leaves both knobs at identity, which
         # preserves the authored look exactly. _venue_sparkle_base holds the
-        # authored deviation; _venue_intensity (operator knob, synced from
-        # settings each frame like blur) scales how far both knobs lean —
-        # 1.0 = full, 0.0 = off (bit-exact, transform gated out).
+        # authored deviation; _venue_intensity scales that continuous sparkle
+        # adjustment. Pattern density is discrete and controlled separately.
         self._venue_size = VenueSizeByte.NO_VENUE
         self._mask_transform = None          # None | _thin_opposites | _fill_opposites
         self._venue_sparkle_base = 1.0
         self._venue_intensity = 1.0
+        self._venue_patterns_enabled = True
 
         # Song section (offset 13). Sustained state — the mapper leans the
         # current look toward the section's hue and scales its energy
@@ -381,6 +381,9 @@ class CueEngine:
         self._song_section = SongSectionByte.NONE
         self._section_hue = None             # (r,g,b) or None
         self._section_energy = 1.0
+        self._section_from_hue = None
+        self._section_from_gain = 0.0
+        self._section_from_energy = 1.0
         self._section_changed_at = 0.0
         self._section_intensity = 1.0
 
@@ -523,10 +526,12 @@ class CueEngine:
         # operator intensity scales the eased gain, which the mapper uses for
         # both the hue-lean strength and the energy deviation — so intensity 0
         # emits gain 0 and the mapper reads it as identity (bit-exact).
-        fx["section"] = ((self._section_hue,
-                          self._section_gain(now) * self._section_intensity,
-                          self._section_energy)
-                         if self._section_hue is not None else None)
+        section_hue, section_gain, section_energy = self._section_state(now)
+        fx["section"] = ((section_hue,
+                          section_gain * self._section_intensity,
+                          section_energy)
+                         if section_hue is not None and section_gain > 0.0
+                         else None)
         # Post-process chain (Phase 6). blur is a strength the mapper wet-mixes;
         # mirror is the capability signal — the dashboard toggle gates it (off by
         # default), so we emit True and let apply_effect_toggles() decide.
@@ -867,12 +872,12 @@ class CueEngine:
     def on_venue_size(self, venue_size: int):
         """Store the venue-size byte (offset 8) and precompute the density knobs.
 
-        Both knobs are resolved here, at signal-change time: the hot path only
-        reads them (a sparkle multiply in get_effects, a transform applied to
-        pattern steps at cue launch). NoVenue/unknown resets to identity, so
-        the authored look is bit-exact when the chart doesn't say. YARG only
-        changes the byte on chart load, so there is no mid-cue re-launch — a
-        new size takes effect at the next cue, as in YALCY.
+        Both venue outputs are resolved here: the hot path reads a sparkle
+        multiplier, while the optional discrete mask transform is applied to
+        pattern steps at cue launch. NoVenue/unknown resets to identity. The
+        protocol applies chart-load venue context before a cue from the same
+        packet; a later mid-cue size change applies to sparkle immediately and
+        to chase masks at the next cue.
         """
         self._venue_size = venue_size
         if venue_size == VenueSizeByte.SMALL:
@@ -892,12 +897,19 @@ class CueEngine:
         signal-change time — the hot path only reads them (a gain ramp plus
         one tuple in get_effects; the mapper does the per-pixel lean). The
         change time arms a slow ease-in over SECTION_EASE so a verse→chorus
-        transition drifts rather than snaps. None/unknown resets to identity,
-        so the authored look is bit-exact when no section is playing. *now* is
-        injectable for tests; production passes None.
+        transition interpolates from the currently rendered bias rather than
+        snapping through neutral. None/unknown eases back to identity. *now*
+        is injectable for tests; production passes None.
         """
         if now is None:
             now = time.monotonic()
+        # Capture the currently rendered bias before changing the target. This
+        # makes Verse→Chorus and section→None transitions continuous instead
+        # of dropping to the neutral authored look at every boundary.
+        current_hue, current_gain, current_energy = self._section_state(now)
+        self._section_from_hue = current_hue
+        self._section_from_gain = current_gain
+        self._section_from_energy = current_energy
         self._song_section = section
         bias = SECTION_BIAS.get(section)
         if bias is None:
@@ -908,26 +920,44 @@ class CueEngine:
         self._section_changed_at = now
 
     def _section_gain(self, now: float) -> float:
-        """Section-bias ease-in 0.0 → 1.0 over SECTION_EASE after a change."""
+        """Current interpolated section-bias gain."""
+        return self._section_state(now)[1]
+
+    def _section_state(self, now: float):
+        """Interpolated (hue, gain, energy) from the previous to target bias."""
         if self._section_changed_at <= 0.0:
-            return 0.0
+            return self._section_hue, (
+                1.0 if self._section_hue is not None else 0.0
+            ), self._section_energy
         t = (now - self._section_changed_at) / SECTION_EASE
-        if t < 0.0:
-            return 0.0
-        return t if t < 1.0 else 1.0
+        t = max(0.0, min(1.0, t))
+        target_gain = 1.0 if self._section_hue is not None else 0.0
+        gain = self._section_from_gain + (target_gain - self._section_from_gain) * t
+        energy = self._section_from_energy + (
+            self._section_energy - self._section_from_energy
+        ) * t
+        if self._section_from_hue is not None and self._section_hue is not None:
+            hue = tuple(
+                int(round(a + (b - a) * t))
+                for a, b in zip(self._section_from_hue, self._section_hue)
+            )
+        elif self._section_hue is not None:
+            hue = self._section_hue
+        else:
+            hue = self._section_from_hue
+        return hue, gain, energy
 
     def set_blur_base(self, amount: float):
         """Set the operator blur strength (0..1); fog stacks on top of it."""
         self._blur_base = max(0.0, min(1.0, float(amount)))
 
     def set_venue_intensity(self, amount: float):
-        """Set the venue-density operator knob (0..1).
-
-        Scales how far the sparkle field leans from the authored default and
-        gates the pattern transform (0 = off → bit-exact authored look, 1 =
-        the full YALCY-style density branch). Synced from settings each frame.
-        """
+        """Set the venue sparkle-density operator knob (0..1)."""
         self._venue_intensity = max(0.0, min(1.0, float(amount)))
+
+    def set_venue_patterns_enabled(self, enabled: bool):
+        """Enable the discrete venue-size chase-mask transform."""
+        self._venue_patterns_enabled = bool(enabled)
 
     def set_section_intensity(self, amount: float):
         """Set the song-section bias operator knob (0..1).
@@ -1283,12 +1313,12 @@ class CueEngine:
         """Apply the venue density transform to a pattern's step masks at launch.
 
         No-op (returns the pattern unchanged) when there's no active transform
-        (NoVenue/unknown) or the operator has dialled venue intensity to 0 —
-        both keep the authored look bit-exact. Only `_venue_safe` masks are
-        transformed; anything else passes through untouched so a nibble-spanning
-        step can never be silently mis-transformed on stage.
+        (NoVenue/unknown) or the discrete chase-density toggle is off. Only
+        `_venue_safe` masks are transformed; anything else passes through
+        untouched so a nibble-spanning step can never be silently
+        mis-transformed on stage.
         """
-        if self._mask_transform is None or self._venue_intensity <= 0.0:
+        if self._mask_transform is None or not self._venue_patterns_enabled:
             return pattern
         xform = self._mask_transform
         return [xform(m) if _venue_safe(m) else m for m in pattern]
