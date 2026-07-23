@@ -8,6 +8,7 @@ Includes built-in test pattern controls to trigger cues from the web UI.
 import asyncio
 import json
 import logging
+import math
 import time
 from http import HTTPStatus
 
@@ -1197,20 +1198,25 @@ class StatusServer:
             return 500, "Engine not connected"
 
         action = body.get("action", "")
-        bpm = body.get("bpm", 120)
+        try:
+            bpm = float(body.get("bpm", 120))
+        except (ValueError, TypeError):
+            return 400, "Invalid BPM value"
+        if not math.isfinite(bpm) or not 30.0 <= bpm <= 400.0:
+            return 400, "BPM must be between 30 and 400"
 
         if action == "pattern":
             pattern = body.get("pattern", "")
             if pattern not in TEST_PATTERNS:
                 return 400, f"Unknown pattern: {pattern}"
             cue_byte = TEST_PATTERNS[pattern]
-            self.engine.bpm = float(bpm)
+            self.engine.bpm = bpm
             self.engine.on_cue(cue_byte)
             self.engine.on_strobe(StrobeSpeed.OFF)
             self.tracker.on_cue(cue_byte)
             self.tracker.test_active = True
             self.tracker.test_pattern = pattern
-            self._start_test_beats(float(bpm))
+            self._start_test_beats(bpm)
             if self.wled_power:
                 self.wled_power.on_test_activity()
             return 200, f"Playing {pattern}"
@@ -1226,9 +1232,9 @@ class StatusServer:
             return 200, f"Strobe {level}"
 
         elif action == "bpm":
-            self.engine.bpm = float(bpm)
+            self.engine.bpm = bpm
             if self._beat_task is not None:
-                self._start_test_beats(float(bpm))
+                self._start_test_beats(bpm)
             return 200, f"BPM set to {bpm}"
 
         elif action == "stop":
@@ -1325,7 +1331,9 @@ class StatusServer:
             if not isinstance(updates, dict):
                 return 400, "Invalid effects payload"
             for tid, on in updates.items():
-                if not self.settings.set_effect(tid, bool(on)):
+                if not isinstance(on, bool):
+                    return 400, f"Effect {tid} must be true or false"
+                if not self.settings.set_effect(tid, on):
                     return 400, f"Unknown effect: {tid}"
                 changed.append(f"{tid}={'on' if on else 'off'}")
         if not changed:
@@ -1358,7 +1366,10 @@ class StatusServer:
                 await self._send_response(writer, 200, 'text/html', STATUS_HTML.encode())
             elif path == '/api/status' and method == 'GET':
                 body = json.dumps(self.tracker.snapshot()).encode()
-                await self._send_response(writer, 200, 'application/json', body)
+                render_thread = self.tracker.render_thread
+                healthy = not (render_thread and render_thread.failed)
+                await self._send_response(
+                    writer, 200 if healthy else 503, 'application/json', body)
             elif path == '/api/test' and method == 'POST':
                 raw = b''
                 if content_length > 0:
@@ -1399,6 +1410,10 @@ class StatusServer:
                 await self._send_response(writer, 404, 'text/plain', b'Not Found')
         except (asyncio.TimeoutError, ConnectionError, BrokenPipeError):
             pass
+        except (ValueError, TypeError) as exc:
+            log.debug("Invalid HTTP request: %s", exc)
+            await self._send_response(
+                writer, 400, 'text/plain', b'Bad Request')
         finally:
             try:
                 writer.close()

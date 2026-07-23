@@ -9,6 +9,8 @@ import logging
 import os
 import threading
 
+from config import GLOBAL_BRIGHTNESS, TARGET_FPS
+
 log = logging.getLogger(__name__)
 
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "/data/settings.json")
@@ -201,9 +203,9 @@ EFFECT_TOGGLES = {
 }
 
 DEFAULT_SETTINGS = {
-    "brightness": 255,
+    "brightness": GLOBAL_BRIGHTNESS,
     "palette": "default",
-    "fps": 40,
+    "fps": TARGET_FPS,
     "direction": "normal",
     # Post-process blur strength 0.0-1.0 (Phase 6). Operator taste knob for the
     # always-on Gaussian smoothing; fog lifts it further at render time. Default
@@ -432,7 +434,7 @@ class BridgeSettings:
                 "palettes": {k: v["label"] for k, v in PALETTES.items()},
                 "colors": PALETTES[palette_key]["colors"],
                 "fps": self._data["fps"],
-                "fps_options": list(VALID_FPS),
+                "fps_options": sorted(set(VALID_FPS) | {self._data["fps"]}),
                 "direction": self._data["direction"],
                 "blur_amount": self._data["blur_amount"],
                 "venue_intensity": self._data["venue_intensity"],

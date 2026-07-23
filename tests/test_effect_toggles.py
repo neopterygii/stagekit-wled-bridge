@@ -95,6 +95,18 @@ def test_unknown_effect_id_rejected():
                          for tid, meta in EFFECT_TOGGLES.items()}
 
 
+def test_settings_api_rejects_non_boolean_effect_values():
+    from status_server import StatusServer, StatusTracker
+
+    s = _settings()
+    server = StatusServer(StatusTracker(), settings=s)
+    status, message = server._handle_settings_action(
+        {"effects": {"blur": "false"}})
+    assert status == 400
+    assert "true or false" in message
+    assert s.effect_enabled("blur")
+
+
 # ── Persistence + snapshot ───────────────────────────────────────
 
 def test_toggle_state_persists_across_reload():

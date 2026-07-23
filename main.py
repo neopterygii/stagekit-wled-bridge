@@ -19,7 +19,7 @@ import time
 from config import (
     YARG_LISTEN_HOST, YARG_LISTEN_PORT,
     WLED_HOST, WLED_DDP_PORT,
-    LED_COUNT, GLOBAL_BRIGHTNESS,
+    LED_COUNT,
     STATUS_HOST, STATUS_PORT,
     IDLE_TIMEOUT,
     LOG_LEVEL,
@@ -248,10 +248,12 @@ class WLEDPowerManager:
     def manual_power(self, on: bool):
         """Manual power toggle from the web UI (deferred to watchdog thread)."""
         if on:
+            self._power_off_pending = False
             self._last_activity = time.monotonic()
             if not self._wled_on:
                 self._power_on_pending = True
         else:
+            self._power_on_pending = False
             if self._wled_on:
                 self._power_off_pending = True
 
@@ -275,8 +277,14 @@ class WLEDPowerManager:
 
     async def _watchdog_run(self):
         # Initial reachability check (non-blocking)
-        await asyncio.to_thread(self._api.is_on)
+        initial_state = await asyncio.to_thread(self._api.is_on)
+        if initial_state is not None:
+            self._wled_on = initial_state
         await asyncio.to_thread(self._api.fetch_wifi_info)
+
+        # Do not make a live sender wait for the first watchdog sleep. Activity
+        # may have arrived while the initial HTTP probes were in flight.
+        await self._process_pending_power()
 
         if not self._enabled:
             log.info("WLED power management: disabled (IDLE_TIMEOUT=0)")
@@ -284,12 +292,7 @@ class WLEDPowerManager:
             wifi_counter = 0
             while True:
                 await asyncio.sleep(5)
-                if self._power_on_pending:
-                    self._power_on_pending = False
-                    await asyncio.to_thread(self._power_on)
-                if self._power_off_pending:
-                    self._power_off_pending = False
-                    await asyncio.to_thread(self._power_off)
+                await self._process_pending_power()
                 self._check_dark_while_active()
                 wifi_counter += 1
                 if wifi_counter >= 6:
@@ -305,13 +308,7 @@ class WLEDPowerManager:
             await asyncio.sleep(5)
 
             # Handle deferred power-on from on_activity() or manual_power()
-            if self._power_on_pending:
-                self._power_on_pending = False
-                await asyncio.to_thread(self._power_on)
-
-            if self._power_off_pending:
-                self._power_off_pending = False
-                await asyncio.to_thread(self._power_off)
+            await self._process_pending_power()
 
             self._check_dark_while_active()
 
@@ -330,6 +327,16 @@ class WLEDPowerManager:
             elapsed = time.monotonic() - self._last_activity
             if elapsed >= self._idle_timeout:
                 await asyncio.to_thread(self._power_off)
+
+    async def _process_pending_power(self):
+        """Apply deferred power commands, with the most recent command winning."""
+        if self._power_off_pending:
+            self._power_off_pending = False
+            self._power_on_pending = False
+            await asyncio.to_thread(self._power_off)
+        elif self._power_on_pending:
+            self._power_on_pending = False
+            await asyncio.to_thread(self._power_on)
 
 
 class RenderThread(threading.Thread):
@@ -402,8 +409,23 @@ class RenderThread(threading.Thread):
         self._last_preview_at = 0.0
         self._preview_strip: list = []
         self._preview_layers: dict | None = None
+        self._fatal_error: str | None = None
 
     def run(self):
+        try:
+            self._run_loop()
+        except Exception as exc:
+            self._fatal_error = f"{type(exc).__name__}: {exc}"
+            self._active = False
+            log.exception("Render thread crashed; health endpoint will report failure")
+            # Best-effort fail dark instead of leaving the last stage look
+            # frozen indefinitely. A sender failure is deliberately secondary.
+            try:
+                self._sender.send_pixels(self._black)
+            except Exception:
+                log.exception("Failed to send blackout after render crash")
+
+    def _run_loop(self):
         self._active = True
         last_frame_time = time.perf_counter()
         fps = self._settings.fps
@@ -573,6 +595,10 @@ class RenderThread(threading.Thread):
     def stop(self):
         self._active = False
 
+    @property
+    def failed(self) -> bool:
+        return self._fatal_error is not None
+
     def preview_snapshot(self) -> dict | None:
         """Latest live strip + per-layer preview for the dashboard, or None if
         nothing has been captured yet (no one watching)."""
@@ -590,13 +616,17 @@ class RenderThread(threading.Thread):
         work = self._work_times
         gaps = self._frame_gaps
         if not work:
-            return {"fps": fps, "rendered": 0, "skipped": 0, "stalls": 0,
+            return {"fps": fps, "alive": self.is_alive(),
+                    "fatal_error": self._fatal_error,
+                    "rendered": 0, "skipped": 0, "stalls": 0,
                     "work_ms_avg": 0.0, "work_ms_max": 0.0,
                     "gap_ms_avg": 0.0, "gap_ms_max": 0.0,
                     "target_ms": round(1000.0 / fps, 1),
                     "ddp": self._sender.stats()}
         return {
             "fps": fps,
+            "alive": self.is_alive(),
+            "fatal_error": self._fatal_error,
             "rendered": self._frames_rendered,
             "skipped": self._frames_skipped,
             "stalls": self._stall_count,
