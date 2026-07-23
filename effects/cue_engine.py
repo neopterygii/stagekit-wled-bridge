@@ -33,13 +33,25 @@ GREEN = 1
 BLUE = 2
 YELLOW = 3
 
-# Strobe rates in Hz
+# Strobe rates in Hz — fallback when BPM is unknown (0).
 STROBE_RATES = {
     StrobeSpeed.OFF: 0,
     StrobeSpeed.SLOW: 2,
     StrobeSpeed.MEDIUM: 4,
     StrobeSpeed.FAST: 8,
     StrobeSpeed.FASTEST: 16,
+}
+
+# Tempo-locked strobe (YALCY StrobeDmxFromBpm: hz = bpm * speed / 60, where
+# speed is flashes per beat). Each speed byte maps to a note division — the
+# rate is derived live from the current BPM so a tempo change retunes the
+# strobe. The divisions are chosen so that at the 120 BPM default they
+# reproduce the fixed fallback rates exactly (2/4/8/16 Hz).
+STROBE_DIVISIONS = {
+    StrobeSpeed.SLOW: 1,     # quarter note
+    StrobeSpeed.MEDIUM: 2,   # eighth note
+    StrobeSpeed.FAST: 4,     # sixteenth note
+    StrobeSpeed.FASTEST: 8,  # thirty-second note
 }
 
 # Animation durations in seconds (wall-clock, independent of render FPS)
@@ -220,8 +232,9 @@ class CueEngine:
         # Effects config dict consumed by the mapper each frame
         self.effects: dict = {}
 
-        # Strobe state
-        self.strobe_rate = 0  # Hz, 0 = off
+        # Strobe state — the raw speed byte; the effective rate is derived
+        # live from BPM by strobe_hz() (tempo-locked, fixed-Hz fallback).
+        self.strobe_byte = StrobeSpeed.OFF
 
         # BPM from YARG
         self.bpm = 120.0
@@ -342,16 +355,33 @@ class CueEngine:
         # static cues keep the cell model. Rebuilt (atomic rebind) each tick.
         self.motion_sources: list[tuple[int, float, float]] = []
 
-    def get_strobe_visible(self) -> bool:
+    def strobe_hz(self) -> float:
+        """Effective strobe rate in Hz (tempo-locked per YALCY StrobeDmxFromBpm).
+
+        The speed byte maps to a note division (flashes per beat) and the rate
+        is computed from the current BPM — a tempo change retunes the strobe.
+        When BPM is unknown (0), the fixed STROBE_RATES values are the
+        fallback. O(1), no allocation — safe on the render hot path.
+        """
+        division = STROBE_DIVISIONS.get(self.strobe_byte, 0)
+        if division and self.bpm > 0:
+            return self.bpm * division / 60.0
+        return STROBE_RATES.get(self.strobe_byte, 0)
+
+    def get_strobe_visible(self, now: float | None = None) -> bool:
         """Returns whether pixels should be visible (considering strobe).
 
         Computed from wall-clock time so the render thread gets accurate
-        strobe phase without depending on an asyncio coroutine.
+        strobe phase without depending on an asyncio coroutine. *now* is
+        injectable for tests; production passes None.
         """
-        if self.strobe_rate == 0:
+        rate = self.strobe_hz()
+        if rate == 0:
             return True
-        period = 1.0 / self.strobe_rate
-        return (time.monotonic() % period) < (period / 2)
+        if now is None:
+            now = time.monotonic()
+        period = 1.0 / rate
+        return (now % period) < (period / 2)
 
     def get_effects(self) -> dict:
         """Return current effects dict with transient flags, then clear them."""
@@ -772,8 +802,13 @@ class CueEngine:
         return out
 
     def on_strobe(self, strobe_byte: int):
-        """Called when strobe state changes."""
-        self.strobe_rate = STROBE_RATES.get(strobe_byte, 0)
+        """Called when strobe state changes.
+
+        Stores the raw speed byte only — the effective rate is derived live
+        from BPM by strobe_hz(), so a tempo change retunes the strobe without
+        needing the byte re-sent.
+        """
+        self.strobe_byte = strobe_byte
 
     def on_bonus(self):
         """Called when YARG flags a bonus_effect — celebration burst."""

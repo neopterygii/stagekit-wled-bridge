@@ -504,7 +504,7 @@ class RenderThread(threading.Thread):
                 ddp_sent = True
 
             self._tracker.on_render(self._engine.zones,
-                                    self._engine.strobe_rate,
+                                    self._engine.strobe_hz(),
                                     self._engine.bpm,
                                     ddp_sent=ddp_sent,
                                     beat_phase=effects.get("beat_phase", 0.0),
