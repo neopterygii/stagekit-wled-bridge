@@ -38,7 +38,7 @@ Every field, and what it should drive. **Bold** = implemented today.
 | Signal (offset) | Meaning | Ideal translation |
 |---|---|---|
 | **LightingCue (34)** | the authored "look" | **the primary wash/chase per cue** (33 cues, `cue_engine._launch_cue`) |
-| **StrobeState (37)** | strobe speed | **software strobe** (black-frame gate); *should* lock rate to BPM (YALCY `StrobeDmxFromBpm`) |
+| **StrobeState (37)** | strobe speed | **software strobe** (black-frame gate) with **BPM-locked rate** (YALCY `StrobeDmxFromBpm`: speed byte → note division, hz = bpm × division / 60; fixed-Hz fallback when BPM is unknown) |
 | **Beat (38)** | Measure/Strong/Weak pulse | **beat flash/sparkle/glitch**; *should* also feed a continuous beat/bar oscillator for smooth motion |
 | **Keyframe (39)** | chart-driven step (First/Next/Prev) | **steps the manual cues** (`listen="keyframe"`) |
 | **BPM (9)** | tempo | **pattern speed**; basis for the oscillator and tempo-locked strobe |
@@ -51,8 +51,8 @@ Every field, and what it should drive. **Bold** = implemented today.
 | **Note bitmasks (14–17)** | per-fret/pad hits | **rising-edge accents with a note-hold min (1/32 note)** so transient hits are visible, painted per-instrument (YALCY DMX) |
 | **Vocal/Harmony pitch (18–33)** | MIDI pitch, 0=none | **pitch→ribbon blob**: position by absolute pitch, hue by pitch class (chroma) |
 | **Spotlight / Singalong (42,43)** | performer bitmask | **hue bias** toward the highlighted performer(s) |
-| VenueSize (8) | small/large | density branching (sparser vs denser patterns), as YALCY does per-cue |
-| SongSection (13) | Verse/Chorus/… | slow palette/energy bias per section |
+| **VenueSize (8)** | small/large | **density branching** (YALCY does it per cue; here generic): small venue **thins chase steps to single heads + halves sparkle**, large **fills single heads into opposing pairs + boosts sparkle**; unknown/None keeps the authored look bit-exact |
+| **SongSection (13)** | Verse/Chorus | **slow palette/energy bias per section**: a gentle convex hue lean on lit pixels (verse cool, chorus warm) + an energy scale on the breathing swing and beat-pump depth (verse settles, chorus lifts), eased in over `SECTION_EASE` so section changes drift, never snap; None/unknown is identity (bit-exact); section name shown on the dashboard |
 | AutoGenVenueTrack (41) | chart has no authored venue | shown on status page (AUTO); could soften/idealize the look |
 
 ### Quirks to respect (from YARG source)
@@ -180,6 +180,27 @@ Who does what best, and where it lands in our code:
   Adding a toggle is one registry row (label/description + the effects key it
   suppresses) — the render loop, persistence, and dashboard switches are
   generic, so new layers get a switch for free.
+- [ ] **8. Venue awareness: tempo-locked strobe + venue-size density + song-section
+  bias** *(implemented on `feat/venue-awareness`)* — the three remaining
+  parsed-but-unused / fixed-rate signals now shape the light. **Tempo-locked
+  strobe**: strobe speeds map to note divisions (quarter/eighth/sixteenth/
+  thirty-second) and derive Hz live from BPM (YALCY `StrobeDmxFromBpm`), with the
+  old fixed-Hz table as the no-BPM fallback (`tests/test_strobe.py`).
+  **Venue-size density**: Small collapses opposite-pair chase steps to
+  single-head and halves sparkle density; Large fills singles into opposing
+  pairs and boosts sparkle — transforms resolved at signal-change time and
+  applied only to opposite-pair/single-head steps (a `_venue_safe` guard passes
+  any nibble-spanning step through untouched, so a future cue can't be silently
+  mis-thinned; the invariant is pinned by a test over every cue).
+  NoVenue/unknown is bit-exact identity (`tests/test_venue_size.py`; SMALL/LARGE
+  pill on the dashboard). **Song-section bias**: Verse leans cool / Chorus leans
+  warm as a convex hue lean on lit pixels only, with a per-section energy scale
+  on the beat-pump depth and breathing swing, eased in over 1 s
+  (`tests/test_song_section.py`; dedicated Song Section card on the dashboard).
+  The venue-density and section-bias magnitudes are **operator-tunable** (0-100%
+  dashboard sliders, persisted like the blur knob) since the defaults are
+  aesthetic and unvalidated on hardware — 0% is bit-exact off, 100% the full
+  branch.
 
 ## Current focus — Phase 4: note / vocal / performer / post-processing reactivity
 
@@ -290,6 +311,11 @@ heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
   (`tests/test_blur_mirror.py`).
 - **Phase 7 (merged):** live strip / per-layer / beat-clock dashboard preview
   (`tests/test_preview.py`). Remaining dashboard backlog (not yet built): richer
-  per-signal telemetry cards and a dedicated song-section readout.
-- Roadmap phases 0–7 are all **merged to main**. The live Tower container still
-  needs a re-pull/recreate to run anything past Phase 2 (see deploy note).
+  per-signal telemetry cards.
+- **Phase 8 (`feat/venue-awareness`):** tempo-locked strobe
+  (`tests/test_strobe.py`), venue-size density branching
+  (`tests/test_venue_size.py`), and song-section palette/energy bias +
+  dashboard readout (`tests/test_song_section.py`). Every signal in the
+  inventory table now drives light or the dashboard.
+- Roadmap phases 0–7 are all **merged to main** and deployed — the live Tower
+  container runs current main. Phase 8 is implemented on its feature branch.

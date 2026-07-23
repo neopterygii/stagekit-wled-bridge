@@ -196,6 +196,44 @@ class PostProcessing:
     TRAILS_SPACEY = 29
 
 
+class VenueSizeByte:
+    """Venue size (offset 8) — matches YARG's VenueType / YALCY VenueSizeByte.
+
+    Set on chart load by YARG's GameplayMonitor; NoVenue (0) at menu or when
+    the chart doesn't say. NAMES gives a display label for the status page.
+    """
+    NO_VENUE = 0
+    SMALL = 1
+    LARGE = 2
+
+    NAMES = {0: "None", 1: "Small", 2: "Large"}
+
+    @classmethod
+    def name(cls, value: int) -> str:
+        return cls.NAMES.get(value, str(value))
+
+
+class SongSectionByte:
+    """Song section (offset 13) — matches YARG's LightingType section values.
+
+    YARG writes the LightingType of the most recent Verse/Chorus lighting
+    event (DataStreamController: MLCCurrentSongSection is set on lighting-cue
+    change and cleared to 0 at menu), so the values match CueByte — Chorus=2,
+    Verse=5; YALCY's SongSectionByte enum confirms the same pair. 0 = none
+    (menu, or before the first section event of the song). NAMES gives a
+    display label for the status page.
+    """
+    NONE = 0
+    CHORUS = CueByte.CHORUS   # 2
+    VERSE = CueByte.VERSE     # 5
+
+    NAMES = {0: "None", 2: "Chorus", 5: "Verse"}
+
+    @classmethod
+    def name(cls, value: int) -> str:
+        return cls.NAMES.get(value, str(value))
+
+
 class CameraCutPriority:
     """Camera-cut priority (offset 45)."""
     NORMAL = 0

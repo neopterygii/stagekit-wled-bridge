@@ -203,6 +203,14 @@ DEFAULT_SETTINGS = {
     # always-on Gaussian smoothing; fog lifts it further at render time. Default
     # mirrors the engine's BLUR_BASE. The Blur toggle still gates it on/off.
     "blur_amount": 0.35,
+    # Venue-size density intensity 0.0-1.0 (Phase 8). Operator taste knob for
+    # how strongly the venue-size byte branches pattern/sparkle density; 0 = off
+    # (authored look bit-exact), 1 = full YALCY-style branch. Baked defaults are
+    # unvalidated on hardware, so this stays dial-able from the dashboard.
+    "venue_intensity": 1.0,
+    # Song-section bias intensity 0.0-1.0 (Phase 8). Scales the verse/chorus
+    # hue-lean + energy bias; 0 = off (bit-exact), 1 = full.
+    "section_intensity": 1.0,
     # Each toggle defaults on unless its registry row opts out with default:False.
     "effects": {tid: meta.get("default", True) for tid, meta in EFFECT_TOGGLES.items()},
 }
@@ -254,6 +262,10 @@ class BridgeSettings:
             self._data["direction"] = stored["direction"]
         if isinstance(stored.get("blur_amount"), (int, float)):
             self._data["blur_amount"] = max(0.0, min(1.0, float(stored["blur_amount"])))
+        if isinstance(stored.get("venue_intensity"), (int, float)):
+            self._data["venue_intensity"] = max(0.0, min(1.0, float(stored["venue_intensity"])))
+        if isinstance(stored.get("section_intensity"), (int, float)):
+            self._data["section_intensity"] = max(0.0, min(1.0, float(stored["section_intensity"])))
         stored_effects = stored.get("effects")
         if isinstance(stored_effects, dict):
             for tid in EFFECT_TOGGLES:
@@ -328,6 +340,30 @@ class BridgeSettings:
             self._save()
 
     @property
+    def venue_intensity(self) -> float:
+        with self._lock:
+            return self._data["venue_intensity"]
+
+    @venue_intensity.setter
+    def venue_intensity(self, value: float):
+        value = max(0.0, min(1.0, float(value)))
+        with self._lock:
+            self._data["venue_intensity"] = value
+            self._save()
+
+    @property
+    def section_intensity(self) -> float:
+        with self._lock:
+            return self._data["section_intensity"]
+
+    @section_intensity.setter
+    def section_intensity(self, value: float):
+        value = max(0.0, min(1.0, float(value)))
+        with self._lock:
+            self._data["section_intensity"] = value
+            self._save()
+
+    @property
     def direction(self) -> str:
         with self._lock:
             return self._data["direction"]
@@ -395,6 +431,8 @@ class BridgeSettings:
                 "fps_options": list(VALID_FPS),
                 "direction": self._data["direction"],
                 "blur_amount": self._data["blur_amount"],
+                "venue_intensity": self._data["venue_intensity"],
+                "section_intensity": self._data["section_intensity"],
                 "effects": dict(self._data["effects"]),
                 "effect_toggles": {
                     tid: {"label": m["label"], "description": m["description"]}

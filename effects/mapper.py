@@ -17,7 +17,8 @@ Render pipeline (VISION Phase 3 — layer/slot compositor, see compositor.py):
   5. Surge       — star-power lift/tint + shimmer, on lit pixels; then the
                    vocal pitch ribbon (colour-by-pitch blobs) alpha-over
   6. Masks/pump  — reveal/spotlight masks, beat-locked brightness pulse
-  7. Grade       — performer hue bias + post-processing colour grade
+  7. Grade       — performer hue bias + song-section palette bias +
+                   post-processing colour grade
   8. Post-proc   — blur (fog-lifted Gaussian smoothing) → mirror(max) fold
   9. Output      — pause-dim + global brightness, reverse, wrap-around fill
 
@@ -133,6 +134,17 @@ PERFORMER_COLORS = {
     Performer.KEYBOARD: (60, 230, 120),   # green
 }
 PERFORMER_BIAS_STRENGTH = 0.18   # max blend toward the highlighted hue
+
+# ── Song-section palette/energy bias (VISION signal inventory) ───
+# The song-section byte (Verse/Chorus, offset 13) leans the current look
+# toward a per-section hue and scales its energy — a slow, subtle modulation
+# of whatever the authored cue is doing, never a repaint. The engine resolves
+# the per-section hue/energy at signal-change time and eases the gain in; the
+# mapper owns only how strongly the hue blends (a convex MIX on lit pixels
+# only, like the performer bias — it never lifts a blackout). The energy knob
+# scales the breathing swing and the beat-pump depth (verse settles, chorus
+# lifts); identity (gain 0 / None) skips both transforms entirely.
+SECTION_BIAS_STRENGTH = 0.12   # max blend toward the section hue at full gain
 
 # ── Camera-cut lighting (VISION Phase 5) ─────────────────────────
 # The venue camera's current subject biases the wash toward that player: a
@@ -538,6 +550,21 @@ class LEDMapper:
         # after a cut); cut_t is a brief directed-cut bloom. None = toggled off.
         camera = effects.get("camera", None)
 
+        # Song-section bias (signal inventory): (hue_rgb, gain, energy) or
+        # None. A slow palette/energy lean per section — gain eases in after a
+        # section change (engine-side). None or gain 0 = identity: both
+        # transforms below are skipped and the frame stays bit-exact.
+        section = effects.get("section", None)
+        section_hue = None
+        section_t = 0.0
+        section_energy = 1.0
+        if section is not None:
+            shue, sgain, senergy = section
+            if sgain > 0.0:
+                section_hue = shue
+                section_t = SECTION_BIAS_STRENGTH * sgain
+                section_energy = 1.0 + (senergy - 1.0) * sgain
+
         # Post-process chain (Phase 6). blur is a 0..1 wet strength (0 = off);
         # mirror folds the strip into a left-right symmetric look. Both applied
         # in the Output stage in the order blur → mirror → brightness.
@@ -554,6 +581,10 @@ class LEDMapper:
         # depth (0 = off); beat_phase is the engine's continuous 0→1 phase.
         beat_pulse = effects.get("beat_pulse", 0.0)
         beat_phase = effects.get("beat_phase", 1.0)
+        # Section energy scales the pump depth (chorus hits harder, a verse
+        # settles); identity skips the multiply so the default is bit-exact.
+        if section_energy != 1.0:
+            beat_pulse *= section_energy
 
         # Gradient palette (opt-in): a Gradient LUT that recolours lit pixels by
         # position, scrolled along the strip by the beat clock. gradient_roll is
@@ -821,7 +852,15 @@ class LEDMapper:
             elapsed = time.monotonic() - self._start_time
             beats_per_sec = max(bpm, 30.0) / 60.0
             phase = elapsed * beats_per_sec * breathing_rate * 2.0 * math.pi
-            breath = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(phase))
+            s = 0.5 + 0.5 * math.sin(phase)
+            if section_energy != 1.0:
+                # Section energy scales the swing depth about the 1.0 ceiling —
+                # a chorus breathes deeper, a verse shallower. Gated so the
+                # identity path keeps the exact authored formula.
+                swing = 0.65 * section_energy
+                breath = (1.0 - swing) + swing * s
+            else:
+                breath = 0.35 + 0.65 * s
             for i in range(MAPPED_REGION):
                 o = i * 3
                 if buf[o] or buf[o + 1] or buf[o + 2]:
@@ -1087,6 +1126,24 @@ class LEDMapper:
                         buf[o]     = int(buf[o] * inv_t + tr_t)
                         buf[o + 1] = int(buf[o + 1] * inv_t + tg_t)
                         buf[o + 2] = int(buf[o + 2] * inv_t + tb_t)
+
+        # ── Effect: Song-section palette bias (signal inventory) ─
+        # Lean the lit pixels toward the current section's hue — the same
+        # gentle convex MIX shape as the performer bias, driven by the engine's
+        # eased gain so a verse→chorus change drifts in over SECTION_EASE
+        # instead of snapping. Lit pixels only; never lifts a blackout.
+        if section_hue is not None and section_t > 0.0:
+            sr, sg, sb = section_hue
+            inv_t = 1.0 - section_t
+            sr_t = sr * section_t
+            sg_t = sg * section_t
+            sb_t = sb * section_t
+            for i in range(MAPPED_REGION):
+                o = i * 3
+                if buf[o] | buf[o + 1] | buf[o + 2]:
+                    buf[o]     = int(buf[o] * inv_t + sr_t)
+                    buf[o + 1] = int(buf[o + 1] * inv_t + sg_t)
+                    buf[o + 2] = int(buf[o + 2] * inv_t + sb_t)
 
         # ── Effect: Camera-cut lighting (Phase 5) ────────────────
         # Bias the wash toward the on-camera player: within that player's region

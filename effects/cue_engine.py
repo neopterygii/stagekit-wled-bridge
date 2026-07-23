@@ -12,7 +12,8 @@ import asyncio
 import time
 
 from protocol.yarg_packet import (
-    CueByte, BeatByte, KeyframeByte, StrobeSpeed, CameraCutPriority)
+    CueByte, BeatByte, KeyframeByte, StrobeSpeed, CameraCutPriority,
+    VenueSizeByte, SongSectionByte)
 from effects.gradient import GRADIENTS
 
 # Bitmask constants matching YALCY
@@ -96,8 +97,76 @@ PLL_TAU = 0.10               # seconds — lock time-constant
 BEAT_LOCK_TIMEOUT = 2.0      # seconds without a beat → free-run fallback
 PLL_DT_MAX = 0.2             # clamp per-frame dt so a stall can't fling motion
 
+# ── Venue-size density branching (VISION signal inventory) ──────
+# YALCY branches per cue on the venue-size byte (offset 8): Large venues get
+# denser multi-pattern variants, anything else sparser ones. We do the same
+# generically instead of hand-authoring 33 per-cue variants: a mask transform
+# applied to chase patterns at cue launch, plus a sparkle-density scale read
+# per frame. NoVenue/unknown keeps the authored look exactly (scale 1.0, no
+# transform) — unlike YALCY, which treats NoVenue as small.
+SPARKLE_SCALE_SMALL = 0.5    # small venue → sparser sparkle field
+SPARKLE_SCALE_LARGE = 1.5    # large venue → denser sparkle field
+
+# ── Song-section palette/energy bias (VISION signal inventory) ───
+# YARG's section byte (offset 13) carries the last Verse/Chorus lighting
+# event (LightingType values — see SongSectionByte). Each section gets a slow,
+# subtle bias that modulates the current look without repainting it: a hue
+# lean (the mapper blends lit pixels a little toward it) and an energy scale
+# applied to the breathing swing and the beat-pump depth — a verse settles,
+# a chorus lifts. The knobs are resolved at signal-change time (see
+# on_song_section); the bias eases in over SECTION_EASE so a section change
+# drifts rather than snaps. Sections not in the table (None/unknown) are
+# identity — the authored look stays bit-exact.
+SECTION_EASE = 1.0             # seconds — bias fade-in after a section change
+SECTION_BIAS = {
+    SongSectionByte.VERSE:  ((70, 110, 255), 0.85),   # cooler, settled
+    SongSectionByte.CHORUS: ((255, 170, 70), 1.20),   # warmer, lifted
+}
+
 # StageKit addressing: every zone bitmask is 8 bits → 8 cells on the ring.
 _CELLS = 8
+
+
+def _thin_opposites(mask: int) -> int:
+    """Sparser variant: collapse each opposite pair {i, i+4} to one bit.
+
+    The authored two-bit chase steps are all opposite pairs (ZERO|FOUR,
+    ONE|FIVE, …); thinning keeps the lower member of each pair, turning them
+    into single-head chases — the same rotation, half the lit cells. Single-bit
+    steps pass through unchanged, and the transform is idempotent.
+    """
+    low = mask & 0x0F
+    high = (mask >> 4) & 0x0F
+    return low | ((high & ~low) << 4)
+
+
+def _fill_opposites(mask: int) -> int:
+    """Denser variant: light the opposite cell of every lit cell.
+
+    Single-head chases (SEARCHLIGHTS, HARMONY, MENU) become opposing-pair
+    chases. Steps that already light opposite pairs (most authored chases)
+    and ALL pass through unchanged — the transform is idempotent.
+    """
+    return mask | ((mask << 4) & 0xF0) | (mask >> 4)
+
+
+def _venue_safe(mask: int) -> bool:
+    """Whether the density transforms are well-defined on this step mask.
+
+    Both transforms only carry their intended "half/double the lit cells"
+    meaning when a step is built from opposite pairs {i, i+4} and/or single
+    heads — i.e. the low and high nibbles are equal (pure opposite pairs) or
+    one nibble is empty (heads confined to a single nibble). A step that mixes
+    a nibble-spanning pair (e.g. THREE|FOUR, as `_start_multi_zone_chase`
+    produces) would be silently mis-thinned/over-filled, so such masks are
+    passed through untransformed instead. `test_venue_size` asserts every cue
+    routed through the transform path is already safe, so this guard turns a
+    future non-conforming pattern into a caught invariant rather than a subtle
+    wrong look on stage.
+    """
+    low = mask & 0x0F
+    high = (mask >> 4) & 0x0F
+    return low == high or low == 0 or high == 0
 
 
 def _ring_delta(a: int, b: int) -> int:
@@ -287,6 +356,34 @@ class CueEngine:
         # BLUR_BASE so a bare engine (tests) still emits the documented value.
         self._blur_base = BLUR_BASE
 
+        # Venue size (offset 8). Branches pattern density per cue: small
+        # venues thin chase steps to single heads, large venues fill single
+        # heads out to opposing pairs, and both rescale sparkle density.
+        # _mask_transform is applied to pattern steps at cue launch (never
+        # per frame); NoVenue/unknown leaves both knobs at identity, which
+        # preserves the authored look exactly. _venue_sparkle_base holds the
+        # authored deviation; _venue_intensity (operator knob, synced from
+        # settings each frame like blur) scales how far both knobs lean —
+        # 1.0 = full, 0.0 = off (bit-exact, transform gated out).
+        self._venue_size = VenueSizeByte.NO_VENUE
+        self._mask_transform = None          # None | _thin_opposites | _fill_opposites
+        self._venue_sparkle_base = 1.0
+        self._venue_intensity = 1.0
+
+        # Song section (offset 13). Sustained state — the mapper leans the
+        # current look toward the section's hue and scales its energy
+        # (breathing swing + beat-pump depth). Both knobs are resolved at
+        # signal-change time (on_song_section); _section_changed_at eases the
+        # bias in over SECTION_EASE so a section change drifts, never snaps.
+        # _section_hue None = identity (None/unknown section → bit-exact).
+        # _section_intensity (operator knob, synced from settings each frame)
+        # scales the whole bias — 1.0 = full, 0.0 = off (bit-exact).
+        self._song_section = SongSectionByte.NONE
+        self._section_hue = None             # (r,g,b) or None
+        self._section_energy = 1.0
+        self._section_changed_at = 0.0
+        self._section_intensity = 1.0
+
         # Camera cut (v3 datagram, Phase 5). The subject is sustained state —
         # it biases the wash toward the on-camera player's strip region + hue.
         # _camera_changed_at eases that bias in after each cut so the band
@@ -389,6 +486,16 @@ class CueEngine:
         now = self._paused_at if self.paused else time.monotonic()
         fx = dict(self.effects)
         fx["bpm"] = self.bpm
+        # Venue-size density knob: rescale the cue's sparkle field. The
+        # authored deviation (_venue_sparkle_base) is leaned toward 1.0 by the
+        # operator intensity, so a full/half/off dial lands live. Skipped at
+        # the identity scale so the NoVenue/unknown (and intensity 0) path
+        # stays bit-exact.
+        sparkle_scale = 1.0 + (self._venue_sparkle_base - 1.0) * self._venue_intensity
+        if sparkle_scale != 1.0:
+            sparkle = fx.get("sparkle")
+            if sparkle:
+                fx["sparkle"] = min(1.0, sparkle * sparkle_scale)
         fx["beat_flash"] = self._beat_flash
         fx["downbeat_flash"] = self._downbeat_flash
         fx["glitch_trigger"] = self._glitch_trigger
@@ -411,6 +518,15 @@ class CueEngine:
         fx["post_processing"] = self._post_processing
         fx["camera"] = (self._camera_subject,
                         self._camera_gain(now), self._camera_accent(now))
+        # Song-section bias (signal inventory): (hue, eased gain, energy) or
+        # None for the identity section (None/unknown → bit-exact look). The
+        # operator intensity scales the eased gain, which the mapper uses for
+        # both the hue-lean strength and the energy deviation — so intensity 0
+        # emits gain 0 and the mapper reads it as identity (bit-exact).
+        fx["section"] = ((self._section_hue,
+                          self._section_gain(now) * self._section_intensity,
+                          self._section_energy)
+                         if self._section_hue is not None else None)
         # Post-process chain (Phase 6). blur is a strength the mapper wet-mixes;
         # mirror is the capability signal — the dashboard toggle gates it (off by
         # default), so we emit True and let apply_effect_toggles() decide.
@@ -748,9 +864,78 @@ class CueEngine:
         """Store venue fog/haze state (Phase 6) — lifts the post-process blur."""
         self._fog = bool(foggy)
 
+    def on_venue_size(self, venue_size: int):
+        """Store the venue-size byte (offset 8) and precompute the density knobs.
+
+        Both knobs are resolved here, at signal-change time: the hot path only
+        reads them (a sparkle multiply in get_effects, a transform applied to
+        pattern steps at cue launch). NoVenue/unknown resets to identity, so
+        the authored look is bit-exact when the chart doesn't say. YARG only
+        changes the byte on chart load, so there is no mid-cue re-launch — a
+        new size takes effect at the next cue, as in YALCY.
+        """
+        self._venue_size = venue_size
+        if venue_size == VenueSizeByte.SMALL:
+            self._mask_transform = _thin_opposites
+            self._venue_sparkle_base = SPARKLE_SCALE_SMALL
+        elif venue_size == VenueSizeByte.LARGE:
+            self._mask_transform = _fill_opposites
+            self._venue_sparkle_base = SPARKLE_SCALE_LARGE
+        else:
+            self._mask_transform = None
+            self._venue_sparkle_base = 1.0
+
+    def on_song_section(self, section: int, now: float | None = None):
+        """Store the song-section byte (offset 13) and resolve the bias knobs.
+
+        Both knobs (hue lean + energy scale) are resolved here, at
+        signal-change time — the hot path only reads them (a gain ramp plus
+        one tuple in get_effects; the mapper does the per-pixel lean). The
+        change time arms a slow ease-in over SECTION_EASE so a verse→chorus
+        transition drifts rather than snaps. None/unknown resets to identity,
+        so the authored look is bit-exact when no section is playing. *now* is
+        injectable for tests; production passes None.
+        """
+        if now is None:
+            now = time.monotonic()
+        self._song_section = section
+        bias = SECTION_BIAS.get(section)
+        if bias is None:
+            self._section_hue = None
+            self._section_energy = 1.0
+        else:
+            self._section_hue, self._section_energy = bias
+        self._section_changed_at = now
+
+    def _section_gain(self, now: float) -> float:
+        """Section-bias ease-in 0.0 → 1.0 over SECTION_EASE after a change."""
+        if self._section_changed_at <= 0.0:
+            return 0.0
+        t = (now - self._section_changed_at) / SECTION_EASE
+        if t < 0.0:
+            return 0.0
+        return t if t < 1.0 else 1.0
+
     def set_blur_base(self, amount: float):
         """Set the operator blur strength (0..1); fog stacks on top of it."""
         self._blur_base = max(0.0, min(1.0, float(amount)))
+
+    def set_venue_intensity(self, amount: float):
+        """Set the venue-density operator knob (0..1).
+
+        Scales how far the sparkle field leans from the authored default and
+        gates the pattern transform (0 = off → bit-exact authored look, 1 =
+        the full YALCY-style density branch). Synced from settings each frame.
+        """
+        self._venue_intensity = max(0.0, min(1.0, float(amount)))
+
+    def set_section_intensity(self, amount: float):
+        """Set the song-section bias operator knob (0..1).
+
+        Scales the whole section bias (hue lean + energy deviation); 0 = off
+        (bit-exact), 1 = full. Synced from settings each frame like blur.
+        """
+        self._section_intensity = max(0.0, min(1.0, float(amount)))
 
     def on_camera_cut(self, subject: int, priority: int,
                       now: float | None = None):
@@ -849,6 +1034,8 @@ class CueEngine:
                 self._camera_cut_at += delta
             if self._camera_changed_at > 0.0:
                 self._camera_changed_at += delta
+            if self._section_changed_at > 0.0:
+                self._section_changed_at += delta
         self.paused = paused
 
     def on_cue(self, cue_byte: int):
@@ -1092,6 +1279,20 @@ class CueEngine:
                 SIX | TWO, SEVEN | THREE, ZERO | FOUR, ONE | FIVE,
             ], seconds=2.0)
 
+    def _venue_transform_pattern(self, pattern: list[int]) -> list[int]:
+        """Apply the venue density transform to a pattern's step masks at launch.
+
+        No-op (returns the pattern unchanged) when there's no active transform
+        (NoVenue/unknown) or the operator has dialled venue intensity to 0 —
+        both keep the authored look bit-exact. Only `_venue_safe` masks are
+        transformed; anything else passes through untouched so a nibble-spanning
+        step can never be silently mis-transformed on stage.
+        """
+        if self._mask_transform is None or self._venue_intensity <= 0.0:
+            return pattern
+        xform = self._mask_transform
+        return [xform(m) if _venue_safe(m) else m for m in pattern]
+
     def _start_beat_pattern(self, zone: int, pattern: list[int],
                             cycles_per_beat: float, listen: str | None = None):
         """Launch a beat-synced pattern loop on a zone.
@@ -1099,7 +1300,11 @@ class CueEngine:
         When *listen* is None the pattern is time-driven and ticked from the
         render thread (immune to event-loop congestion).  Event-driven
         patterns still use asyncio tasks.
+
+        The venue-size density transform (if any) is applied to the steps
+        here, at launch — never per frame.
         """
+        pattern = self._venue_transform_pattern(pattern)
         if listen is not None:
             task = asyncio.ensure_future(
                 self._run_beat_pattern(zone, pattern, cycles_per_beat, listen)
@@ -1158,6 +1363,7 @@ class CueEngine:
 
     def _start_timed_pattern(self, zone: int, pattern: list[int], seconds: float):
         """Launch a fixed-period pattern (not BPM-synced), ticked from render thread."""
+        pattern = self._venue_transform_pattern(pattern)
         steps = [[(zone, mask)] for mask in pattern]
         now = time.monotonic()
         self._time_patterns.append(_TimePattern(

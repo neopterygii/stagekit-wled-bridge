@@ -45,6 +45,8 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self._last_cue = -1
         self._last_strobe = -1
         self._last_camera_subject = -1
+        self._last_venue_size = -1
+        self._last_song_section = -1
         self._warned_versions: set[int] = set()
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
@@ -115,6 +117,20 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # blur-glow floor while the venue haze is up.
         self.engine.on_fog(pkt.fog_state)
 
+        # Venue size (offset 8) — branches pattern + sparkle density per cue.
+        # YARG only changes the byte on chart load, so this is change-gated;
+        # the new density takes effect at the next cue launch (as in YALCY).
+        if pkt.venue_size != self._last_venue_size:
+            self.engine.on_venue_size(pkt.venue_size)
+            self._last_venue_size = pkt.venue_size
+
+        # Song section (offset 13) — slow palette/energy bias per section.
+        # YARG only changes the byte on a Verse/Chorus lighting event, so this
+        # is change-gated; the engine eases the new bias in over SECTION_EASE.
+        if pkt.song_section != self._last_song_section:
+            self.engine.on_song_section(pkt.song_section)
+            self._last_song_section = pkt.song_section
+
         # Bonus FX flag — one-frame celebration burst on the strip.
         if pkt.bonus_effect:
             self.engine.on_bonus()
@@ -139,6 +155,8 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # Surface scene + auto-gen track flag for the status page.
         self.tracker.on_scene(pkt.scene)
         self.tracker.on_auto_gen(pkt.auto_gen)
+        self.tracker.on_venue_size(pkt.venue_size)
+        self.tracker.on_song_section(pkt.song_section)
         self.tracker.on_paused(pkt.paused == 2)
         self.tracker.on_star_power(pkt.sp_active, pkt.sp_charge, pkt.sp_active_count)
 
@@ -429,6 +447,12 @@ class RenderThread(threading.Thread):
             # Operator blur strength (dashboard slider) — fog stacks on top of
             # this in the engine. Synced each frame so a drag lands live.
             self._engine.set_blur_base(self._settings.blur_amount)
+
+            # Venue-density + song-section intensity (dashboard sliders) —
+            # scale the Phase 8 signal biases; synced each frame so a drag
+            # lands live (the venue transform re-reads the knob at next cue).
+            self._engine.set_venue_intensity(self._settings.venue_intensity)
+            self._engine.set_section_intensity(self._settings.section_intensity)
 
             # Get effects (consumes and clears transient flags)
             effects = self._engine.get_effects()

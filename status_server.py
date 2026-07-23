@@ -13,6 +13,7 @@ from http import HTTPStatus
 
 from protocol.yarg_packet import (
     CueByte, BeatByte, SceneIndexByte, StrobeSpeed, CameraCutSubject,
+    VenueSizeByte, SongSectionByte,
 )
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,8 @@ class StatusTracker:
         self.scene = 0          # 0=Unknown 1=Menu 2=Gameplay 3=Score 4=Calibration
         self.auto_gen = False   # True when YARG is using auto-generated venue lighting
         self.paused = False
+        self.venue_size = 0     # VenueSizeByte: 0=None 1=Small 2=Large
+        self.song_section = 0   # SongSectionByte: 0=None 2=Chorus 5=Verse
 
         # v4 datagram signals surfaced for the dashboard
         self.camera_subject = 0     # CameraCutSubject id (parse-only, no lighting yet)
@@ -143,6 +146,12 @@ class StatusTracker:
     def on_auto_gen(self, auto_gen: bool):
         self.auto_gen = auto_gen
 
+    def on_venue_size(self, venue_size: int):
+        self.venue_size = venue_size
+
+    def on_song_section(self, section: int):
+        self.song_section = section
+
     def on_paused(self, paused: bool):
         self.paused = paused
 
@@ -171,7 +180,7 @@ class StatusTracker:
             "cue": self.current_cue_name,
             "cue_id": self.current_cue,
             "bpm": round(self.bpm, 1),
-            "strobe_hz": self.strobe_rate,
+            "strobe_hz": round(self.strobe_rate, 1),
             "zones": {
                 "red": f"{self.zones[0]:08b}",
                 "green": f"{self.zones[1]:08b}",
@@ -191,6 +200,10 @@ class StatusTracker:
             "scene": _SCENE_NAMES.get(self.scene, "Unknown"),
             "scene_id": self.scene,
             "auto_gen": self.auto_gen,
+            "venue_size": VenueSizeByte.name(self.venue_size),
+            "venue_size_id": self.venue_size,
+            "song_section": SongSectionByte.name(self.song_section),
+            "song_section_id": self.song_section,
             "paused": self.paused,
             "camera_subject": CameraCutSubject.name(self.camera_subject),
             "camera_subject_id": self.camera_subject,
@@ -364,7 +377,7 @@ STATUS_HTML = """\
   </div>
   <div class="card">
     <div class="label">Current Cue</div>
-    <div class="value"><span id="cue">&mdash;</span> <span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span></div>
+    <div class="value"><span id="cue">&mdash;</span> <span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span><span class="pill auto hidden" id="venue-pill"></span></div>
   </div>
   <div class="card">
     <div class="label">BPM</div>
@@ -374,6 +387,10 @@ STATUS_HTML = """\
     <div class="label">Beat</div>
     <div class="value"><span class="beat-dot" id="beat-dot"></span> <span id="beat-num">&mdash;</span></div>
     <div style="font-size:0.7rem;color:var(--dim);margin-top:0.35rem">beat in bar</div>
+  </div>
+  <div class="card" id="section-card">
+    <div class="label">Song Section</div>
+    <div class="value" id="section">&mdash;</div>
   </div>
   <div class="card">
     <div class="label">Strobe</div>
@@ -443,6 +460,18 @@ STATUS_HTML = """\
     <div class="label">Blur Amount</div>
     <div class="value" id="blur-pct">35%</div>
     <input type="range" id="blur-slider" min="0" max="100" value="35" step="1"
+           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
+  </div>
+  <div class="card" id="venue-intensity-card">
+    <div class="label">Venue Density</div>
+    <div class="value" id="venue-intensity-pct">100%</div>
+    <input type="range" id="venue-intensity-slider" min="0" max="100" value="100" step="1"
+           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
+  </div>
+  <div class="card" id="section-intensity-card">
+    <div class="label">Section Bias</div>
+    <div class="value" id="section-intensity-pct">100%</div>
+    <input type="range" id="section-intensity-slider" min="0" max="100" value="100" step="1"
            style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
   </div>
 </div>
@@ -629,6 +658,36 @@ blurSlider.addEventListener('change', () => {
   sendBlur(parseInt(blurSlider.value));
 });
 
+// Intensity sliders (venue density, section bias) — same 0-100% → 0.0-1.0
+// debounced POST as blur. Each returns its dragging-flag getter so the live
+// update() poll can skip syncing the slider back while the user drags it.
+function wireIntensitySlider(sliderId, pctId, settingsKey) {
+  const slider = document.getElementById(sliderId);
+  const pctEl = document.getElementById(pctId);
+  let sendTimer = null;
+  let dragging = false;
+  const send = (pct) => fetch('/api/settings',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [settingsKey]: pct / 100 }) });
+  slider.addEventListener('input', () => {
+    dragging = true;
+    const pct = parseInt(slider.value);
+    pctEl.textContent = pct + '%';
+    clearTimeout(sendTimer);
+    sendTimer = setTimeout(() => send(pct), 80);
+  });
+  slider.addEventListener('change', () => {
+    dragging = false;
+    clearTimeout(sendTimer);
+    send(parseInt(slider.value));
+  });
+  return { slider, pctEl, isDragging: () => dragging };
+}
+const venueIntensity = wireIntensitySlider(
+  'venue-intensity-slider', 'venue-intensity-pct', 'venue_intensity');
+const sectionIntensity = wireIntensitySlider(
+  'section-intensity-slider', 'section-intensity-pct', 'section_intensity');
+
 // Palette select
 const paletteSelect = document.getElementById('palette-select');
 let palettesPopulated = false;
@@ -712,6 +771,15 @@ function updateSettings(s) {
       blurSlider.value = pct;
     }
     blurPct.textContent = pct + '%';
+  }
+  // Sync the intensity sliders from server values (skip while dragging).
+  for (const [knob, key] of [[venueIntensity, 'venue_intensity'],
+                             [sectionIntensity, 'section_intensity']]) {
+    if (typeof s[key] === 'number' && !knob.isDragging()) {
+      const pct = Math.round(s[key] * 100);
+      if (parseInt(knob.slider.value) !== pct) knob.slider.value = pct;
+      knob.pctEl.textContent = pct + '%';
+    }
   }
   // Populate palette dropdown once
   if (!palettesPopulated && s.palettes) {
@@ -984,6 +1052,17 @@ function update(d) {
   document.getElementById('autogen-pill').classList.toggle('hidden', !d.auto_gen);
   // PAUSED pill — YARG game is paused
   document.getElementById('paused-pill').classList.toggle('hidden', !d.paused);
+  // Venue pill — YARG venue size (drives the density branching)
+  const venueEl = document.getElementById('venue-pill');
+  if (d.venue_size_id > 0) {
+    venueEl.textContent = d.venue_size.toUpperCase() + ' VENUE';
+    venueEl.classList.remove('hidden');
+  } else {
+    venueEl.classList.add('hidden');
+  }
+  // Song section — dedicated readout (drives the palette/energy bias)
+  document.getElementById('section').textContent =
+    d.song_section_id > 0 ? d.song_section.toUpperCase() : '\u2014';
   // Scene label under the connection card
   const sceneEl = document.getElementById('scene-label');
   if (d.scene && d.scene !== 'Unknown') {
@@ -1225,6 +1304,22 @@ class StatusServer:
                     changed.append(f"blur_amount={self.settings.blur_amount:.2f}")
             except (ValueError, TypeError):
                 return 400, "Invalid blur_amount value"
+        if "venue_intensity" in body:
+            try:
+                old_vi = self.settings.venue_intensity
+                self.settings.venue_intensity = float(body["venue_intensity"])
+                if self.settings.venue_intensity != old_vi:
+                    changed.append(f"venue_intensity={self.settings.venue_intensity:.2f}")
+            except (ValueError, TypeError):
+                return 400, "Invalid venue_intensity value"
+        if "section_intensity" in body:
+            try:
+                old_si = self.settings.section_intensity
+                self.settings.section_intensity = float(body["section_intensity"])
+                if self.settings.section_intensity != old_si:
+                    changed.append(f"section_intensity={self.settings.section_intensity:.2f}")
+            except (ValueError, TypeError):
+                return 400, "Invalid section_intensity value"
         if "effects" in body:
             updates = body["effects"]
             if not isinstance(updates, dict):
