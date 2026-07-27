@@ -219,9 +219,14 @@ repeatable, observable, and safe to evolve:
    parser → cue engine → mapper → DDP. Keep captures to protocol data, not song
    audio or encrypted chart content. Assert deterministic frame samples/hashes,
    lifecycle transitions, malformed/future packets, dropped beats, pause/resume,
-   and WLED loss/recovery. Use a headless DDP receiver (the WLED Simulator is a
-   candidate) in CI. Official RB3/YARG songs can still produce useful live
-   captures even when their `.sng`/`.yargsong` sources are encrypted.
+   and WLED loss/recovery. Classify fixtures by their real venue source:
+   chart-native MIDI `VENUE` events, legacy Rock Band `.milo/.milo_xbox`
+   animation cues loaded by `SongChart.LoadVenueFromMilo()`, or YARG
+   auto-generation used only when neither authored source supplies lighting.
+   Inspect both chart and Milo members before calling a song auto-generated.
+   Use a headless DDP receiver (the WLED Simulator is a candidate) in CI.
+   Official RB3/YARG songs can still produce useful live captures even when
+   their `.sng`/`.yargsong` sources are encrypted.
 3. **Lighting alignment trim.** Add a persisted, dashboard-adjustable delay in
    milliseconds plus a calibration pattern. Default to **0 ms**: YARG emits
    venue events against `GameManager.SongTime`, which already incorporates its
