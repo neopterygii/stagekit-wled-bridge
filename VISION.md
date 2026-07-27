@@ -219,11 +219,13 @@ repeatable, observable, and safe to evolve:
    parser → cue engine → mapper → DDP. Keep captures to protocol data, not song
    audio or encrypted chart content. Assert deterministic frame samples/hashes,
    lifecycle transitions, malformed/future packets, dropped beats, pause/resume,
-   and WLED loss/recovery. Classify fixtures by their real venue source:
-   chart-native MIDI `VENUE` events, legacy Rock Band `.milo/.milo_xbox`
-   animation cues loaded by `SongChart.LoadVenueFromMilo()`, or YARG
-   auto-generation used only when neither authored source supplies lighting.
-   Inspect both chart and Milo members before calling a song auto-generated.
+   and WLED loss/recovery. Classify fixtures by their real venue source: MIDI
+   `VENUE` data (including both legacy Rock Band note-number/controller cues and
+   text events), legacy Rock Band `.milo/.milo_xbox` animation cues loaded by
+   `SongChart.LoadVenueFromMilo()`, or YARG auto-generation used only when
+   neither authored source supplies lighting. Decode the MIDI events and inspect
+   Milo members before calling a song auto-generated; printable-string searches
+   are insufficient.
    Use a headless DDP receiver (the WLED Simulator is a candidate) in CI.
    Official RB3/YARG songs can still produce useful live captures even when
    their `.sng`/`.yargsong` sources are encrypted.
