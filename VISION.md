@@ -116,16 +116,16 @@ Who does what best, and where it lands in our code:
 - [x] **2. Continuous sub-pixel scanner rendering** *(merged to main)* — motion
   cues paint a soft triangular profile at a continuous float position; peak and
   width stay constant while the head glides pixel-by-pixel.
-- [x] **3. Layer/slot compositor** *(implemented on `feat/layer-compositor`)* —
+- [x] **3. Layer/slot compositor** *(merged to main)* —
   independent elements (wash, motion, sparkle, flash, bonus) render into their
   own pre-allocated buffers and are folded together by a `Compositor` with
   explicit blend modes (REPLACE / ADD / MIX / MIX_LIT / MIX_PREMULT); the
   whitening accents compose convexly in one pass, so overlapping overlays
   screen-combine instead of clip-fighting in a shared buffer. Whole-image
   modifiers (breathing, glitch, surge, masks, beat-pulse, brightness) stay as
-  ordered transforms. See "Current focus" below.
+  ordered transforms. See "Foundation — Phase 3" below.
 - [x] **4. Note-hold + performer/vocal reactivity + post-processing colour
-  tints** *(implemented on `feat/note-vocal-reactivity`)* — the four
+  tints** *(merged to main)* — the four
   parsed-but-unused signal groups now drive light: per-instrument **note-hold**
   accents (rising edge → ≥1/32-note hold → decay, painted in each instrument's
   strip slice), a **vocal pitch ribbon** (per-voice blob, position = absolute
@@ -133,7 +133,7 @@ Who does what best, and where it lands in our code:
   union tints the wash toward the featured performers' hues), and
   **post-processing colour grades** (B&W/sepia/silver/negative/desaturated/
   contrast tints applied as a global palette modifier; camera-only grades pass
-  through). See "Current focus" below.
+  through). See "Delivered — Phase 4" below.
 - [x] **5. Camera-cut lighting** *(merged to main)* —
   the camera subject biases the wash toward the on-camera player's strip region
   + hue (a gentle brightness lift + convex hue lean on lit pixels only, eased in
@@ -181,7 +181,7 @@ Who does what best, and where it lands in our code:
   suppresses) — the render loop, persistence, and dashboard switches are
   generic, so new layers get a switch for free.
 - [ ] **8. Venue awareness: tempo-locked strobe + venue-size density + song-section
-  bias** *(implemented on `feat/venue-awareness`)* — the three remaining
+  bias** *(merged to main)* — the three remaining
   parsed-but-unused / fixed-rate signals now shape the light. **Tempo-locked
   strobe**: strobe speeds map to note divisions (quarter/eighth/sixteenth/
   thirty-second) and derive Hz live from BPM (YALCY `StrobeDmxFromBpm`), with the
@@ -207,17 +207,19 @@ Who does what best, and where it lands in our code:
   transforms cannot vary continuously—while preserving a continuous taste
   knob for sparkle.
 
-## Next push — reliability, replay, alignment, and state
+## Current focus — next push: reliability, replay, alignment, and state
 
 Multi-strip output remains a major goal, but is deliberately deferred until
 there is enough hardware to exercise failure, ordering, and geometry cases on a
 real rig. The next push should make the current single-strip appliance
 repeatable, observable, and safe to evolve:
 
-1. **Release the live baseline.** Merge `fix/bridge-review-findings` (including
-   Phase 8) to `main`, publish/redeploy `:latest`, bring this file and the README
-   up to the deployed feature set, and run the Python suite in GitHub Actions
-   before building the container.
+1. **Release the live baseline.** *(done — `v1.0.0`.)* Merged
+   `fix/bridge-review-findings` (including Phase 8) to `main`, tagged `v1.0.0` as
+   an immutable rollback image, brought this file and the README up to the
+   deployed feature set, and added a `test` job to `.github/workflows/docker.yml`
+   that the image build now depends on. The Unraid template tracks `:latest`;
+   rollback is a template edit to `:1.0.0`.
 2. **Full-path replay and capture harness.** Record timestamped YARG datagrams
    from representative performances and replay them through
    parser → cue engine → mapper → DDP. Keep captures to protocol data, not song
@@ -268,14 +270,14 @@ repeatable, observable, and safe to evolve:
   bridge state, but the bridge remains the lighting authority while it meets the
   rig's needs.
 
-## Current focus — Phase 4: note / vocal / performer / post-processing reactivity
+## Delivered — Phase 4: note / vocal / performer / post-processing reactivity
 
 **Problem.** Four signal groups YARG broadcasts were parsed but thrown away, so
 the strip ignored the notes being played, the vocal line, who the venue was
 featuring, and the film grade — the light didn't react to the *performance*, only
 to the authored cue.
 
-**The work (implemented, `feat/note-vocal-reactivity`).** Each group is consumed
+**The work (merged to main).** Each group is consumed
 host-side, tastefully, and composited on top of the existing cue look:
 
 - **Note-hold accents** (`on_notes`, notes 14–17). A note bitmask bit going 0→1
@@ -327,7 +329,7 @@ buffer"). Whitening accents were the worst offenders: three sequential
 blend-toward-white passes over-whitened a lit pixel until its wash colour was
 lost.
 
-**The fix (implemented, `feat/layer-compositor`).** A small compositor
+**The fix (merged to main).** A small compositor
 (`effects/compositor.py`): each independent element renders into its own
 pre-allocated buffer — a `Layer` — and `Compositor.composite()` folds the active
 layers together with an explicit blend mode + opacity (REPLACE / ADD / MIX /
@@ -368,20 +370,30 @@ heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
   scroll (`effects/gradient.py`; demo on VERSE).
 - **Phase 2 (merged):** continuous sub-pixel scanner rendering
   (`tests/test_scanner.py`).
-- **Phase 3 (`feat/layer-compositor`):** the layer/slot compositor above.
-- **Phase 4 (`feat/note-vocal-reactivity`):** note-hold accents, vocal pitch
+- **Phase 3 (merged):** the layer/slot compositor above.
+- **Phase 4 (merged):** note-hold accents, vocal pitch
   ribbon, performer highlight bias, and post-processing colour grades — the four
-  parsed-but-unused signal groups now drive light (see "Current focus" above).
+  parsed-but-unused signal groups now drive light (see "Delivered — Phase 4"
+  above).
 - **Phase 5 (merged):** camera-cut lighting (`tests/test_camera_cut.py`).
 - **Phase 6 (merged):** blur/mirror post-process polish + fog-lifted blur
   (`tests/test_blur_mirror.py`).
 - **Phase 7 (merged):** live strip / per-layer / beat-clock dashboard preview
   (`tests/test_preview.py`). Remaining dashboard backlog (not yet built): richer
   per-signal telemetry cards.
-- **Phase 8 (`feat/venue-awareness`):** tempo-locked strobe
+- **Phase 8 (merged):** tempo-locked strobe
   (`tests/test_strobe.py`), venue-size density branching
   (`tests/test_venue_size.py`), and song-section palette/energy bias +
   dashboard readout (`tests/test_song_section.py`). Every signal in the
   inventory table now drives light or the dashboard.
-- Roadmap phases 0–7 are all **merged to main** and deployed — the live Tower
-  container runs current main. Phase 8 is implemented on its feature branch.
+  *Caveat:* YARG hardcodes venue size to Small, so the Large density path never
+  runs on real input — see `BACKLOG.md`.
+- **`venue_scan/` (merged):** offline library inventory. Reads SNG and
+  RB3CON/STFS containers, decodes MIDI `VENUE` text *and* legacy note-number
+  cues, inspects `.milo/.milo_xbox` members, and classifies each song's lighting
+  source against YARG's three fallback gates. Not part of the bridge runtime; it
+  exists so effect work aims at the cues real charts actually contain
+  (`tests/test_venue_*.py`).
+- Roadmap phases 0–8 are all **merged to main**, released as **`v1.0.0`**, and
+  deployed. Test suite: 271 tests, run in CI before the image is built.
+- **Not yet started:** everything under "Current focus — next push" above.

@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: CI
 
 on:
   push:
@@ -12,7 +12,32 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Gate the image on the suite. The container is what runs the show, so a
+  # green build of a red commit is worse than no build at all — nothing else
+  # stands between a bad commit and the live strip.
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Match the Dockerfile's python:3.12-alpine base.
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

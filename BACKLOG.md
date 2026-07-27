@@ -29,8 +29,13 @@ permanently thinned to single-head chase steps with halved sparkle, and the
 Large fill-out path never runs on real input. `VISION.md` describes the feature
 as branching on small/large, which does not match what arrives on the wire.
 
-**This is a source read, not a live observation.** Confirm against a real
-capture before changing behaviour — the whole point of `AGENTS.md`'s
+**Corroborated live, 2026-07-27.** The running Tower container's
+`/api/status` reported `"venue_size": "Small"` (`venue_size_id: 1`) while
+attached to a live YARG session mid-song. That is consistent with the hardcode
+but is still a single observation of one song, so it cannot by itself prove
+`Large` is unreachable. A capture across several songs — which the replay
+harness (item 2) will produce — is what settles it. Do not change behaviour on
+the strength of the source read alone; that is the whole point of `AGENTS.md`'s
 "check the running system first" rule.
 
 Options once confirmed:
@@ -96,10 +101,14 @@ its behaviour dominates the look far more than any individual cue.
 See `VISION.md` "Next push — reliability, replay, alignment, and state" for the
 full description of each:
 
-1. `OPEN` — Release the live baseline: merge `fix/bridge-review-findings` to
-   `main`, publish/redeploy, reconcile docs with the deployed feature set.
-2. `OPEN` — Timestamped YARG datagram capture/replay harness with a headless
-   DDP receiver in CI.
+1. `DONE` (2026-07-27) — Release the live baseline: merged
+   `fix/bridge-review-findings` to `main` (a fast-forward), tagged `v1.0.0`,
+   added the CI test gate, and reconciled README/VISION with the deployed
+   feature set. The four commits on top of the live commit `117952b` contained
+   no runtime changes — only docs and the offline `venue_scan/` package — so the
+   release was a re-tag rather than a behaviour change.
+2. `IN PROGRESS` — Timestamped YARG datagram capture/replay harness with a
+   headless DDP receiver in CI.
 3. `OPEN` — Persisted operator lighting-alignment trim plus a calibration
    pattern. Default 0 ms.
 4. `OPEN` — Expanded read-only game/bridge state, optionally over MQTT.

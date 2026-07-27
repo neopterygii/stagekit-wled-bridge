@@ -1,0 +1,3 @@
+# Test-only dependencies. The bridge runtime itself is stdlib-only
+# (see requirements.txt) and nothing here is installed into the image.
+pytest>=8,<10

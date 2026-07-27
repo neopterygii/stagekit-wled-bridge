@@ -2,23 +2,29 @@
 
 A Docker container that receives **YARG / RB3E** Stage Kit lighting data over UDP and outputs it as DDP pixel data to a **WLED** controller driving an APA102/SK9822 LED strip.
 
-Translates all Stage Kit cues (Warm Auto, Cool Auto, Frenzy, Sweep, Big Rock Ending, etc.) into beat-synced color patterns across 120 LEDs with per-pixel effects, strobe overlay, and 12 color palettes. Includes a live web dashboard with built-in test pattern controls.
+Translates all Stage Kit cues (Warm Auto, Cool Auto, Frenzy, Sweep, Big Rock Ending, etc.) into beat-synced color patterns across 120 LEDs with per-pixel effects, tempo-locked strobe, and 12 color palettes. Every field YARG puts on the wire — notes, vocals, performers, camera cuts, star power, post-processing, fog, venue size, song section — drives the light or the dashboard. Includes a live web dashboard with built-in test pattern controls.
 
 ## Features
 
-- **Full Stage Kit cue engine** — 21 cues with beat-synced patterns, event-triggered flares, and static presets
+- **Full Stage Kit cue engine** — all 33 YARG `CueByte` values: 25 lighting cues with beat-synced patterns, event-triggered flares and static presets, plus 5 strobe speeds and 3 keyframe steps
 - **Per-pixel effects** — decay trails, sine breathing, sparkle overlay, gradient blending, glitch overlay, initial flash
+- **Layer/slot compositor** — wash, motion, sparkle, flash, bonus, note, and vocal layers composed in a fixed order rather than overwritten in place
 - **12 color palettes** — Default RGBY, Party, Dancefloor, Plasma, Lava, Ocean, Forest, Sunset, Borealis, Frost, Sakura, Neon
+- **Beat oscillator** — continuous beat clock that coasts through dropped beat pulses, phase-locked chase motion (PLL with free-run fallback), and beat-locked gradient scroll
+- **Instrument and vocal reactivity** — per-instrument note-hold accents in each instrument's slice of the strip, and a colour-by-pitch vocal ribbon for lead plus three harmonies
+- **Performer and camera awareness** — spotlight/singalong bias toward the featured players, and camera-cut subject region/hue bias with a directed-cut accent
+- **Star power** — charging tint that builds with the meter, then a surge-and-shimmer overlay while overdrive is active
+- **Venue and section awareness** — tempo-locked strobe (BPM × note division), venue-size pattern density, and song-section palette/energy bias
+- **Post-processing and fog** — venue colour grades applied as a global palette modifier, plus a blur/mirror chain that lifts toward a blur-glow floor while the haze is up
 - **DDP output** — sends raw RGB pixels directly to WLED (no segment config needed)
 - **Dedicated render thread** — pixel rendering and DDP output run on an isolated OS thread with adaptive perf_counter timing, independent of the asyncio event loop
 - **Interleaved zone layout** — 4 color zones spread across 8 cells of 12 LEDs each for smooth chase/sweep effects
-- **Strobe overlay** — global brightness modulation at 2/4/8/16 Hz
-- **Live web dashboard** — real-time zone visualization, event log, SSE streaming, palette preview
+- **Live web dashboard** — live strip and per-layer preview, beat clock, zone visualization, event log, SSE streaming, palette preview
 - **Built-in test controls** — trigger any of 21 cues from the web UI with adjustable BPM and strobe, no need to run YARG
-- **Persistent settings** — brightness and palette stored in JSON, survive restarts
+- **Persistent settings** — brightness, palette, FPS, direction, blur/venue/section intensities and per-effect toggles stored in JSON, survive restarts
 - **WLED power management** — auto-on when YARG starts, auto-off after idle timeout
 - **Pure Python stdlib** — zero external dependencies, runs on Python 3.12+
-- **Multi-arch Docker image** — builds for both `amd64` and `arm64`
+- **Multi-arch Docker image** — builds for both `amd64` and `arm64`, gated on the test suite in CI
 
 ## Quick Start
 
@@ -261,6 +267,18 @@ See [WLED_SETUP.md](WLED_SETUP.md) for detailed WLED configuration instructions.
 
 ## Development
 
+### Tests
+
+The suite is stdlib-only apart from pytest, and needs no WLED controller, no
+YARG, and no network:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+CI runs the same command and the container image is only built if it passes.
+
 ### Test Packet Sender
 
 A standalone test sender is included for development without YARG:
@@ -272,8 +290,8 @@ python test_sender.py --pattern cycle_cues
 # Specific pattern at custom BPM
 python test_sender.py --pattern warm_loop --bpm 140
 
-# Available patterns: all_on, warm_loop, cool_loop, sweep,
-#                     big_rock_ending, strobe_fast, cycle_cues
+# Available patterns: all_on, warm_loop, cool_loop, sweep, big_rock_ending,
+#                     strobe_fast, cycle_cues, star_power, camera_cuts
 ```
 
 ### Build Docker Image Locally
@@ -297,12 +315,26 @@ docker run --network host -e WLED_HOST=192.168.0.53 stagekit-wled-bridge
 │   └── wled_api.py          # WLED JSON API (power control)
 ├── effects/
 │   ├── cue_engine.py        # Stage Kit cue state machine
+│   ├── compositor.py        # Ordered layer/slot composition
+│   ├── gradient.py          # Eased gradient palettes, beat-locked scroll
 │   └── mapper.py            # Zone bitmasks → RGB pixel data + effects
+├── venue_scan/              # Offline library inventory (not part of the runtime)
+│   ├── scan.py              # Indexer entry point
+│   ├── discover.py          # Song/package discovery
+│   ├── containers/          # SNG, RB3CON/STFS, songs.dta readers
+│   ├── venue_midi.py        # MIDI VENUE track decoding (text + legacy notes)
+│   ├── venue_milo.py        # .milo/.milo_xbox animation venue data
+│   └── classify.py          # Lighting-source classification per YARG's gates
+├── tests/                   # pytest suite (stdlib only, no live hosts needed)
 ├── Dockerfile
 ├── docker-compose.yml
 └── .github/workflows/
-    └── docker.yml           # CI: build & push to ghcr.io
+    └── docker.yml           # CI: pytest, then build & push to ghcr.io
 ```
+
+`venue_scan/` is analysis tooling, not part of the bridge runtime — it reads the
+song library to answer which lighting sources and cues actually occur, so effect
+work can be aimed at what real charts contain. See `VISION.md`.
 
 ## Hardware
 
