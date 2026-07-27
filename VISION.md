@@ -193,7 +193,11 @@ Who does what best, and where it lands in our code:
   any nibble-spanning step through untouched, so a future cue can't be silently
   mis-thinned; the invariant is pinned by a test over every cue).
   NoVenue/unknown is bit-exact identity (`tests/test_venue_size.py`; SMALL/LARGE
-  pill on the dashboard). **Song-section bias**: Verse leans cool / Chorus leans
+  pill on the dashboard). **Caveat found 2026-07-27:** YARG hardcodes the venue
+  size it sends — `DataStreamGameplayMonitor.cs:85` uses
+  `Random.Range(1, 2)`, whose `int` overload is max-exclusive and so always
+  returns `Small`. The Large path therefore never runs on real input. Confirm
+  against a live capture before acting; see `BACKLOG.md`. **Song-section bias**: Verse leans cool / Chorus leans
   warm as a convex hue lean on lit pixels only, with a per-section energy scale
   on the beat-pump depth and breathing swing, eased in over 1 s
   (`tests/test_song_section.py`; dedicated Song Section card on the dashboard).
@@ -222,10 +226,13 @@ repeatable, observable, and safe to evolve:
    and WLED loss/recovery. Classify fixtures by their real venue source: MIDI
    `VENUE` data (including both legacy Rock Band note-number/controller cues and
    text events), legacy Rock Band `.milo/.milo_xbox` animation cues loaded by
-   `SongChart.LoadVenueFromMilo()`, or YARG auto-generation used only when
-   neither authored source supplies lighting. Decode the MIDI events and inspect
-   Milo members before calling a song auto-generated; printable-string searches
-   are insufficient.
+   `SongChart.LoadVenueFromMilo()`, or YARG auto-generation. Note the three
+   fallbacks have different triggers — the Milo load needs all five `VenueTrack`
+   lists empty, lighting auto-generation needs only `Lighting.Count == 0`, and
+   fog auto-generation runs even on authored venues (see `AGENTS.md`). Decode the
+   MIDI events and inspect Milo members before calling a song auto-generated;
+   printable-string searches are insufficient. `venue_scan/` does this across the
+   whole library and is the source for picking fixtures.
    Use a headless DDP receiver (the WLED Simulator is a candidate) in CI.
    Official RB3/YARG songs can still produce useful live captures even when
    their `.sng`/`.yargsong` sources are encrypted.
