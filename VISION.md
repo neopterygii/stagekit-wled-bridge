@@ -203,6 +203,57 @@ Who does what best, and where it lands in our code:
   transforms cannot vary continuously—while preserving a continuous taste
   knob for sparkle.
 
+## Next push — reliability, replay, alignment, and state
+
+Multi-strip output remains a major goal, but is deliberately deferred until
+there is enough hardware to exercise failure, ordering, and geometry cases on a
+real rig. The next push should make the current single-strip appliance
+repeatable, observable, and safe to evolve:
+
+1. **Release the live baseline.** Merge `fix/bridge-review-findings` (including
+   Phase 8) to `main`, publish/redeploy `:latest`, bring this file and the README
+   up to the deployed feature set, and run the Python suite in GitHub Actions
+   before building the container.
+2. **Full-path replay and capture harness.** Record timestamped YARG datagrams
+   from representative performances and replay them through
+   parser → cue engine → mapper → DDP. Keep captures to protocol data, not song
+   audio or encrypted chart content. Assert deterministic frame samples/hashes,
+   lifecycle transitions, malformed/future packets, dropped beats, pause/resume,
+   and WLED loss/recovery. Use a headless DDP receiver (the WLED Simulator is a
+   candidate) in CI. Official RB3/YARG songs can still produce useful live
+   captures even when their `.sng`/`.yargsong` sources are encrypted.
+3. **Lighting alignment trim.** Add a persisted, dashboard-adjustable delay in
+   milliseconds plus a calibration pattern. Default to **0 ms**: YARG emits
+   venue events against `GameManager.SongTime`, which already incorporates its
+   audio calibration and modeled playback latency, so copying the in-game audio
+   calibration into the bridge would likely compensate twice. The bridge value
+   is an additional trim for display, network, controller, and human perception.
+4. **Game-state output, without surrendering lighting control.** Keep all cue
+   interpretation and WLED/DMX control in this bridge. Expand its status model
+   and optionally publish the resulting read-only state over MQTT (connection,
+   scene, paused/in-song, cue, section, BPM, performers, star power, and WLED
+   health). Song title/artist require a separate YARG metadata input or upstream
+   datagram extension; do not infer them from lighting packets.
+5. **High-priority WLED firmware qualification.** Treat the live Athom device as
+   irreplaceable until recovery is proven. Before OTA: export `cfg.json`,
+   `presets.json`, `/json/cfg`, `/json/info`, and the current state; archive the
+   exact known-good 0.14.4/vendor image; document USB/serial recovery; and verify
+   the target binary on spare equivalent hardware when available. Pin and test
+   the device-specific invariants: ESP32/4 MB with 983 KB filesystem, APA102
+   type 51 on data/clock GPIO 18/5 at 5 MHz, 120 pixels, 3 A limiter, IR GPIO 25,
+   relay GPIO 2, button GPIO 0, AudioReactive configuration, DDP :4048, and
+   realtime timeout/brightness behavior. After upgrade, run a bridge replay and
+   visual color/order/strobe/power-cycle checks before accepting it.
+
+### Deferred until multi-output test hardware exists
+
+- A logical canvas sliced across multiple WLED devices, with named performer
+  regions, per-output offsets/counts/reverse/brightness, and independent health.
+- A general rig editor or arbitrary fixture routing.
+- Moving lighting control into Home Assistant. Home Assistant/MQTT may consume
+  bridge state, but the bridge remains the lighting authority while it meets the
+  rig's needs.
+
 ## Current focus — Phase 4: note / vocal / performer / post-processing reactivity
 
 **Problem.** Four signal groups YARG broadcasts were parsed but thrown away, so
