@@ -5,6 +5,33 @@ Per the mission-control protocol, this is the full backlog; the dashboard in
 
 Item status: `OPEN` · `IN PROGRESS` · `BLOCKED` · `DONE` · `DEFERRED`.
 
+## Next up (set 2026-07-28)
+
+These three came from watching the rig, so they take priority over the remaining
+reliability workstreams. In order:
+
+1. **[WLED desync after hours of DDP](#open--wled-drifts-out-of-sync-after-hours-of-ddp-only-a-physical-power-cycle-clears-it)**
+   — first, because it's the only one that breaks a show rather than merely
+   looking wrong, and because the diagnosis is *evidence gathering*, not a code
+   change. Do not touch lighting code for it until "desync" is pinned down to
+   constant latency, progressive drift, or dropped frames. Start with a
+   long-running replay loop rather than another 4-hour game session.
+2. **[Spotlight cues are too narrow](#open--spotlight-cues-light-too-narrow-a-slice-of-the-strip)**
+   — a one-number change with an obvious answer, worth landing while the desync
+   evidence accumulates.
+3. **[Newer layers ignore the selected palette](#open--newer-reactivity-layers-ignore-the-selected-palette)**
+   — the largest of the three and the one with a real design question in it
+   (pitch-class colour *means* something), so it wants a decision before code.
+
+Then back to the reliability push: W3 alignment trim, W4 read-only state/MQTT,
+W5 firmware qualification. Note item 1 above is an argument *for* W5 but also a
+reason to gather evidence before it, since a firmware upgrade could mask the
+cause rather than fix it.
+
+Blocking neither: `feat/replay-harness` is built and awaiting merge, and items 1
+and 2 both get easier once it lands (a recorded passage replayed before/after
+beats remembering last night's show).
+
 ---
 
 ## OPEN — VenueSize is hardcoded to Small, so Phase 8 density branching is dead code
@@ -254,10 +281,14 @@ recorded passage instead of relying on memory of last night's show.
 
 ---
 
-## Existing headline items
+## Reliability-push headline items
 
-See `VISION.md` "Next push — reliability, replay, alignment, and state" for the
-full description of each:
+The original five-workstream push. **"Next up" above now takes priority over
+items 3–5 here** — those three came from the rig's actual behaviour, which beats
+a plan made before it was watched this closely.
+
+See `VISION.md` "Current focus — next push: reliability, replay, alignment, and
+state" for the full description of each:
 
 1. `DONE` (2026-07-27) — Release the live baseline: merged
    `fix/bridge-review-findings` to `main` (a fast-forward), tagged `v1.0.0`,
@@ -265,8 +296,10 @@ full description of each:
    feature set. The four commits on top of the live commit `117952b` contained
    no runtime changes — only docs and the offline `venue_scan/` package — so the
    release was a re-tag rather than a behaviour change.
+   *Still outstanding:* the operator flips the Unraid template from the stale
+   branch tag to `:latest` (rollback `:1.0.0`) and recreates the container.
 2. `IN PROGRESS` — Timestamped YARG datagram capture/replay harness with a
-   headless DDP receiver in CI.
+   headless DDP receiver in CI. Built on `feat/replay-harness`, awaiting merge.
 3. `OPEN` — Persisted operator lighting-alignment trim plus a calibration
    pattern. Default 0 ms.
 4. `OPEN` — Expanded read-only game/bridge state, optionally over MQTT.
