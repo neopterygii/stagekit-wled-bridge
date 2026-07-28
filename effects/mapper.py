@@ -230,7 +230,8 @@ class LEDMapper:
     to avoid per-frame heap allocations and GC pressure.
     """
 
-    def __init__(self, led_count: int = LED_COUNT):
+    def __init__(self, led_count: int = LED_COUNT, clock=time.monotonic,
+                 seed: int | None = None):
         self.led_count = led_count
         # Output buffer — written in place each frame
         self._out = bytearray(led_count * 3)
@@ -290,8 +291,17 @@ class LEDMapper:
         # sparkle so cool flecks fade smoothly instead of strobing per frame.
         self._sp_shimmer = bytearray(MAPPED_REGION)
 
-        # Timing for breathing
-        self._start_time = time.monotonic()
+        # Timing for breathing. Injectable so a replayed capture breathes on the
+        # same synthetic timeline as everything else (replay/player.py).
+        self._clock = clock
+        self._start_time = clock()
+
+        # Sparkle, glitch and star-power shimmer scatter pixels at random. An
+        # owned Random instead of the module-level one means (a) nothing else in
+        # the process can perturb the look by reseeding, and (b) a replay can
+        # pass a fixed seed and get the same flecks every run. seed=None keeps
+        # production's behaviour: OS entropy, a different scatter each start.
+        self._rng = random.Random(seed)
 
         # ── Live per-layer preview (VISION Phase 7) ──────────────
         # When render() is called with preview=True, each compositor layer's
@@ -849,7 +859,7 @@ class LEDMapper:
 
         # ── Effect: Sine breathing ───────────────────────────────
         if breathing_rate > 0.0:
-            elapsed = time.monotonic() - self._start_time
+            elapsed = self._clock() - self._start_time
             beats_per_sec = max(bpm, 30.0) / 60.0
             phase = elapsed * beats_per_sec * breathing_rate * 2.0 * math.pi
             s = 0.5 + 0.5 * math.sin(phase)
@@ -885,7 +895,7 @@ class LEDMapper:
             if beat_flash or sparkle_continuous:
                 for i in range(MAPPED_REGION):
                     o = i * 3
-                    if (buf[o] | buf[o + 1] | buf[o + 2]) and random.random() < effective_density:
+                    if (buf[o] | buf[o + 1] | buf[o + 2]) and self._rng.random() < effective_density:
                         sparkle[i] = sparkle_life
 
             life_div = float(sparkle_life)
@@ -914,7 +924,7 @@ class LEDMapper:
             glitch = self._glitch
             if glitch_trigger:
                 for cell in range(NUM_CELLS):
-                    if random.random() < glitch_prob:
+                    if self._rng.random() < glitch_prob:
                         glitch[cell] = 3
 
             for cell in range(NUM_CELLS):
@@ -1016,7 +1026,7 @@ class LEDMapper:
                     buf[o] = r if r < 255 else 255
                     buf[o + 1] = g if g < 255 else 255
                     buf[o + 2] = b if b < 255 else 255
-                    if random.random() < density:
+                    if self._rng.random() < density:
                         shimmer[i] = shimmer_life
             # Render + decay the cool shimmer flecks (additive toward SP_TINT).
             life_div = float(shimmer_life)

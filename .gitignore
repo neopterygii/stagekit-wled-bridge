@@ -6,3 +6,12 @@ __pycache__/
 .env
 .DS_Store
 .pytest_cache/
+
+# Datagram captures. Real ones are recorded off the live bridge into /data and
+# are the operator's, not the repo's; synthetic fixtures are generated from
+# tests/replay_fixtures.py, so committing them would just invite drift. The one
+# deliberate exception is tests/fixtures/format_v1_sample.jsonl, the on-disk
+# format golden, which is committed.
+tests/fixtures/captures/
+*.jsonl
+!tests/fixtures/format_v1_sample.jsonl

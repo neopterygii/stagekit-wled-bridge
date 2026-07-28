@@ -50,5 +50,9 @@ STATUS_PORT = _env_int("STATUS_PORT", 8080, min_val=1, max_val=65535)
 # Idle timeout — seconds without YARG packets before turning WLED off (0 = disabled)
 IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT", 1800, min_val=0)
 
+# Datagram captures for replay. Lives under the same /data volume as settings so
+# a recording survives a container recreate and can be copied off the host.
+CAPTURE_DIR = os.environ.get("CAPTURE_DIR", "/data/captures")
+
 # Logging
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()

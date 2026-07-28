@@ -22,6 +22,7 @@ from config import (
     LED_COUNT,
     STATUS_HOST, STATUS_PORT,
     IDLE_TIMEOUT,
+    CAPTURE_DIR,
     LOG_LEVEL,
 )
 from protocol.yarg_packet import parse_packet, CueByte, KNOWN_DATAGRAM_VERSIONS
@@ -31,6 +32,7 @@ from effects.cue_engine import CueEngine
 from effects.mapper import LEDMapper, MAPPED_REGION, PREVIEW_CELLS
 from status_server import StatusTracker, StatusServer
 from settings import BridgeSettings
+from replay.controller import CaptureController
 
 log = logging.getLogger(__name__)
 
@@ -38,10 +40,14 @@ log = logging.getLogger(__name__)
 class YARGProtocol(asyncio.DatagramProtocol):
     """Receives YARG UDP packets and feeds the cue engine."""
 
-    def __init__(self, engine: CueEngine, tracker: StatusTracker, wled_power: 'WLEDPowerManager'):
+    def __init__(self, engine: CueEngine, tracker: StatusTracker,
+                 wled_power: 'WLEDPowerManager', capture=None):
         self.engine = engine
         self.tracker = tracker
         self.wled_power = wled_power
+        # Optional CaptureController. When a recording is active its recorder
+        # buffers datagrams for replay; see replay/controller.py.
+        self.capture = capture
         self._last_cue = -1
         self._last_strobe = -1
         self._last_camera_subject = -1
@@ -50,6 +56,16 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self._warned_versions: set[int] = set()
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
+        # Record before parsing, so a capture holds exactly what arrived —
+        # malformed and truncated datagrams included. Those are the ones worth
+        # replaying against the parser later. Costs an attribute load and a
+        # None check on the ~90/s path when nothing is recording; when something
+        # is, a deque append. No encoding or disk I/O happens here.
+        if self.capture is not None:
+            recorder = self.capture.recorder
+            if recorder is not None:
+                recorder.record(data)
+
         pkt = parse_packet(data)
         if pkt is None:
             return
@@ -455,116 +471,7 @@ class RenderThread(threading.Thread):
                 time.sleep(0.001)
                 continue
 
-            # Cache zone colours — only re-read when palette changes
-            palette_name = self._settings.palette_name
-            if palette_name != self._cached_palette:
-                self._cached_colors = self._settings.zone_colors
-                self._cached_palette = palette_name
-
-            # Advance time-based patterns (zone bitmasks computed from
-            # wall-clock time — immune to asyncio event-loop congestion)
-            self._engine.tick(time.monotonic())
-
-            # Operator blur strength (dashboard slider) — fog stacks on top of
-            # this in the engine. Synced each frame so a drag lands live.
-            self._engine.set_blur_base(self._settings.blur_amount)
-
-            # Venue sparkle + song-section intensity (dashboard sliders), plus
-            # the discrete venue chase toggle. Synced each frame; chase-mask
-            # changes take effect at the next cue launch.
-            self._engine.set_venue_intensity(self._settings.venue_intensity)
-            self._engine.set_venue_patterns_enabled(
-                self._settings.effect_enabled("venue_patterns"))
-            self._engine.set_section_intensity(self._settings.section_intensity)
-
-            # Get effects (consumes and clears transient flags)
-            effects = self._engine.get_effects()
-            # Mapper scales frame-count effects (sparkle life) by FPS so
-            # they hold their wall-clock duration at any render rate.
-            effects["fps"] = fps
-            # Apply the dashboard's per-effect on/off switches — suppresses the
-            # render signal of any disabled toggle before the mapper sees it.
-            self._settings.apply_effect_toggles(effects)
-
-            # Brightness baked into mapper output (Phase 2)
-            brightness = self._settings.brightness / 255.0
-
-            # Live-preview gate: only capture when the dashboard is open and the
-            # throttle interval has elapsed, so the mapper does the per-layer
-            # downsample only when it will actually be shown.
-            want_preview = (self._tracker.has_subscribers and
-                            (frame_start - self._last_preview_at) >= self._PREVIEW_INTERVAL)
-
-            # Render pixels
-            reverse = self._settings.direction == "reverse"
-            pixel_data = self._mapper.render(
-                self._engine.zones,
-                zone_colors=self._cached_colors,
-                effects=effects,
-                brightness=brightness,
-                reverse=reverse,
-                zone_cell_levels=self._engine.zone_cell_levels,
-                motion_sources=self._engine.motion_sources,
-                preview=want_preview,
-            )
-
-            # Apply strobe (replace with pre-allocated black)
-            if not self._engine.get_strobe_visible():
-                pixel_data = self._black
-
-            # Cue cross-fade: snapshot the last sent frame on cue change,
-            # then blend incoming frames against it for FADE_DURATION.
-            # Skipped when strobe is suppressing the frame to black, so
-            # we don't fade *through* the strobe blackout.
-            now = time.monotonic()
-            cue_change_at = effects.get("cue_change_at") or 0.0
-            if cue_change_at > self._last_cue_change_at:
-                self._fade_from[:] = self._last_sent
-                self._fade_until = cue_change_at + self._FADE_DURATION
-                self._last_cue_change_at = cue_change_at
-
-            if pixel_data is not self._black and now < self._fade_until:
-                t = 1.0 - (self._fade_until - now) / self._FADE_DURATION
-                if t < 0.0:
-                    t = 0.0
-                inv_t = 1.0 - t
-                fb = self._fade_buf
-                ff = self._fade_from
-                pd = pixel_data
-                n = len(pd)
-                for i in range(n):
-                    fb[i] = int(ff[i] * inv_t + pd[i] * t)
-                pixel_data = fb
-
-            # Save for next frame's potential cross-fade source. Skip the
-            # strobe blank — a cue change mid-strobe should fade from the
-            # last visible frame, not from black.
-            if pixel_data is not self._black:
-                n = len(pixel_data)
-                self._last_sent[:n] = pixel_data
-
-            # Send DDP every frame when WLED is on (no dedup — WiFi
-            # can drop UDP packets, so always resend like LedFx does)
-            ddp_sent = False
-            if self._wled_power.is_on:
-                self._sender.send_pixels(pixel_data)
-                ddp_sent = True
-
-            self._tracker.on_render(self._engine.zones,
-                                    self._engine.strobe_hz(),
-                                    self._engine.bpm,
-                                    ddp_sent=ddp_sent,
-                                    beat_phase=effects.get("beat_phase", 0.0),
-                                    bar_beat=effects.get("bar_beat", 0))
-            self._frames_rendered += 1
-
-            # Live preview: downsample the frame actually sent (captures strobe
-            # blackout and cross-fade) and grab the mapper's per-layer rows.
-            if want_preview:
-                self._preview_strip = LEDMapper.downsample_rgb(
-                    pixel_data, MAPPED_REGION, PREVIEW_CELLS)
-                self._preview_layers = self._mapper.layer_preview()
-                self._last_preview_at = frame_start
+            self.render_frame(time.monotonic(), fps)
 
             # Rolling stats
             frame_end = time.perf_counter()
@@ -591,6 +498,133 @@ class RenderThread(threading.Thread):
             time.sleep(sleep_time)
 
         log.info("Render thread stopped")
+
+    def render_frame(self, now: float, fps: int) -> bytes:
+        """Render one frame, send it over DDP, and return the pixels that went out.
+
+        The whole per-frame pipeline — settings sync, engine tick, mapper,
+        strobe, cue cross-fade, DDP send, status and preview capture — with the
+        clock passed in rather than read. `_run_loop` supplies
+        `time.monotonic()` and owns scheduling; `replay/player.py` supplies a
+        synthetic timeline so a recorded session renders identically on every
+        run. Every time-dependent step here reads *now*, including
+        `get_strobe_visible()`, which would otherwise sample the wall clock and
+        make strobe frames unreproducible.
+
+        The returned buffer is reused by later calls (it may be `_black` or the
+        cross-fade scratch buffer) — copy it if you need to keep it.
+        """
+        # Cache zone colours — only re-read when palette changes
+        palette_name = self._settings.palette_name
+        if palette_name != self._cached_palette:
+            self._cached_colors = self._settings.zone_colors
+            self._cached_palette = palette_name
+
+        # Advance time-based patterns (zone bitmasks computed from the injected
+        # clock — immune to asyncio event-loop congestion)
+        self._engine.tick(now)
+
+        # Operator blur strength (dashboard slider) — fog stacks on top of
+        # this in the engine. Synced each frame so a drag lands live.
+        self._engine.set_blur_base(self._settings.blur_amount)
+
+        # Venue sparkle + song-section intensity (dashboard sliders), plus
+        # the discrete venue chase toggle. Synced each frame; chase-mask
+        # changes take effect at the next cue launch.
+        self._engine.set_venue_intensity(self._settings.venue_intensity)
+        self._engine.set_venue_patterns_enabled(
+            self._settings.effect_enabled("venue_patterns"))
+        self._engine.set_section_intensity(self._settings.section_intensity)
+
+        # Get effects (consumes and clears transient flags)
+        effects = self._engine.get_effects()
+        # Mapper scales frame-count effects (sparkle life) by FPS so
+        # they hold their wall-clock duration at any render rate.
+        effects["fps"] = fps
+        # Apply the dashboard's per-effect on/off switches — suppresses the
+        # render signal of any disabled toggle before the mapper sees it.
+        self._settings.apply_effect_toggles(effects)
+
+        # Brightness baked into mapper output (Phase 2)
+        brightness = self._settings.brightness / 255.0
+
+        # Live-preview gate: only capture when the dashboard is open and the
+        # throttle interval has elapsed, so the mapper does the per-layer
+        # downsample only when it will actually be shown.
+        want_preview = (self._tracker.has_subscribers and
+                        (now - self._last_preview_at) >= self._PREVIEW_INTERVAL)
+
+        # Render pixels
+        reverse = self._settings.direction == "reverse"
+        pixel_data = self._mapper.render(
+            self._engine.zones,
+            zone_colors=self._cached_colors,
+            effects=effects,
+            brightness=brightness,
+            reverse=reverse,
+            zone_cell_levels=self._engine.zone_cell_levels,
+            motion_sources=self._engine.motion_sources,
+            preview=want_preview,
+        )
+
+        # Apply strobe (replace with pre-allocated black)
+        if not self._engine.get_strobe_visible(now):
+            pixel_data = self._black
+
+        # Cue cross-fade: snapshot the last sent frame on cue change,
+        # then blend incoming frames against it for FADE_DURATION.
+        # Skipped when strobe is suppressing the frame to black, so
+        # we don't fade *through* the strobe blackout.
+        cue_change_at = effects.get("cue_change_at") or 0.0
+        if cue_change_at > self._last_cue_change_at:
+            self._fade_from[:] = self._last_sent
+            self._fade_until = cue_change_at + self._FADE_DURATION
+            self._last_cue_change_at = cue_change_at
+
+        if pixel_data is not self._black and now < self._fade_until:
+            t = 1.0 - (self._fade_until - now) / self._FADE_DURATION
+            if t < 0.0:
+                t = 0.0
+            inv_t = 1.0 - t
+            fb = self._fade_buf
+            ff = self._fade_from
+            pd = pixel_data
+            n = len(pd)
+            for i in range(n):
+                fb[i] = int(ff[i] * inv_t + pd[i] * t)
+            pixel_data = fb
+
+        # Save for next frame's potential cross-fade source. Skip the
+        # strobe blank — a cue change mid-strobe should fade from the
+        # last visible frame, not from black.
+        if pixel_data is not self._black:
+            n = len(pixel_data)
+            self._last_sent[:n] = pixel_data
+
+        # Send DDP every frame when WLED is on (no dedup — WiFi
+        # can drop UDP packets, so always resend like LedFx does)
+        ddp_sent = False
+        if self._wled_power.is_on:
+            self._sender.send_pixels(pixel_data)
+            ddp_sent = True
+
+        self._tracker.on_render(self._engine.zones,
+                                self._engine.strobe_hz(),
+                                self._engine.bpm,
+                                ddp_sent=ddp_sent,
+                                beat_phase=effects.get("beat_phase", 0.0),
+                                bar_beat=effects.get("bar_beat", 0))
+        self._frames_rendered += 1
+
+        # Live preview: downsample the frame actually sent (captures strobe
+        # blackout and cross-fade) and grab the mapper's per-layer rows.
+        if want_preview:
+            self._preview_strip = LEDMapper.downsample_rgb(
+                pixel_data, MAPPED_REGION, PREVIEW_CELLS)
+            self._preview_layers = self._mapper.layer_preview()
+            self._last_preview_at = now
+
+        return pixel_data
 
     def stop(self):
         self._active = False
@@ -658,8 +692,10 @@ async def main():
     wled_power = WLEDPowerManager(wled_api, IDLE_TIMEOUT)
     tracker = StatusTracker()
     settings = BridgeSettings()
+    capture = CaptureController(CAPTURE_DIR)
     status_server = StatusServer(tracker, STATUS_HOST, STATUS_PORT, engine=engine,
-                                 wled_power=wled_power, settings=settings)
+                                 wled_power=wled_power, settings=settings,
+                                 capture=capture)
 
     loop = asyncio.get_running_loop()
 
@@ -668,12 +704,15 @@ async def main():
 
     # Start UDP listener
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: YARGProtocol(engine, tracker, wled_power),
+        lambda: YARGProtocol(engine, tracker, wled_power, capture=capture),
         local_addr=(YARG_LISTEN_HOST, YARG_LISTEN_PORT),
     )
 
     # Start status broadcast task
     broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power, settings=settings))
+
+    # Drain any active capture's buffer to disk off the event loop
+    capture_task = asyncio.create_task(capture.flush_loop())
 
     # Start render thread (Phase 3: isolated from asyncio event loop)
     render_thread = RenderThread(engine, mapper, sender, tracker, settings, wled_power)
@@ -704,7 +743,14 @@ async def main():
     render_thread.join(timeout=2.0)
     broadcast_task.cancel()
     watchdog_task.cancel()
+    capture_task.cancel()
     transport.close()
+
+    # Close any open capture so its buffered tail reaches disk.
+    try:
+        capture.shutdown()
+    except Exception as e:
+        log.debug("Capture shutdown failed: %s", e)
 
     try:
         sender.send_pixels(b'\x00' * LED_COUNT * 3)

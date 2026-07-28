@@ -220,7 +220,15 @@ repeatable, observable, and safe to evolve:
    deployed feature set, and added a `test` job to `.github/workflows/docker.yml`
    that the image build now depends on. The Unraid template tracks `:latest`;
    rollback is a template edit to `:1.0.0`.
-2. **Full-path replay and capture harness.** Record timestamped YARG datagrams
+2. **Full-path replay and capture harness.** *(Built — see `replay/`,
+   `tests/test_replay.py`, `tests/test_capture.py`. Remaining gap: the
+   keyframe/beat-**event**-driven cues still step on asyncio and so don't animate
+   under replay; that covers the library's most common cues, and is tracked in
+   `BACKLOG.md`. Determinism required injecting a clock into `CueEngine` and
+   `LEDMapper` and seeding the mapper's sparkle/glitch RNG; frames are pinned by
+   golden sampled digests at a fixed synthetic epoch — not 0.0, which collides
+   with the engine's "not yet happened" sentinels.)*
+   Record timestamped YARG datagrams
    from representative performances and replay them through
    parser → cue engine → mapper → DDP. Keep captures to protocol data, not song
    audio or encrypted chart content. Assert deterministic frame samples/hashes,

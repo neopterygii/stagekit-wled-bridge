@@ -1149,13 +1149,14 @@ class StatusServer:
     """Async HTTP server serving the status page, SSE stream, and test controls."""
 
     def __init__(self, tracker: StatusTracker, host: str = "0.0.0.0", port: int = 8080,
-                 engine=None, wled_power=None, settings=None):
+                 engine=None, wled_power=None, settings=None, capture=None):
         self.tracker = tracker
         self.host = host
         self.port = port
         self.engine = engine
         self.wled_power = wled_power
         self.settings = settings
+        self.capture = capture
         self._beat_task: asyncio.Task | None = None
 
     async def start(self):
@@ -1340,6 +1341,24 @@ class StatusServer:
             return 200, "No change"
         return 200, "Updated: " + ", ".join(changed)
 
+    def _handle_capture_action(self, body: dict) -> tuple[int, str]:
+        """Start or stop a datagram capture for replay (replay/controller.py)."""
+        if self.capture is None:
+            return 500, "Capture not connected"
+        action = body.get("action", "")
+        if action == "start":
+            note = body.get("note", "")
+            if not isinstance(note, str):
+                return 400, "note must be a string"
+            if len(note) > 200:
+                return 400, "note is too long (max 200 characters)"
+            ok, msg = self.capture.start(note)
+            return (200, f"Recording to {msg}") if ok else (409, msg)
+        if action == "stop":
+            ok, msg = self.capture.stop()
+            return (200, f"Saved {msg}") if ok else (409, msg)
+        return 400, f"Unknown capture action: {action!r} (use start or stop)"
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -1365,7 +1384,10 @@ class StatusServer:
             elif path in ('/', '/index.html') and method == 'GET':
                 await self._send_response(writer, 200, 'text/html', STATUS_HTML.encode())
             elif path == '/api/status' and method == 'GET':
-                body = json.dumps(self.tracker.snapshot()).encode()
+                snap = self.tracker.snapshot()
+                if self.capture is not None:
+                    snap["capture"] = self.capture.snapshot()
+                body = json.dumps(snap).encode()
                 render_thread = self.tracker.render_thread
                 healthy = not (render_thread and render_thread.failed)
                 await self._send_response(
@@ -1405,6 +1427,24 @@ class StatusServer:
                 await self._send_response(writer, status, 'application/json', resp)
             elif path == '/api/settings' and method == 'GET':
                 body = json.dumps(self.settings.snapshot() if self.settings else {}).encode()
+                await self._send_response(writer, 200, 'application/json', body)
+            elif path == '/api/capture' and method == 'POST':
+                raw = b''
+                if content_length > 0:
+                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
+                try:
+                    req_body = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, ValueError):
+                    req_body = {}
+                status, msg = self._handle_capture_action(req_body)
+                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
+                await self._send_response(writer, status, 'application/json', resp)
+            elif path == '/api/capture' and method == 'GET':
+                if self.capture is None:
+                    body = json.dumps({"recording": False}).encode()
+                else:
+                    body = json.dumps({**self.capture.snapshot(),
+                                       "captures": self.capture.list_captures()}).encode()
                 await self._send_response(writer, 200, 'application/json', body)
             else:
                 await self._send_response(writer, 404, 'text/plain', b'Not Found')

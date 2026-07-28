@@ -96,6 +96,164 @@ its behaviour dominates the look far more than any individual cue.
 
 ---
 
+## OPEN — Event-driven cue patterns still run on asyncio, so replay can't judge them
+
+**Found:** 2026-07-27, while building the replay harness.
+
+Time-driven zone patterns were migrated to the deterministic `engine.tick()`
+path, but the **event**-driven ones were not. Five cues launch asyncio
+coroutines that step on `_beat_event` / `_keyframe_event`
+(`_start_listen_pattern`, and `_start_beat_pattern`/`_start_multi_zone_chase`
+when `listen=` is set):
+
+- `DEFAULT`, `WARM_MANUAL`, `COOL_MANUAL` — keyframe-stepped
+- `STOMP` — keyframe-stepped
+- `DISCHORD` — `beat_any`
+
+**Why this matters more than five cues suggests.** Per the `venue_scan`
+inventory, `next` keyframes are the most common cue in the library by roughly
+**10×** — legacy note numbers can express *only* keyframes — and
+`warm_manual`, `dischord` and `stomp` all sit in the top eight. So the replay
+harness currently cannot render, hash, or regression-test the motion of the
+library's most common cues. It covers everything else end to end.
+
+`tests/test_replay.py::test_event_driven_cues_do_not_advance_under_replay` pins
+the limitation deliberately and fails once it's fixed, which is the prompt to
+delete it and assert the real motion.
+
+**Already fixed in passing:** these launches used `asyncio.ensure_future`, whose
+`get_event_loop()` fallback *raises* `RuntimeError` when no loop is running
+(and is deprecated in 3.12, removed later). Off the event loop that took the
+whole cue dispatch down instead of just losing the animation. They now go
+through `CueEngine._spawn`, which uses `get_running_loop()`/`create_task` and
+degrades to "this cue doesn't animate" when there's no loop. Production always
+has one, so live behaviour is unchanged — but the bridge is no longer one Python
+upgrade away from a hard failure here.
+
+**The work:** move the `listen=` patterns onto `_TimePattern`-style ticking
+driven by beat/keyframe *counters* rather than awaited events. The engine
+already tracks beat edges and keyframes, so the state a coroutine keeps in its
+local `idx` can live in the pattern object instead. Do it as its own change with
+its own look-check on the real strip — it alters the most common cues in the
+library, so it should not ride along with unrelated work.
+
+---
+
+## OPEN — Newer reactivity layers ignore the selected palette
+
+**Raised:** 2026-07-27 by the operator, after watching the vocal ribbon.
+
+Several Phase 4–5 features paint from **fixed hue tables of their own** rather
+than from the active palette, so they look correct under `default` (RGBY) and
+foreign under any other palette — pick Lava or Frost and the vocal ribbon still
+emits full-spectrum chroma.
+
+Confirmed palette-independent sources in `effects/mapper.py`:
+
+- **Vocal ribbon** — hue is the pitch *class* sampled from a fixed chroma ramp
+  (`VOCAL_CHROMA`, ~line 47). Deliberate: same note → same colour is the whole
+  idea. But it means an octave of singing sweeps hues the palette never contains.
+- **Performer highlight bias** — a fixed hue per `Performer` bit
+  (`PERFORMER_BIAS_STRENGTH` block, ~line 128).
+- **Camera-cut bias** — reuses the same performer hue table (~line 163).
+- **Song-section bias** — a fixed per-section hue (`SECTION_BIAS_STRENGTH`,
+  ~line 147).
+
+The tension is real, not a bug: pitch-class colour and per-performer colour both
+*mean* something, and remapping them into a 4-colour palette would throw that
+meaning away. Options, cheapest first:
+
+1. **Palette-relative hues.** Map each fixed hue onto the nearest palette entry,
+   or onto the palette's own hue span, keeping the *relative* ordering (so notes
+   still differ from each other, within the palette's family).
+2. **A "palette strictness" operator toggle.** Off = today's expressive hues;
+   on = every layer constrained to the palette. Cheap, honest, and lets the
+   operator decide per show.
+3. **Leave the ribbon alone, fix the biases.** The three *bias* layers are
+   subtle tints where palette-relative hue costs nothing; the ribbon is the only
+   one whose meaning depends on absolute hue.
+
+First step is the inventory above turned into a test: assert each layer's output
+hues fall inside the active palette when strictness is on. Do that before
+changing any of the maths.
+
+---
+
+## OPEN — WLED drifts out of sync after hours of DDP; only a physical power-cycle clears it
+
+**Observed:** 2026-07-27 by the operator. Left paused on a song for **4+ hours**;
+the strip ended up visibly out of sync with the game. Turning WLED off from the
+container did **not** clear it — only pulling the controller's power did.
+
+That last detail is the important one: **the bad state lives on the ESP32, not in
+the bridge.** A container-side power-off is a JSON API call; it doesn't reset the
+device. So this is very unlikely to be a cue-engine or render-thread bug, and
+correspondingly unlikely to be fixed by anything in this repo.
+
+What we know about the conditions:
+
+- Pausing does **not** stop the packet stream. YARG keeps sending ~90
+  datagrams/s with `paused=2`, so `IDLE_TIMEOUT` never fires and the bridge keeps
+  rendering and sending DDP the whole time.
+- At 60 FPS that is roughly **860,000 DDP frames** and ~310 MB of UDP over four
+  hours, sustained, to a WiFi-attached ESP32.
+- Live baseline is WLED 0.14.4, APA102/type 51 on data GPIO 18 / clock GPIO 5 at
+  5 MHz, 120 pixels (`evidence/wled-live-baseline-2026-07-27.md`).
+
+Candidate causes, in rough order of suspicion — **none confirmed**:
+
+1. ESP32-side accumulation over a long realtime session (heap fragmentation, a
+   growing UDP backlog, or a WiFi power-save state) adding latency that never
+   drains.
+2. APA102 clock/data timing degrading at 5 MHz once the device has been warm and
+   busy for hours.
+3. Something in WLED's realtime/DDP timeout handling that behaves differently
+   after a very long uninterrupted stream.
+
+**"Desync" needs pinning down before anything else.** It could be constant added
+latency (lights consistently late), progressive drift (getting later), or dropped
+frames making motion stutter. Those have different causes. Cheapest evidence:
+
+- Reproduce with the replay CLI rather than a 4-hour game session — replay a
+  capture on a loop for hours and watch, which is exactly what the harness is
+  for.
+- Read `/json/info` (heap, uptime, WiFi RSSI) periodically across the run and see
+  what moves. The bridge already fetches WiFi info; extend that to log heap.
+- Compare bridge-side timing over the same window (`render.gap_ms_max`,
+  `ddp.send_us_max`, `stalls`) to rule the host out — if bridge telemetry stays
+  flat while the strip drifts, the device is proven guilty.
+- Consider whether pausing should stop DDP output entirely after some period.
+  A paused game does not need 60 FPS of unchanged frames, and not sending is the
+  most reliable way to avoid whatever the long-stream state is.
+
+Related: this is a strong argument *for* the firmware qualification item below —
+but note it also means a firmware upgrade could mask the cause rather than fix
+it. Capture the evidence first.
+
+---
+
+## OPEN — Spotlight cues light too narrow a slice of the strip
+
+**Raised:** 2026-07-27 by the operator: the spotlight cues light one small
+section, and should cover roughly **2–3 sections**.
+
+The strip is 8 cells of 12 LEDs. Current widths in `effects/cue_engine.py`:
+
+- `BLACKOUT_SPOTLIGHT` — `spotlight_region=0.18`, about **1.4 cells** (~22 LEDs).
+  This is the narrow one.
+- `SILHOUETTES_SPOTLIGHT` — `spotlight_region=0.40`, about 3.2 cells, already in
+  the requested range.
+
+So the change is mostly `BLACKOUT_SPOTLIGHT`: 2–3 cells is `spotlight_region`
+≈ **0.25–0.375**. Worth checking the two cues read as a deliberate pair
+afterwards (a tight spot vs. a wider one) rather than collapsing into the same
+look. `SILHOUETTES_SPOTLIGHT` may want a small nudge for contrast.
+
+Cheap to try, and the replay harness can show the before/after on the same
+recorded passage instead of relying on memory of last night's show.
+
+---
+
 ## Existing headline items
 
 See `VISION.md` "Next push — reliability, replay, alignment, and state" for the

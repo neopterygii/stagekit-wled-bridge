@@ -294,7 +294,14 @@ class _TimePattern:
 class CueEngine:
     """Manages active lighting cue and produces zone bitmask state + effects."""
 
-    def __init__(self):
+    def __init__(self, clock=time.monotonic):
+        # Every time-dependent decision in this class reads self._clock(), so a
+        # replayed capture can advance a synthetic timeline and render the same
+        # frames every run (replay/player.py). Production leaves it as
+        # time.monotonic. The `now=None` parameters on the on_*/get_* methods
+        # still override per call; they fall back to this clock.
+        self._clock = clock
+
         # Current zone bitmasks [red, green, blue, yellow]
         self.zones = [NONE, NONE, NONE, NONE]
 
@@ -479,14 +486,14 @@ class CueEngine:
         if rate == 0:
             return True
         if now is None:
-            now = time.monotonic()
+            now = self._clock()
         period = 1.0 / rate
         return (now % period) < (period / 2)
 
     def get_effects(self) -> dict:
         """Return current effects dict with transient flags, then clear them."""
         # While paused, animation clocks freeze at the pause instant.
-        now = self._paused_at if self.paused else time.monotonic()
+        now = self._paused_at if self.paused else self._clock()
         fx = dict(self.effects)
         fx["bpm"] = self.bpm
         # Venue-size density knob: rescale the cue's sparkle field. The
@@ -750,7 +757,7 @@ class CueEngine:
             return
         self._beat_event.set()
         if now is None:
-            now = time.monotonic()
+            now = self._clock()
         if beat_type == BeatByte.MEASURE:
             self._beat_flash = True
             self._downbeat_flash = True
@@ -815,7 +822,7 @@ class CueEngine:
         tests; production passes None.
         """
         if now is None:
-            now = time.monotonic()
+            now = self._clock()
         interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
         dur = interval * NOTE_HOLD_BEATS
         if dur < NOTE_HOLD_FLOOR:
@@ -902,7 +909,7 @@ class CueEngine:
         is injectable for tests; production passes None.
         """
         if now is None:
-            now = time.monotonic()
+            now = self._clock()
         # Capture the currently rendered bias before changing the target. This
         # makes Verse→Chorus and section→None transitions continuous instead
         # of dropping to the neutral authored look at every boundary.
@@ -980,7 +987,7 @@ class CueEngine:
         None.
         """
         if now is None:
-            now = time.monotonic()
+            now = self._clock()
         self._camera_subject = subject
         self._camera_changed_at = now
         if priority == CameraCutPriority.DIRECTED:
@@ -1028,7 +1035,7 @@ class CueEngine:
     def on_bonus(self):
         """Called when YARG flags a bonus_effect — celebration burst."""
         # Mapper renders a white-tinted flash that decays over the duration.
-        self._bonus_until = time.monotonic() + BONUS_BURST_DURATION
+        self._bonus_until = self._clock() + BONUS_BURST_DURATION
 
     def on_star_power(self, active: bool, amount: float, charge: float,
                       active_count: int):
@@ -1049,11 +1056,11 @@ class CueEngine:
         if paused == self.paused:
             return
         if paused:
-            self._paused_at = time.monotonic()
+            self._paused_at = self._clock()
         else:
             # Shift active animation deadlines forward by the pause duration
             # so reveal/bonus resume where they froze instead of being spent.
-            delta = time.monotonic() - self._paused_at
+            delta = self._clock() - self._paused_at
             if self._reveal_started_at > 0.0:
                 self._reveal_started_at += delta
             if self._bonus_until > 0.0:
@@ -1073,7 +1080,7 @@ class CueEngine:
         if cue_byte == self._current_cue:
             return
         self._current_cue = cue_byte
-        self._cue_change_at = time.monotonic()
+        self._cue_change_at = self._clock()
         self._kill_primitives()
         self._launch_cue(cue_byte)
 
@@ -1289,7 +1296,7 @@ class CueEngine:
             # into the green breathing wash. The mapper masks pixels
             # beyond the radius given by reveal_progress.
             self._set_effects(breathing=0.05)
-            self._reveal_started_at = time.monotonic()
+            self._reveal_started_at = self._clock()
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.MENU:
@@ -1336,14 +1343,12 @@ class CueEngine:
         """
         pattern = self._venue_transform_pattern(pattern)
         if listen is not None:
-            task = asyncio.ensure_future(
-                self._run_beat_pattern(zone, pattern, cycles_per_beat, listen)
-            )
-            self._active_tasks.append(task)
+            self._spawn(
+                self._run_beat_pattern(zone, pattern, cycles_per_beat, listen))
             return
 
         steps = [[(zone, mask)] for mask in pattern]
-        now = time.monotonic()
+        now = self._clock()
         self._time_patterns.append(_TimePattern(
             steps, bpm_sync=True, param=cycles_per_beat,
             now=now, init_bpm=self.bpm,
@@ -1395,7 +1400,7 @@ class CueEngine:
         """Launch a fixed-period pattern (not BPM-synced), ticked from render thread."""
         pattern = self._venue_transform_pattern(pattern)
         steps = [[(zone, mask)] for mask in pattern]
-        now = time.monotonic()
+        now = self._clock()
         self._time_patterns.append(_TimePattern(
             steps, bpm_sync=False, param=seconds, now=now,
         ))
@@ -1423,11 +1428,9 @@ class CueEngine:
             frames.append(masks)
 
         if listen is not None:
-            task = asyncio.ensure_future(
+            self._spawn(
                 self._run_multi_zone_chase(zone_order, frames, cycles_per_beat,
-                                           listen, reverse_on_beat)
-            )
-            self._active_tasks.append(task)
+                                           listen, reverse_on_beat))
             return
 
         # Time-based — store for render-thread ticking
@@ -1436,7 +1439,7 @@ class CueEngine:
         for z in range(4):
             if z not in used:
                 self.zones[z] = NONE
-        now = time.monotonic()
+        now = self._clock()
         self._time_patterns.append(_TimePattern(
             steps, bpm_sync=True, param=cycles_per_beat,
             now=now, init_bpm=self.bpm,
@@ -1486,12 +1489,34 @@ class CueEngine:
         except asyncio.CancelledError:
             pass
 
+    def _spawn(self, coro) -> "asyncio.Task | None":
+        """Schedule an event-driven pattern coroutine, if a loop is running.
+
+        Event-driven patterns (the `listen=` modes on DEFAULT, WARM_MANUAL,
+        COOL_MANUAL, STOMP and DISCHORD) are still asyncio coroutines rather than
+        `tick()`-driven. In the bridge they're always launched from the UDP
+        callback or an HTTP handler, so a running loop is guaranteed.
+
+        Offline callers — the replay harness, unit tests — have no loop, and
+        asyncio's older `ensure_future`/`get_event_loop` path *raises* there
+        rather than doing nothing. Losing this cue's motion is an acceptable
+        degradation offline; taking the whole cue dispatch down with a
+        RuntimeError is not. Returns None when there was nothing to run it.
+
+        See BACKLOG.md — migrating these onto tick() removes the asymmetry.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coro.close()   # no loop: don't leave an un-awaited coroutine behind
+            return None
+        task = loop.create_task(coro)
+        self._active_tasks.append(task)
+        return task
+
     def _start_listen_pattern(self, zone: int, pattern: list[int], listen: str):
         """Launch an event-triggered pattern on a zone."""
-        task = asyncio.ensure_future(
-            self._run_listen_pattern(zone, pattern, listen)
-        )
-        self._active_tasks.append(task)
+        self._spawn(self._run_listen_pattern(zone, pattern, listen))
 
     async def _run_listen_pattern(self, zone: int, pattern: list[int], listen: str):
         """Event-triggered pattern."""

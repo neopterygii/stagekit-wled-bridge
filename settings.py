@@ -225,7 +225,7 @@ DEFAULT_SETTINGS = {
 class BridgeSettings:
     """Thread-safe persistent settings manager."""
 
-    def __init__(self, path: str = SETTINGS_FILE):
+    def __init__(self, path: str = SETTINGS_FILE, warn_unwritable: bool = True):
         self._path = path
         self._lock = threading.Lock()
         self._data = dict(DEFAULT_SETTINGS)
@@ -233,7 +233,10 @@ class BridgeSettings:
         # DEFAULT_SETTINGS) don't share one mutable object.
         self._data["effects"] = dict(DEFAULT_SETTINGS["effects"])
         self._writable = self._probe_writable()
-        if not self._writable:
+        # Replay and tests deliberately point at an unwritable path to get
+        # in-code defaults; there the warning is noise telling them to mount a
+        # volume they don't want (see replay/player.py).
+        if not self._writable and warn_unwritable:
             log.warning(
                 "Settings: %s is not writable — runtime changes will not persist. "
                 "Mount a volume at %s to enable persistence.",

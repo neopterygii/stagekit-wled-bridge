@@ -279,6 +279,43 @@ python -m pytest tests/ -q
 
 CI runs the same command and the container image is only built if it passes.
 
+### Capture and Replay
+
+The bridge can record the YARG datagrams it receives and play them back through
+the real pipeline, so a lighting change can be judged against the same
+performance twice instead of from memory of last night's show.
+
+Record from a running bridge (writes to `/data/captures/`):
+
+```bash
+curl -X POST http://<host>:8080/api/capture -d '{"action":"start","note":"song name"}'
+curl -X POST http://<host>:8080/api/capture -d '{"action":"stop"}'
+curl http://<host>:8080/api/capture          # state + recent captures
+```
+
+Recording auto-stops at a size/packet cap, so a forgotten capture can't fill the
+volume. Captures are JSONL — one datagram per line, base64 — holding **protocol
+data only**: no audio, no chart content.
+
+Replay it two ways:
+
+```bash
+# In process, deterministic, no hardware — what the tests use
+python -m replay.player capture.jsonl --fps 40
+
+# Over UDP at original timing, to a running bridge and a real strip
+python -m replay.cli capture.jsonl --host 192.168.0.230 --speed 1 --loop
+
+# Watch DDP output without a WLED controller attached
+python -m replay.ddp_receiver --port 4048
+```
+
+Replay is deterministic because the cue engine, mapper and render loop all take
+an injected clock, and the mapper's sparkle/glitch RNG takes a seed. One known
+gap: the keyframe- and beat-*event*-driven cues (`DEFAULT`, `WARM_MANUAL`,
+`COOL_MANUAL`, `STOMP`, `DISCHORD`) still step on asyncio events, so their motion
+doesn't advance under replay — see `BACKLOG.md`.
+
 ### Test Packet Sender
 
 A standalone test sender is included for development without YARG:
@@ -318,6 +355,12 @@ docker run --network host -e WLED_HOST=192.168.0.53 stagekit-wled-bridge
 │   ├── compositor.py        # Ordered layer/slot composition
 │   ├── gradient.py          # Eased gradient palettes, beat-locked scroll
 │   └── mapper.py            # Zone bitmasks → RGB pixel data + effects
+├── replay/                  # Datagram capture + replay harness
+│   ├── capture.py           # JSONL capture format + hot-path recorder
+│   ├── controller.py        # Runtime start/stop, buffer flush, size caps
+│   ├── player.py            # Deterministic in-process replay (synthetic clock)
+│   ├── cli.py               # Wall-clock UDP replay to a live bridge
+│   └── ddp_receiver.py      # Headless DDP sink (stands in for WLED)
 ├── venue_scan/              # Offline library inventory (not part of the runtime)
 │   ├── scan.py              # Indexer entry point
 │   ├── discover.py          # Song/package discovery
