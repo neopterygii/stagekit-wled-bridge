@@ -5,50 +5,81 @@ Per the mission-control protocol, this is the full backlog; the dashboard in
 
 Item status: `OPEN` · `IN PROGRESS` · `BLOCKED` · `DONE` · `DEFERRED`.
 
-## Next up (set 2026-07-28)
+Item kind, which follows the status on each heading:
 
-These three came from watching the rig, so they take priority over the remaining
-reliability workstreams. In order:
+| Kind | Means |
+|---|---|
+| `bugfix` | The bridge does the wrong thing in production today. |
+| `feature` | A capability that does not exist yet. |
+| `perf` | Same behaviour, less latency or less work per frame. |
+| `refactor` | Same behaviour, better structure or testability. |
+| `evidence` | A measurement or investigation. May end in no code at all. |
+| `ops` | Firmware, backup, recovery — the rig rather than the repo. |
 
-1. **[WLED desync after hours of DDP](#open--wled-drifts-out-of-sync-after-hours-of-ddp-only-a-physical-power-cycle-clears-it)**
-   — first, because it's the only one that breaks a show rather than merely
-   looking wrong, and because the diagnosis is *evidence gathering*, not a code
-   change. **Half-solved and half-fixed on 2026-07-28:** the "only a power cycle
-   clears it" behaviour was a WLED realtime-timeout misconfiguration on the
-   controller (which also blocked OTA); the timeout is now 2500 ms and the exit
-   behaviour is verified. Remaining: whether there is *also* drift during an
-   active stream, which `tools/wled_soak.py` plus a sustained stream is there to
-   answer. That soak is now unblocked.
-2. ~~Spotlight cues are too narrow~~ — **built 2026-07-29**; see
-   [the write-up](#done-2026-07-29--spotlight-cues-light-too-narrow-a-slice-of-the-strip).
-   Not the one-number change this entry claimed: the operator wanted *more*
-   spotlights, not a wider one.
-3. ~~Newer layers ignore the selected palette~~ — **done, verified on the rig,
-   and merged to `main` 2026-07-29**; see
-   [the write-up](#done-2026-07-28--newer-reactivity-layers-ignore-the-selected-palette).
+Kind is about the work, not its importance: an `evidence` item can outrank a
+`bugfix`, and twice already has.
 
-Also **built 2026-07-29**, off the back of the latency work rather than the
-original three: the [cue crossfade](#done-2026-07-29--cue-changes-are-crossfaded-over-250-ms-and-that-is-the-visible-lag)
-is now an operator setting with per-cue overrides — it was the largest latency
-term in the pipeline and the one no hardware change touches.
+## Next up (set 2026-07-29)
 
-Then back to the reliability push: W3 alignment trim, W4 read-only state/MQTT,
-W5 firmware qualification. Note item 1 above is an argument *for* W5 but also a
-reason to gather evidence before it, since a firmware upgrade could mask the
-cause rather than fix it.
+**Deployment is not tracked here.** The operator updates the container template
+and judges changes on the rig on their own time; this backlog covers the work in
+the repo. Query the running container when an item needs live evidence
+(`AGENTS.md` has the triage commands) — do not add "deploy" or "flip the
+template" as a backlog step.
 
-**Three default-on look changes are now queued behind one template flip** —
-palette strictness (merged, already looked at), multi-spot spotlights, and the
-cue fade. All three are dashboard-adjustable, so they can be judged and A/B'd in
-a single session rather than needing three deploys.
+In order:
 
-Blocking neither: the replay harness is **merged to `main` (2026-07-29)**, so
-items 1 and 2 can both lean on it — a recorded passage replayed before/after
-beats remembering last night's show.
+1. **[Event-driven cue patterns still run on asyncio](#open-refactor--event-driven-cue-patterns-still-run-on-asyncio-so-replay-cant-judge-them)**
+   (`refactor`) — five cues still step on awaited events instead of the
+   deterministic tick, so the replay harness cannot render, hash or
+   regression-test their motion. It matters far more than "five cues" suggests:
+   `next` keyframes are the most common cue in the library by roughly **10×**,
+   and `warm_manual`, `dischord` and `stomp` are all top-eight. This is the
+   largest remaining hole in the harness, and it alters the library's most
+   common cues, so it takes its own branch and rides alone.
+2. **The two state bugs** (`bugfix`) — both are cases of the bridge believing
+   something about the world that is not true, and both mislead the operator in
+   the room, which is the one thing the dashboard exists to prevent:
+   - [cached WLED power state never resyncs after a device reboot](#open-bugfix--the-bridges-cached-wled-power-state-never-resyncs-after-a-device-reboot)
+     — the periodic probe discards its own answer, so a device powered on by
+     anything but the bridge stays lit indefinitely at a measured ~1622 mA.
+   - [stale lit cue held after disconnect/power-off](#open-bugfix--bridge-keeps-a-stale-lit-cue-after-disconnectpower-off)
+     — the dashboard shows an active cue and a lit preview while the strip is
+     dark.
+
+   Small, adjacent, and both about state that is never reset — reasonable as
+   **one branch**, though they touch different code (`WLEDPower._wled_on` in the
+   watchdog vs. cue/zone state in `CueEngine`) and split cleanly if preferred.
+
+Then back to the reliability push: W3 alignment trim (`feature`), W4 read-only
+state/MQTT (`feature`), W5 firmware qualification (`ops`). The desync item is an
+argument *for* W5 but also a reason to gather evidence before it, since a
+firmware upgrade could mask the cause rather than fix it.
+
+### Recently closed
+
+- ~~WLED desync — "only a power cycle clears it"~~ — root-caused and fixed
+  2026-07-28 (a realtime-timeout misconfiguration on the controller, which was
+  also blocking OTA). [Drift during an active stream](#open-evidence--desync-not-reproduced-since-the-realtime-timeout-fix-testing-is-parked-not-finished)
+  is unproven and testing is **parked, not finished**.
+- ~~Spotlight cues are too narrow~~ — built 2026-07-29;
+  [write-up](#done-2026-07-29-feature--spotlight-cues-light-too-narrow-a-slice-of-the-strip).
+  Not the one-number change that entry claimed: the operator wanted *more*
+  spotlights, not a wider one.
+- ~~Newer layers ignore the selected palette~~ — verified on the rig and merged
+  2026-07-29; [write-up](#done-2026-07-28-feature--newer-reactivity-layers-ignore-the-selected-palette).
+- ~~The 250 ms cue crossfade~~ — built 2026-07-29;
+  [write-up](#done-2026-07-29-perf--cue-changes-are-crossfaded-over-250-ms-and-that-is-the-visible-lag).
+  It was the largest latency term in the pipeline and the one no hardware change
+  touches.
+
+Blocking none of the above: the replay harness is **merged to `main`
+(2026-07-29)**, so anything here can lean on it — a recorded passage replayed
+before/after beats remembering last night's show.
 
 ---
 
-## OPEN — VenueSize is hardcoded to Small, so Phase 8 density branching is dead code
+## OPEN `evidence` — VenueSize is hardcoded to Small, so Phase 8 density branching is dead code
 
 **Found:** 2026-07-27, while tracing venue sources for the library inventory.
 
@@ -93,7 +124,7 @@ fix this at any time, and the transform itself is tested and correct.
 
 ---
 
-## OPEN — Venue fixture coverage now has a measured answer
+## OPEN `evidence` — Venue fixture coverage now has a measured answer
 
 **Found:** 2026-07-27, from the `venue_scan` library inventory
 (`~/yarg-lighting/evidence/venue-inventory-2026-07-27.md`).
@@ -118,7 +149,7 @@ is not an edge case; it is the default.
 
 ---
 
-## OPEN — Render priority is now measured, not assumed
+## OPEN `evidence` — Render priority is now measured, not assumed
 
 **Found:** 2026-07-27, same inventory.
 
@@ -137,7 +168,7 @@ its behaviour dominates the look far more than any individual cue.
 
 ---
 
-## OPEN — Event-driven cue patterns still run on asyncio, so replay can't judge them
+## OPEN `refactor` — Event-driven cue patterns still run on asyncio, so replay can't judge them
 
 **Found:** 2026-07-27, while building the replay harness.
 
@@ -180,7 +211,7 @@ library, so it should not ride along with unrelated work.
 
 ---
 
-## DONE (2026-07-28) — Newer reactivity layers ignore the selected palette
+## DONE (2026-07-28) `feature` — Newer reactivity layers ignore the selected palette
 
 **Raised:** 2026-07-27 by the operator, after watching the vocal ribbon.
 **Built:** 2026-07-28. **Verified on the rig and merged to `main` 2026-07-29.**
@@ -273,7 +304,7 @@ but not the rainbow). Rollback remains the slider to 0.0, or `:1.0.0`.
 
 ---
 
-## OPEN — WLED drifts out of sync after hours of DDP; only a physical power-cycle clears it
+## OPEN `evidence` — WLED drifts out of sync after hours of DDP; only a physical power-cycle clears it
 
 **Observed:** 2026-07-27 by the operator. Left paused on a song for **4+ hours**;
 the strip ended up visibly out of sync with the game. Turning WLED off from the
@@ -409,7 +440,7 @@ it. Capture the evidence first.
 
 ---
 
-## OPEN — The bridge's cached WLED power state never resyncs after a device reboot
+## OPEN `bugfix` — The bridge's cached WLED power state never resyncs after a device reboot
 
 **Found:** 2026-07-28, immediately after the realtime-latch fix, when the
 rebooted controller came up `on: true` and stayed lit with the bridge idle.
@@ -448,7 +479,7 @@ PID-exhaustion bug lived in, so it wants its own change and a look at the rig.
 
 ---
 
-## DONE 2026-07-29 — Spotlight cues light too narrow a slice of the strip
+## DONE 2026-07-29 `feature` — Spotlight cues light too narrow a slice of the strip
 
 **Raised:** 2026-07-27 by the operator: the spotlight cues light one small
 section, and should cover roughly **2–3 sections**.
@@ -521,8 +552,9 @@ exercised either cue.
 ## Reliability-push headline items
 
 The original five-workstream push. **"Next up" above now takes priority over
-items 3–5 here** — those three came from the rig's actual behaviour, which beats
-a plan made before it was watched this closely.
+items 3–5 here** — the rig-observed items came from the rig's actual behaviour,
+which beats a plan made before it was watched this closely, and the two `bugfix`
+items and the event-driven-cue `refactor` now sit ahead of these too.
 
 See `VISION.md` "Current focus — next push: reliability, replay, alignment, and
 state" for the full description of each:
@@ -533,15 +565,13 @@ state" for the full description of each:
    feature set. The four commits on top of the live commit `117952b` contained
    no runtime changes — only docs and the offline `venue_scan/` package — so the
    release was a re-tag rather than a behaviour change.
-   *Still outstanding:* the operator flips the Unraid template from the stale
-   branch tag to `:latest` (rollback `:1.0.0`) and recreates the container.
 2. `DONE` (2026-07-29) — Timestamped YARG datagram capture/replay harness with a
    headless DDP receiver in CI. Merged to `main` together with palette
    strictness and the WLED desync tooling.
-3. `OPEN` — Persisted operator lighting-alignment trim plus a calibration
-   pattern. Default 0 ms.
-4. `OPEN` — Expanded read-only game/bridge state, optionally over MQTT.
-5. `OPEN` — WLED 0.14.4 firmware upgrade qualification with backups, an exact
+3. `OPEN` `feature` — Persisted operator lighting-alignment trim plus a
+   calibration pattern. Default 0 ms.
+4. `OPEN` `feature` — Expanded read-only game/bridge state, optionally over MQTT.
+5. `OPEN` `ops` — WLED 0.14.4 firmware upgrade qualification with backups, an exact
    rollback image, and proven recovery. **Blocked in practice until the realtime
    latch above is fixed:** a latched controller never runs `ArduinoOTA.handle()`,
    so it cannot be OTA-flashed at all, and it latches on the first DDP frame
@@ -553,12 +583,12 @@ state" for the full description of each:
    complete backup needs `wsec.json` off the flash over USB/serial, the same
    physical access the plan already wants for recovery. The device has no
    presets, so there is nothing to lose there.
-6. `DEFERRED` — Multi-WLED logical canvas and performer-region routing; blocked
+6. `DEFERRED` `feature` — Multi-WLED logical canvas and performer-region routing; blocked
    on having enough equivalent hardware to test geometry and partial failure.
 
 ---
 
-## OPEN — Classify every rig finding by whether the wired QuinLED will fix it
+## OPEN `evidence` — Classify every rig finding by whether the wired QuinLED will fix it
 
 **Raised:** 2026-07-28 by the operator, who expects to move to a QuinLED quad
 with ethernet once it ships.
@@ -595,7 +625,7 @@ airtime, so a flat RSSI correlation does not clear WiFi.
 
 ---
 
-## DONE 2026-07-29 — Cue changes are crossfaded over 250 ms, and that is the visible "lag"
+## DONE 2026-07-29 `perf` — Cue changes are crossfaded over 250 ms, and that is the visible "lag"
 
 **Found:** 2026-07-28, measuring step latency end to end after the operator
 described the symptom precisely: *"changing patterns where I could see the
@@ -714,9 +744,10 @@ rollback: at `cue_fade_ms=250` with an empty override table, all ten reproduce
 their previous digests **exactly**, so "bit-exact rollback" is under test rather
 than asserted.
 
-**Not yet judged on the rig** — measure with
-`tools/wled_lag.py step` before and after, and expect the via-bridge median to
-fall from 145–164 ms toward ~55–80 ms against an unchanged ~23 ms direct floor.
+**How to confirm it on the strip, whenever that happens:** `tools/wled_lag.py
+step` before and after, expecting the via-bridge median to fall from 145–164 ms
+toward ~55–80 ms against an unchanged ~23 ms direct floor. Compare like cues —
+the snapping ones now measure differently from the base-fade ones.
 
 **Rollback is two things, and the slider alone is not enough:** `cue_fade_ms`
 to 250 restores the base, but exact pre-change behaviour also needs
@@ -725,7 +756,7 @@ code-level. Same shape as the spotlight rollback.
 
 ---
 
-## OPEN — Bridge keeps a stale lit cue after disconnect/power-off
+## OPEN `bugfix` — Bridge keeps a stale lit cue after disconnect/power-off
 
 **Found:** 2026-07-28 by the operator, watching the dashboard during the latency
 work: *"the bridge is still on a cue, even though the device is off and the
@@ -753,7 +784,7 @@ sending" so the dashboard cannot be read as live output.
 
 ---
 
-## OPEN — Desync: not reproduced since the realtime-timeout fix; testing is parked, not finished
+## OPEN `evidence` — Desync: not reproduced since the realtime-timeout fix; testing is parked, not finished
 
 **Status 2026-07-28 (end of day):** two instrumented runs since the latch fix,
 neither reproduced the failure. Parked at the operator's request — the tooling
