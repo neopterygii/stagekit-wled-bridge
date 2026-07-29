@@ -29,15 +29,7 @@ template" as a backlog step.
 
 In order:
 
-1. **[Event-driven cue patterns still run on asyncio](#open-refactor--event-driven-cue-patterns-still-run-on-asyncio-so-replay-cant-judge-them)**
-   (`refactor`) — five cues still step on awaited events instead of the
-   deterministic tick, so the replay harness cannot render, hash or
-   regression-test their motion. It matters far more than "five cues" suggests:
-   `next` keyframes are the most common cue in the library by roughly **10×**,
-   and `warm_manual`, `dischord` and `stomp` are all top-eight. This is the
-   largest remaining hole in the harness, and it alters the library's most
-   common cues, so it takes its own branch and rides alone.
-2. **The two state bugs** (`bugfix`) — both are cases of the bridge believing
+1. **The two state bugs** (`bugfix`) — both are cases of the bridge believing
    something about the world that is not true, and both mislead the operator in
    the room, which is the one thing the dashboard exists to prevent:
    - [cached WLED power state never resyncs after a device reboot](#open-bugfix--the-bridges-cached-wled-power-state-never-resyncs-after-a-device-reboot)
@@ -58,6 +50,10 @@ firmware upgrade could mask the cause rather than fix it.
 
 ### Recently closed
 
+- ~~Event-driven cue patterns still run on asyncio~~ — built 2026-07-29;
+  [write-up](#done-2026-07-29-refactor--event-driven-cue-patterns-still-run-on-asyncio-so-replay-cant-judge-them).
+  The harness now covers the library's most common cues. Only `authored_venue`'s
+  digest moved; `DEFAULT` gained its first replay coverage of any kind.
 - ~~WLED desync — "only a power cycle clears it"~~ — root-caused and fixed
   2026-07-28 (a realtime-timeout misconfiguration on the controller, which was
   also blocking OTA). [Drift during an active stream](#open-evidence--desync-not-reproduced-since-the-realtime-timeout-fix-testing-is-parked-not-finished)
@@ -168,9 +164,9 @@ its behaviour dominates the look far more than any individual cue.
 
 ---
 
-## OPEN `refactor` — Event-driven cue patterns still run on asyncio, so replay can't judge them
+## DONE 2026-07-29 `refactor` — Event-driven cue patterns still run on asyncio, so replay can't judge them
 
-**Found:** 2026-07-27, while building the replay harness.
+**Found:** 2026-07-27, while building the replay harness. **Built 2026-07-29.**
 
 Time-driven zone patterns were migrated to the deterministic `engine.tick()`
 path, but the **event**-driven ones were not. Five cues launch asyncio
@@ -208,6 +204,96 @@ already tracks beat edges and keyframes, so the state a coroutine keeps in its
 local `idx` can live in the pattern object instead. Do it as its own change with
 its own look-check on the real strip — it alters the most common cues in the
 library, so it should not ride along with unrelated work.
+
+### What was built
+
+`_CounterPattern` alongside `_TimePattern`: the packet path only *counts*
+(`_keyframe_count`, and the existing `_beat_count`) and `tick()` reads the
+counter, so the step index is a pure function of (counter, wall clock). The
+three coroutines, `_spawn`, `_active_tasks`, both `asyncio.Event`s and both
+`_last_*_type` fields are gone, and with them the `asyncio` import — there is no
+longer a second, untestable way to run a pattern.
+
+**The shape came from LedFx**, which has no event-driven pattern coroutines at
+all. Its beat queries are `@lru_cache` methods invalidated once per audio frame
+(`ledfx/effects/audio.py:1355-1363`), and discrete state advances by
+edge-detecting a sampled phase — `if self.beat < self.last_beat:` then
+`frame_c = (frame_c + 1) % framecount` (`ledfx/effects/keybeat2d.py:534-555`).
+We read a counter instead of detecting wraps, because we have one.
+
+Three decisions worth keeping:
+
+- **Block rendering, not glide.** These write `self.zones` and are painted as
+  cell blocks, exactly as the coroutines were; they claim no zones and emit no
+  motion heads. Gliding needs to know when the *next* step lands. Tempo supplies
+  that; an external chart keyframe stream does not, and interpolating toward an
+  unarrived keyframe would render a step behind the chart. LedFx can interpolate
+  its key frames (`frame_progress = self.beat / self.beat_incs[...]`) precisely
+  because its beat oscillator predicts the next beat. This is why the migration
+  moved only one golden digest.
+- **The keyframe fallback is now uniform.** `WARM_MANUAL`/`COOL_MANUAL` already
+  stepped on tempo once a keyframe was overdue; `DEFAULT` and `STOMP` awaited
+  forever and **froze solid** on charts with no keyframes. All four now fall
+  back, matching LedFx's oscillator, which coasts on the last known period and
+  cannot freeze. Note the real cadence is one step per **2 ×** the nominal step
+  interval — the asyncio `wait_for` re-armed its 2× timeout after firing, so
+  "steps on BPM cadence" was never what the old comment claimed. Preserved as
+  measured, as `KEYFRAME_FALLBACK_BEATS`.
+- **`DISCHORD` reuses `_beat_count`**, so `_advance_clock`'s
+  `max(1, round(elapsed))` bridges a dropped beat packet and the chase stays in
+  musical phase rather than falling a step behind — the rule the time-driven PLL
+  already follows, and further than LedFx goes (its `beat_counter` increments per
+  detected beat while only its *position* coasts).
+
+Two details that would have changed the look if missed, both now under test:
+
+- **`apply_delay`.** The coroutine shapes disagreed: `_run_beat_pattern` and
+  `_run_multi_zone_chase` applied step 0 *then* awaited, while
+  `_run_listen_pattern` awaited *then* applied. So `DEFAULT` holds the `BLUE=ALL`
+  its own cue sets until the chart's first keyframe. Inverting this starts the
+  cue dark instead of blue.
+- **`DEFAULT` is exempt from the venue density transform**, as it always was —
+  `_start_listen_pattern` never applied it. Its steps are washes (`NONE`/`ALL`),
+  not a chase, so thinning them would dim the cue rather than sparsen a pattern.
+
+`DEFAULT` was the one cue with no rate of its own to inherit (`_start_listen_
+pattern` took no `cycles_per_beat`), so its fallback rate — 1.0 over a 2-step
+pattern, alternating once per beat — is **the only invented number in the
+change** and the thing to judge on the strip.
+
+**Cost: none for the mechanism.** Median ms/frame, base vs. this branch, on the
+fixtures whose look is unchanged: `warm_beats` 0.489 → 0.494, `rapid_cue_changes`
+0.632 → 0.633, `auto_generated_venue` 0.681 → 0.681, `spotlight_cues` 0.329 →
+0.328 — all inside the noise. `authored_venue` goes 0.375 → 0.450 ms/frame, which
+is not the counter machinery: it is the cost of *actually rendering* four cues
+that previously rendered nothing at all.
+
+**Verification:** 586 tests green, up from 553. 25 new in
+`tests/test_counter_patterns.py`, plus new replay coverage.
+`test_event_driven_cues_do_not_advance_under_replay` was deleted and replaced
+with `test_event_driven_cues_advance_under_replay`, as its own docstring
+instructed. Two fixtures were added: `default_keyframes` (DEFAULT had **no
+replay coverage at all** — the cue tied to the library's most common event was
+the one the harness could not see) and `keyframe_starved` (the fallback).
+
+**Exactly one pre-existing golden digest moved: `authored_venue`**, the only
+fixture using `WARM_MANUAL`/`COOL_MANUAL`/`STOMP`/`DISCHORD`. The other ten
+holding still is the evidence that block rendering preserved the look. Its
+entries in `PRE_FADE_DIGESTS` and `PRE_STRICTNESS_DIGESTS` were re-derived too:
+those tables pin that a *settings* rollback is bit-exact, and this was an engine
+change, so that fixture's historical capture — four cues sitting motionless
+because their coroutines never ran — no longer describes anything reachable. The
+other ten values in each table are untouched and are what carry the claim.
+
+**Rollback is the branch/tag, not a knob.** Palette strictness and the cue fade
+both shipped a slider plus a pre-change digest table; this one deliberately does
+not, because the knob would have to keep the asyncio path alive, and removing
+that path is the entire point.
+
+**What to judge on the rig:** the five cues should look unchanged on a keyframed
+chart. Two things will differ — `DEFAULT` and `STOMP` now move instead of
+freezing on a chart with no keyframes, and `DEFAULT`'s fallback runs at the
+invented 1.0 cycles/beat.
 
 ---
 

@@ -197,6 +197,37 @@ def authored_venue():
     return b.build()
 
 
+def default_keyframes():
+    """The DEFAULT cue stepped by chart keyframes.
+
+    DEFAULT alternates blue/red on every `next` keyframe — the most common event
+    in the library by roughly 10× — and had no replay coverage at all until the
+    event-driven cues moved onto the deterministic tick. It was precisely the
+    cue the harness most needed to be able to judge, and the only one it could
+    not see.
+    """
+    b = StreamBuilder(bpm=120.0)
+    b.set_defaults(auto_gen=0)
+    b.play(3.0, cue=CueByte.DEFAULT, keyframe_every=1)
+    return b.build()
+
+
+def keyframe_starved():
+    """Keyframe-stepped cues on a chart that never sends a keyframe.
+
+    The fallback case: rather than freezing, these step on tempo once a keyframe
+    is overdue by KEYFRAME_FALLBACK_BEATS nominal intervals. WARM_MANUAL always
+    behaved this way; DEFAULT and STOMP used to freeze solid here, which is the
+    asymmetry the counter-pattern migration removed.
+    """
+    b = StreamBuilder(bpm=120.0)
+    b.set_defaults(auto_gen=0)
+    b.play(2.0, cue=CueByte.DEFAULT)        # keyframe_every=0 → none are sent
+    b.play(2.0, cue=CueByte.WARM_MANUAL)
+    b.play(2.0, cue=CueByte.STOMP)
+    return b.build()
+
+
 def auto_generated_venue():
     """The majority case: YARG synthesised the lighting (`auto_gen` set).
 
@@ -349,6 +380,10 @@ FIXTURES = {
                        "menu → gameplay → pause → resume → score → menu"),
     "authored_venue": (authored_venue, "midi-venue",
                        "keyframed manual cues, spotlights, fog, post grades"),
+    "default_keyframes": (default_keyframes, "midi-venue",
+                          "DEFAULT alternating on chart keyframes"),
+    "keyframe_starved": (keyframe_starved, "midi-venue",
+                         "keyframe cues with no keyframes — tempo fallback"),
     "auto_generated_venue": (auto_generated_venue, "auto-generated",
                              "YARG-synthesised lighting, the majority case"),
     "strobe_and_blackout": (strobe_and_blackout, "n/a",

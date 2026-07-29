@@ -8,7 +8,6 @@ Based on YALCY's StageKitTalker behavior, enhanced with LedFx/WLED-inspired
 effects for a modern LED strip look.
 """
 
-import asyncio
 import time
 
 from protocol.yarg_packet import (
@@ -107,6 +106,14 @@ NOTE_REFRESH_MIN = 0.14      # seconds — ~7 Hz max re-flash cadence
 PLL_TAU = 0.10               # seconds — lock time-constant
 BEAT_LOCK_TIMEOUT = 2.0      # seconds without a beat → free-run fallback
 PLL_DT_MAX = 0.2             # clamp per-frame dt so a stall can't fling motion
+
+# Chart-keyframe stepping (drives the keyframe _CounterPatterns).
+# KEYFRAME_FALLBACK_BEATS: a keyframe cue must not freeze on a chart that sends
+# no keyframes, so it steps on tempo once one is overdue by this multiple of the
+# pattern's nominal step interval. 2.0 is the value the asyncio wait_for used,
+# so the fallback cadence is unchanged where it already existed.
+KEYFRAME_DEDUP_WINDOW = 0.015   # seconds — reject a duplicated NEXT datagram
+KEYFRAME_FALLBACK_BEATS = 2.0   # nominal step intervals before stepping on tempo
 
 # ── Venue-size density branching (VISION signal inventory) ──────
 # YALCY branches per cue on the venue-size byte (offset 8): Large venues get
@@ -302,6 +309,85 @@ class _TimePattern:
         return heads
 
 
+class _CounterPattern:
+    """Event-stepped zone pattern advanced by counters, ticked from the render thread.
+
+    The cues YARG drives from the *chart* rather than the clock — keyframe-
+    stepped scanners and the beat-stepped Dischord chase — used to be asyncio
+    coroutines awaiting an Event. That made them invisible to the replay
+    harness, which has no event loop: they never stepped and their zones stayed
+    dark. Per the venue_scan inventory those are the library's most common cues,
+    so the harness could not judge the look of most of what it renders.
+
+    Instead the packet path only ever *counts* (CueEngine._keyframe_count,
+    _beat_count) and tick() reads the counter, exactly the way LedFx samples its
+    beat oscillator once per frame rather than delivering beat events to
+    effects. The step index is a pure function of (counter, wall clock), so a
+    replayed capture reproduces it frame for frame.
+
+    Unlike _TimePattern these claim no zones and emit no motion heads: gliding
+    between steps needs to know when the *next* step lands, which tempo supplies
+    and an external chart keyframe stream does not. They write self.zones and
+    render as cell blocks, which is what the coroutines did.
+    """
+    __slots__ = ('steps', 'source', 'base', 'apply_delay',
+                 'fallback_steps_per_beat', 'next_fallback_time',
+                 'fallback_steps', 'last_count')
+
+    def __init__(self, steps, *, source, base, now, apply_delay=0,
+                 fallback_steps_per_beat=0.0, init_bpm=120.0):
+        self.steps = steps                  # list of list[(zone, mask)]
+        self.source = source                # 'keyframe' | 'beat'
+        self.base = base                    # counter value at launch
+        # How many events pass before the pattern paints anything. The two
+        # coroutine shapes disagreed and the difference is visible: the beat/
+        # chase loops applied step 0 *then* awaited (apply_delay=0), while the
+        # listen loop awaited *then* applied, leaving the cue's own opening
+        # zones standing until the first event (apply_delay=1). Getting this
+        # backwards starts DEFAULT on the wrong colour.
+        self.apply_delay = apply_delay
+        # Keyframe patterns must not freeze on charts that send no keyframes,
+        # so they fall back to stepping on tempo. 0.0 disables the fallback.
+        # Stored as a rate, not a duration, so the interval tracks tempo changes
+        # — the coroutine recomputed its wait_for timeout on every step.
+        self.fallback_steps_per_beat = fallback_steps_per_beat
+        self.next_fallback_time = now + self.fallback_interval(init_bpm)
+        self.fallback_steps = 0             # steps taken via the timer
+        self.last_count = base
+
+    def fallback_interval(self, bpm: float) -> float:
+        """Seconds a keyframe may be overdue before the pattern steps on tempo."""
+        if self.fallback_steps_per_beat <= 0.0:
+            return 0.0
+        effective_bpm = bpm if bpm > 0 else 120.0
+        return (KEYFRAME_FALLBACK_BEATS * 60.0 / effective_bpm
+                / self.fallback_steps_per_beat)
+
+    def resolve(self, count: int, now: float, bpm: float) -> int | None:
+        """Current step index, or None for "leave the zones alone"."""
+        interval = self.fallback_interval(bpm)
+        if count != self.last_count:
+            self.last_count = count
+            # A real event re-arms the fallback: the chart is driving again.
+            if interval > 0.0:
+                self.next_fallback_time = now + interval
+        elif interval > 0.0 and now >= self.next_fallback_time:
+            self.fallback_steps += 1
+            # At most one fallback step per tick. If the deadline is more than
+            # an interval in the past — a pause, a host suspend, a long GC —
+            # snap forward rather than emitting a catch-up burst, the same
+            # reasoning as _TimePattern's free-run scheduler.
+            if now - self.next_fallback_time > interval:
+                self.next_fallback_time = now + interval
+            else:
+                self.next_fallback_time += interval
+
+        delta = (count - self.base) + self.fallback_steps
+        if delta < self.apply_delay:
+            return None
+        return (delta - self.apply_delay) % len(self.steps)
+
+
 class CueEngine:
     """Manages active lighting cue and produces zone bitmask state + effects."""
 
@@ -326,17 +412,19 @@ class CueEngine:
         # BPM from YARG
         self.bpm = 120.0
 
-        # Active primitives (asyncio tasks for event-driven patterns only)
-        self._active_tasks: list[asyncio.Task] = []
-
         # Time-driven patterns (ticked from render thread)
         self._time_patterns: list[_TimePattern] = []
 
-        # Beat/keyframe event for listen patterns
-        self._beat_event = asyncio.Event()
-        self._keyframe_event = asyncio.Event()
-        self._last_beat_type = BeatByte.OFF
-        self._last_keyframe_type = KeyframeByte.OFF
+        # Event-stepped patterns, advanced from the counters below — also
+        # ticked from the render thread. See _CounterPattern.
+        self._counter_patterns: list[_CounterPattern] = []
+
+        # Chart keyframe counter. YARG clears MLCKeyframe immediately after each
+        # send (DataStreamController.cs), so NEXT occupies exactly one datagram
+        # and this counts chart keyframes rather than packets. _keyframe_at
+        # exists only to reject a duplicated datagram.
+        self._keyframe_count = 0
+        self._keyframe_at = -1.0e9
 
         # Note-hold accents (Phase 4). Rising-edge per-instrument hits, order
         # [guitar, bass, drums, keys]. _note_prev holds the last bitmask for
@@ -661,6 +749,12 @@ class CueEngine:
         frozen scanner holds still; owned zones stay zeroed so it never
         double-paints as blocks. The mapper applies the brightness dim.
         """
+        # Event-stepped patterns write self.zones, which the level reset below
+        # derives from — so they must advance first or their steps land a frame
+        # late. Frozen while paused, like the motion below.
+        if not self.paused:
+            self._advance_counter_patterns(now)
+
         bpm = self.bpm
         levels = self.zone_cell_levels
         patterns = self._time_patterns  # local ref — safe across threads
@@ -755,22 +849,45 @@ class CueEngine:
 
         self.motion_sources = motion  # atomic rebind for the render read
 
+    def _advance_counter_patterns(self, now: float):
+        """Step the event-driven patterns from their counters.
+
+        Called from the top of tick(), before the level reset, because these
+        write self.zones and the reset derives the cell levels from it.
+
+        The counters are plain ints written on the asyncio thread and read here
+        on the render thread, which is safe in CPython; the pattern list is
+        rebound atomically by _kill_primitives the same way _time_patterns is.
+        """
+        patterns = self._counter_patterns  # local ref — safe across threads
+        for p in patterns:
+            count = (self._keyframe_count if p.source == 'keyframe'
+                     else self._beat_count)
+            step = p.resolve(count, now, self.bpm)
+            if step is None:
+                continue   # apply_delay: the cue's opening zones still stand
+            for zone, mask in p.steps[step]:
+                self.zones[zone] = mask
+
     def on_beat(self, beat_type: int, now: float | None = None):
         """Called when a beat event arrives from YARG.
 
         MEASURE = downbeat (start of a measure) — most prominent.
         STRONG  = strong beat within the measure.
-        WEAK    = sub-beat — fires _beat_event so listen-patterns nudge,
-                  but no sparkle/glitch overlay (would feel cluttered).
+        WEAK    = sub-beat — no sparkle/glitch overlay (would feel cluttered)
+                  and no oscillator update.
 
-        MEASURE and STRONG also drive the beat oscillator (reset phase, advance
-        the bar). WEAK does not — it can't be told apart from YARG's post-send
-        "3" sentinel. *now* is injectable for tests; production passes None.
+        MEASURE and STRONG drive the beat oscillator (reset phase, advance the
+        bar) and so advance _beat_count, which is what the beat-stepped
+        _CounterPatterns read. WEAK does not — it can't be told apart from
+        YARG's post-send "3" sentinel, and the event-driven patterns this
+        replaced re-waited on WEAK rather than stepping, so counting only
+        MEASURE/STRONG keeps their behaviour.
+
+        *now* is injectable for tests; production passes None.
         """
-        self._last_beat_type = beat_type
         if beat_type == BeatByte.OFF:
             return
-        self._beat_event.set()
         if now is None:
             now = self._clock()
         if beat_type == BeatByte.MEASURE:
@@ -810,11 +927,29 @@ class CueEngine:
             self._beat_count += 1
         self._beat_at = now
 
-    def on_keyframe(self, keyframe_type: int):
-        """Called when a keyframe event arrives from YARG."""
-        self._last_keyframe_type = keyframe_type
-        if keyframe_type != KeyframeByte.OFF:
-            self._keyframe_event.set()
+    def on_keyframe(self, keyframe_type: int, now: float | None = None):
+        """Called when a keyframe event arrives from YARG.
+
+        Only NEXT advances the counter the keyframe-stepped _CounterPatterns
+        read; FIRST/PREVIOUS are positional and the patterns this replaced
+        ignored them too.
+
+        The old asyncio.Event collapsed a duplicated datagram for free (two
+        set()s before one clear() are one wakeup). A counter does not, so
+        reject a NEXT arriving within KEYFRAME_DEDUP_WINDOW of the last —
+        far below any musically meaningful keyframe spacing, far above the
+        ~11 ms packet interval a duplicate arrives within.
+
+        *now* is injectable for tests; production passes None.
+        """
+        if keyframe_type != KeyframeByte.NEXT:
+            return
+        if now is None:
+            now = self._clock()
+        if now - self._keyframe_at < KEYFRAME_DEDUP_WINDOW:
+            return
+        self._keyframe_at = now
+        self._keyframe_count += 1
 
     def on_notes(self, guitar: int, bass: int, drums: int, keys: int,
                  now: float | None = None):
@@ -1100,11 +1235,14 @@ class CueEngine:
         self._launch_cue(cue_byte)
 
     def _kill_primitives(self):
-        """Cancel all active pattern tasks and time-driven patterns."""
-        for task in self._active_tasks:
-            task.cancel()
-        self._active_tasks.clear()
-        self._time_patterns = []  # atomic reference swap — safe for render thread
+        """Drop every pattern the outgoing cue launched.
+
+        Both lists are rebound rather than mutated: the render thread reads them
+        without a lock, and an atomic reference swap means it sees either the
+        old set or the new one, never a half-cleared list.
+        """
+        self._time_patterns = []
+        self._counter_patterns = []
 
     def _set_zone(self, zone: int, mask: int):
         """Set a zone's bitmask."""
@@ -1356,67 +1494,51 @@ class CueEngine:
                             cycles_per_beat: float, listen: str | None = None):
         """Launch a beat-synced pattern loop on a zone.
 
-        When *listen* is None the pattern is time-driven and ticked from the
-        render thread (immune to event-loop congestion).  Event-driven
-        patterns still use asyncio tasks.
+        When *listen* is None the pattern is time-driven; otherwise it is
+        event-stepped. Both are ticked from the render thread, so both are
+        immune to event-loop congestion and both replay deterministically.
 
         The venue-size density transform (if any) is applied to the steps
         here, at launch — never per frame.
         """
         pattern = self._venue_transform_pattern(pattern)
-        if listen is not None:
-            self._spawn(
-                self._run_beat_pattern(zone, pattern, cycles_per_beat, listen))
-            return
-
         steps = [[(zone, mask)] for mask in pattern]
         now = self._clock()
+        if listen is not None:
+            self._counter_patterns.append(self._make_counter_pattern(
+                steps, listen=listen, cycles_per_beat=cycles_per_beat, now=now))
+            return
+
         self._time_patterns.append(_TimePattern(
             steps, bpm_sync=True, param=cycles_per_beat,
             now=now, init_bpm=self.bpm,
         ))
 
-    async def _run_beat_pattern(self, zone: int, pattern: list[int],
-                                cycles_per_beat: float, listen: str | None = None):
-        """Beat-synced pattern loop (event-driven only — kept for listen modes)."""
-        idx = 0
-        try:
-            while True:
-                self.zones[zone] = pattern[idx]
-                idx = (idx + 1) % len(pattern)
+    def _make_counter_pattern(self, steps, *, listen: str,
+                              cycles_per_beat: float, now: float,
+                              apply_delay: int = 0) -> _CounterPattern:
+        """Build an event-stepped pattern for a `listen=` mode.
 
-                if listen == "beat_any":
-                    while True:
-                        await self._beat_event.wait()
-                        self._beat_event.clear()
-                        if self._last_beat_type in (BeatByte.MEASURE, BeatByte.STRONG):
-                            break
-                elif listen == "keyframe":
-                    # Step on YARG NEXT keyframes — used by the *_MANUAL
-                    # cues so the chart drives the rhythm — but fall back
-                    # to BPM pacing when keyframes stop arriving so the
-                    # pattern never freezes on charts without them.
-                    steps_per_beat = len(pattern) * cycles_per_beat
-                    bpm = self.bpm if self.bpm > 0 else 120.0
-                    timeout = 2.0 * 60.0 / bpm / steps_per_beat
-                    while True:
-                        try:
-                            await asyncio.wait_for(
-                                self._keyframe_event.wait(), timeout)
-                        except asyncio.TimeoutError:
-                            if self.paused:
-                                continue  # frozen — keep waiting
-                            break  # no keyframes — step on BPM cadence
-                        self._keyframe_event.clear()
-                        if self._last_keyframe_type == KeyframeByte.NEXT:
-                            break
-                else:
-                    steps_per_beat = len(pattern) * cycles_per_beat
-                    bpm = self.bpm if self.bpm > 0 else 120.0
-                    seconds_per_beat = 60.0 / bpm
-                    await asyncio.sleep(seconds_per_beat / steps_per_beat)
-        except asyncio.CancelledError:
-            pass
+        Both beat modes ("beat_any", "beat_major") mean the same thing: the
+        coroutines they replace stepped only on MEASURE/STRONG and re-waited on
+        WEAK, and _beat_count counts exactly those. Reusing it also means a
+        dropped beat packet is bridged by _advance_clock's rounding, so the
+        chase stays in musical phase — the rule the time-driven PLL follows.
+
+        Only keyframe patterns get a tempo fallback. Beat patterns need none:
+        with no beats there is no tempo to fall back to.
+        """
+        if listen == "keyframe":
+            return _CounterPattern(
+                steps, source='keyframe', base=self._keyframe_count, now=now,
+                apply_delay=apply_delay,
+                fallback_steps_per_beat=len(steps) * cycles_per_beat,
+                init_bpm=self.bpm,
+            )
+        return _CounterPattern(
+            steps, source='beat', base=self._beat_count, now=now,
+            apply_delay=apply_delay,
+        )
 
     def _start_timed_pattern(self, zone: int, pattern: list[int], seconds: float):
         """Launch a fixed-period pattern (not BPM-synced), ticked from render thread."""
@@ -1449,117 +1571,47 @@ class CueEngine:
                 masks[zone_order[zone_idx]] |= bit_values[bit_pos]
             frames.append(masks)
 
-        if listen is not None:
-            self._spawn(
-                self._run_multi_zone_chase(zone_order, frames, cycles_per_beat,
-                                           listen, reverse_on_beat))
-            return
-
-        # Time-based — store for render-thread ticking
         steps = [list(f.items()) for f in frames]
         used = set(zone_order)
         for z in range(4):
             if z not in used:
                 self.zones[z] = NONE
         now = self._clock()
+
+        if listen is not None:
+            # reverse_on_beat is a time-driven chaos behaviour (Frenzy); no
+            # event-stepped cue uses it, and the coroutine's own counter only
+            # advanced on the steps it took, so there is nothing to carry over.
+            self._counter_patterns.append(self._make_counter_pattern(
+                steps, listen=listen, cycles_per_beat=cycles_per_beat, now=now))
+            return
+
+        # Time-based — store for render-thread ticking
         self._time_patterns.append(_TimePattern(
             steps, bpm_sync=True, param=cycles_per_beat,
             now=now, init_bpm=self.bpm,
             reverse_on_beat=reverse_on_beat,
         ))
 
-    async def _run_multi_zone_chase(self, zone_order: list[int], frames: list[dict],
-                                     cycles_per_beat: float, listen: str | None,
-                                     reverse_on_beat: bool):
-        """Run the multi-zone rotating chase (event-driven only)."""
-        idx = 0
-        direction = 1
-        beat_count = 0
+    def _start_listen_pattern(self, zone: int, pattern: list[int], listen: str,
+                              cycles_per_beat: float = 1.0):
+        """Launch an event-stepped pattern that leaves the cue's opening zones lit.
 
-        used = set(zone_order)
-        for z in range(4):
-            if z not in used:
-                self.zones[z] = NONE
+        Unlike _start_beat_pattern this paints nothing until the first event
+        arrives (apply_delay=1): the coroutine it replaces awaited *before* it
+        assigned, so DEFAULT holds the BLUE=ALL its own cue set until the
+        chart's first keyframe, then starts alternating.
 
-        try:
-            while True:
-                frame = frames[idx]
-                for zone, mask in frame.items():
-                    self.zones[zone] = mask
-                idx = (idx + direction) % len(frames)
+        *cycles_per_beat* only sets the tempo fallback rate for keyframe mode;
+        the pattern itself is stepped by events, not by the clock. DEFAULT is
+        the one cue with no rate of its own to inherit, and 1.0 over its 2-step
+        pattern falls back to alternating once per beat.
 
-                if listen == "beat_major":
-                    await self._beat_event.wait()
-                    self._beat_event.clear()
-                    if self._last_beat_type not in (BeatByte.MEASURE, BeatByte.STRONG):
-                        continue
-                elif listen == "keyframe":
-                    await self._keyframe_event.wait()
-                    self._keyframe_event.clear()
-                    if self._last_keyframe_type != KeyframeByte.NEXT:
-                        continue
-                else:
-                    steps_per_beat = len(frames) * cycles_per_beat
-                    bpm = self.bpm if self.bpm > 0 else 120.0
-                    await asyncio.sleep(60.0 / bpm / steps_per_beat)
-
-                # Random direction reversal for Frenzy-style chaos
-                if reverse_on_beat:
-                    beat_count += 1
-                    if beat_count % 4 == 0:
-                        direction = -direction
-        except asyncio.CancelledError:
-            pass
-
-    def _spawn(self, coro) -> "asyncio.Task | None":
-        """Schedule an event-driven pattern coroutine, if a loop is running.
-
-        Event-driven patterns (the `listen=` modes on DEFAULT, WARM_MANUAL,
-        COOL_MANUAL, STOMP and DISCHORD) are still asyncio coroutines rather than
-        `tick()`-driven. In the bridge they're always launched from the UDP
-        callback or an HTTP handler, so a running loop is guaranteed.
-
-        Offline callers — the replay harness, unit tests — have no loop, and
-        asyncio's older `ensure_future`/`get_event_loop` path *raises* there
-        rather than doing nothing. Losing this cue's motion is an acceptable
-        degradation offline; taking the whole cue dispatch down with a
-        RuntimeError is not. Returns None when there was nothing to run it.
-
-        See BACKLOG.md — migrating these onto tick() removes the asymmetry.
+        No venue density transform here, deliberately — the coroutine applied
+        none, and DEFAULT's steps are washes (NONE/ALL) rather than a chase, so
+        thinning them would dim the cue rather than sparsen a pattern.
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            coro.close()   # no loop: don't leave an un-awaited coroutine behind
-            return None
-        task = loop.create_task(coro)
-        self._active_tasks.append(task)
-        return task
-
-    def _start_listen_pattern(self, zone: int, pattern: list[int], listen: str):
-        """Launch an event-triggered pattern on a zone."""
-        self._spawn(self._run_listen_pattern(zone, pattern, listen))
-
-    async def _run_listen_pattern(self, zone: int, pattern: list[int], listen: str):
-        """Event-triggered pattern."""
-        idx = 0
-        try:
-            while True:
-                if listen == "beat_major":
-                    await self._beat_event.wait()
-                    self._beat_event.clear()
-                    if self._last_beat_type not in (BeatByte.MEASURE, BeatByte.STRONG):
-                        continue
-                elif listen == "keyframe":
-                    await self._keyframe_event.wait()
-                    self._keyframe_event.clear()
-                    if self._last_keyframe_type != KeyframeByte.NEXT:
-                        continue
-                else:
-                    await asyncio.sleep(0.05)
-                    continue
-
-                self.zones[zone] = pattern[idx]
-                idx = (idx + 1) % len(pattern)
-        except asyncio.CancelledError:
-            pass
+        steps = [[(zone, mask)] for mask in pattern]
+        self._counter_patterns.append(self._make_counter_pattern(
+            steps, listen=listen, cycles_per_beat=cycles_per_beat,
+            now=self._clock(), apply_delay=1))

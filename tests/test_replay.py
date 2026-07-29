@@ -153,8 +153,18 @@ def test_strobe_frames_are_reproducible():
 # Three had previously moved when palette strictness landed and shipped on by
 # default (auto_generated_venue, song_lifecycle, star_power_run — the fixtures
 # that actually drive a remapped layer).
+#
+# Exactly one moved when the event-driven cues migrated onto counter-stepped
+# patterns (2026-07-29): authored_venue, the only fixture using WARM_MANUAL,
+# COOL_MANUAL, STOMP or DISCHORD. Those cues previously rendered *static* under
+# replay because their asyncio coroutines never ran, so this digest is the first
+# one to describe their actual motion. The other ten holding still is the
+# evidence that migration preserved the look of everything else — the patterns
+# kept writing zones as cell blocks rather than becoming gliding motion heads.
 GOLDEN_DIGESTS = {
-    "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
+    "authored_venue": "db197118404387de7a9ebe560c680ccc410b01b4cf6a0992545024990e8aefa1",
+    "default_keyframes": "5f0ecd51e0e21a2d9920ae8d991a574ce411649e1bf5a4f5408936da70c1411f",
+    "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
     "auto_generated_venue": "538576dbc5c32bba140a440867f299c2150ae2fa3a6dacd8e8725fef1b264687",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "f34b2836915ed0b2ead764626aa861d44d3860269fea93a55301e59756ca3c3e",
@@ -184,9 +194,20 @@ def test_golden_frame_digest(name):
 # documented rollback is `cue_fade_ms = 250` plus an empty override table, and
 # this asserts that combination still renders the old light exactly rather than
 # approximately.
+#
+# authored_venue's value was re-derived when the event-driven cues moved onto
+# counter-stepped patterns. That is an *engine* change, not a knob, so its
+# historical capture no longer describes anything reachable: it recorded four
+# cues sitting motionless because their coroutines never ran off an event loop.
+# The claim these tests make is that the documented settings rollback is
+# bit-exact, and the other ten unchanged values are what carry it.
 PRE_FADE_DIGESTS = {
-    "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
+    "authored_venue": "ae902983223e79a6670c47eef02ea37dfa68f66d5d6aeb293bb11f62e2703c31",
     "auto_generated_venue": "b7ad4ec42b45a9453a606ba0e9c49561e339575d997e28e4448b5eeb71b0c522",
+    # No history — these two arrived with the counter-pattern change, for
+    # rollback coverage of the cues it touches. Not pre-change captures.
+    "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
+    "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
     # No history — this fixture arrived with the fade change. It is what the
@@ -227,9 +248,15 @@ def test_pre_fade_settings_reproduce_the_old_look(name):
 # are what strictness 0.0 renders today. They still earn their place, because
 # the rollback path has to keep lighting these cues, but do not read them as
 # history.
+#
+# authored_venue was likewise re-derived for the counter-pattern change; see the
+# note on PRE_FADE_DIGESTS. default_keyframes and keyframe_starved arrived with
+# it and are not history either.
 PRE_STRICTNESS_DIGESTS = {
-    "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
+    "authored_venue": "918350075c7884bccc923b2743a97717c4243602b97bd37377dac5cf47545444",
     "auto_generated_venue": "39ddaabb8e6cf7fcc93b69dbcfd44fa44850b1982e376d1f2b47ad82650d7aa6",
+    "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
+    "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
     "rapid_cue_changes": "6d758dd4c98cca4d2eaf5454eb3f5f536562dd4e36c75064b3ab150f196a49ae",
@@ -344,39 +371,61 @@ def test_authored_and_auto_streams_render_differently():
     assert a.sampled_digest() != b.sampled_digest()
 
 
-def test_event_driven_cues_do_not_advance_under_replay():
-    """KNOWN LIMITATION, pinned deliberately — see BACKLOG.md.
+def test_event_driven_cues_advance_under_replay():
+    """The event-stepped cues animate — replaces a pinned known limitation.
 
-    Time-driven patterns were migrated to the deterministic `engine.tick()`
-    path, but the *event*-driven ones (`listen="keyframe"` / `"beat_any"`) still
-    run as asyncio coroutines: DEFAULT, WARM_MANUAL, COOL_MANUAL, STOMP and
-    DISCHORD. Replay has no event loop, so those coroutines never step and their
-    zones stay dark.
+    DEFAULT, WARM_MANUAL, COOL_MANUAL, STOMP and DISCHORD used to run as asyncio
+    coroutines awaiting a beat/keyframe Event. Replay has no event loop, so they
+    never stepped and their zones stayed dark — and per the venue_scan inventory
+    those are the library's most common cues, `next` keyframes leading by
+    roughly 10×. They now step from counters read by `engine.tick()`, so the
+    harness can render, hash and regression-test their motion.
 
-    That matters more than the cue count suggests: per the venue_scan inventory,
-    `next` keyframes are the most common cue in the library by roughly 10×, and
-    warm_manual/dischord/stomp are all in the top eight. So the harness cannot
-    yet judge the look of the library's most common cues.
-
-    This test exists so the limitation is visible rather than lurking. When
-    those patterns move onto tick(), it will fail — that is the signal to delete
-    it and assert the motion instead.
+    `authored_venue`'s opening two seconds are WARM_MANUAL driven by a keyframe
+    on every beat.
     """
     result = _replay("authored_venue")
-    # The keyframe-stepped stretch renders nothing.
-    assert result.dark_frames() > 0
     early = result.frames[20:60]
-    assert len({bytes(f) for f in early}) == 1, (
-        "event-driven cues now advance under replay — the asyncio patterns were "
-        "migrated to tick(). Delete this test and assert the motion instead."
+    assert len({bytes(f) for f in early}) > 1, (
+        "the keyframe-stepped opening is static again — the counter patterns "
+        "are no longer advancing under replay"
     )
+    assert _dark_after_the_opening_fade(result) == 0
+
+
+def test_default_cue_alternates_on_chart_keyframes():
+    """DEFAULT holds its opening wash, then alternates once per keyframe.
+
+    The `apply_delay` semantic: the coroutine this replaced awaited *before* it
+    assigned, so the cue's own BLUE=ALL stands until the chart's first keyframe.
+    Getting that backwards starts the cue on the wrong colour.
+    """
+    result = _replay("default_keyframes")
+    frames = result.frames[20:]
+    assert len({bytes(f) for f in frames}) > 1
+    assert _dark_after_the_opening_fade(result) == 0
+
+
+def test_keyframe_cues_fall_back_to_tempo_when_no_keyframes_arrive():
+    """A chart with no keyframes must not freeze the cues that step on them.
+
+    WARM_MANUAL always fell back to tempo; DEFAULT and STOMP froze solid, which
+    the counter-pattern migration unified. Without the fallback this fixture
+    renders one unchanging frame per cue.
+    """
+    result = _replay("keyframe_starved")
+    frames = result.frames[20:]
+    assert len({bytes(f) for f in frames}) > 1, (
+        "keyframe cues froze with no keyframes — the tempo fallback is not firing"
+    )
+    assert _dark_after_the_opening_fade(result) == 0
 
 
 def test_time_driven_cues_do_advance_under_replay():
-    """The counterpart: cues already on the tick() path animate fine.
+    """The counterpart: cues on the time-driven tick() path animate too.
 
-    Keeps the limitation above scoped to event-driven patterns rather than
-    reading as "replay can't animate anything".
+    Kept alongside the event-stepped assertions above so a regression in either
+    path is distinguishable from a harness-wide failure.
     """
     result = _replay("auto_generated_venue")   # VERSE/CHORUS are time-driven
     frames = result.frames[20:80]
