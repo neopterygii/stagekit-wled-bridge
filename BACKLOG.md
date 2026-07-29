@@ -22,19 +22,18 @@ reliability workstreams. In order:
 2. **[Spotlight cues are too narrow](#open--spotlight-cues-light-too-narrow-a-slice-of-the-strip)**
    — a one-number change with an obvious answer, worth landing while the desync
    evidence accumulates.
-3. ~~Newer layers ignore the selected palette~~ — **done 2026-07-28** on
-   `feat/palette-strictness`; see
+3. ~~Newer layers ignore the selected palette~~ — **done, verified on the rig,
+   and merged to `main` 2026-07-29**; see
    [the write-up](#done-2026-07-28--newer-reactivity-layers-ignore-the-selected-palette).
-   Awaits a look on the real strip.
 
 Then back to the reliability push: W3 alignment trim, W4 read-only state/MQTT,
 W5 firmware qualification. Note item 1 above is an argument *for* W5 but also a
 reason to gather evidence before it, since a firmware upgrade could mask the
 cause rather than fix it.
 
-Blocking neither: `feat/replay-harness` is built and awaiting merge, and items 1
-and 2 both get easier once it lands (a recorded passage replayed before/after
-beats remembering last night's show).
+Blocking neither: the replay harness is **merged to `main` (2026-07-29)**, so
+items 1 and 2 can both lean on it — a recorded passage replayed before/after
+beats remembering last night's show.
 
 ---
 
@@ -173,8 +172,7 @@ library, so it should not ride along with unrelated work.
 ## DONE (2026-07-28) — Newer reactivity layers ignore the selected palette
 
 **Raised:** 2026-07-27 by the operator, after watching the vocal ribbon.
-**Built:** 2026-07-28 on `feat/palette-strictness`. Still wants a look on the
-real strip before it is called finished.
+**Built:** 2026-07-28. **Verified on the rig and merged to `main` 2026-07-29.**
 
 Several Phase 4–5 features paint from **fixed hue tables of their own** rather
 than from the active palette, so they look correct under `default` (RGBY) and
@@ -258,9 +256,9 @@ pins all nine pre-change golden digests at strictness 0.0, so the rollback path
 stays bit-exact under test rather than on trust. Three of the nine goldens moved
 at strictness 1.0 — exactly the fixtures that drive a remapped layer.
 
-**Not done:** nobody has looked at this on the strip. Default-on changes the
-live look, including under `default` (its ring is the four-colour fallback,
-close to but not the rainbow). Rollback is the slider to 0.0, or `:1.0.0`.
+**Looked at on the strip 2026-07-29 and kept.** Default-on does change the live
+look, including under `default` (its ring is the four-colour fallback, close to
+but not the rainbow). Rollback remains the slider to 0.0, or `:1.0.0`.
 
 ---
 
@@ -478,8 +476,9 @@ state" for the full description of each:
    release was a re-tag rather than a behaviour change.
    *Still outstanding:* the operator flips the Unraid template from the stale
    branch tag to `:latest` (rollback `:1.0.0`) and recreates the container.
-2. `IN PROGRESS` — Timestamped YARG datagram capture/replay harness with a
-   headless DDP receiver in CI. Built on `feat/replay-harness`, awaiting merge.
+2. `DONE` (2026-07-29) — Timestamped YARG datagram capture/replay harness with a
+   headless DDP receiver in CI. Merged to `main` together with palette
+   strictness and the WLED desync tooling.
 3. `OPEN` — Persisted operator lighting-alignment trim plus a calibration
    pattern. Default 0 ms.
 4. `OPEN` — Expanded read-only game/bridge state, optionally over MQTT.
