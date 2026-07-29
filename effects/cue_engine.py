@@ -59,6 +59,17 @@ STROBE_DIVISIONS = {
 REVEAL_DURATION = 1.5        # Intro center-out reveal
 BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
 
+# ── Spotlight cues ───────────────────────────────────────────────
+# Both spotlight cues light several evenly spaced spots, not one window — the
+# operator's ask was "2-3 spotlights of about the current size", i.e. a stage
+# lit by a few lamps. The two stay a deliberate pair: BLACKOUT's spots are
+# tight, SILHOUETTES' are half again as wide. Widths are a fraction of the
+# strip PER SPOT; on the 120px strip TIGHT is 20px and WIDE is 30px.
+SPOTLIGHT_COUNT = 3          # evenly tiled spots
+SPOTLIGHT_WIDTH_TIGHT = 0.18   # BLACKOUT_SPOTLIGHT — unchanged from single-spot
+SPOTLIGHT_WIDTH_WIDE = 0.25    # SILHOUETTES_SPOTLIGHT
+SPOTLIGHT_CHASE_RATE = 1.0   # spots the emphasis advances per beat
+
 # ── Camera-cut lighting (VISION Phase 5) ─────────────────────────
 CAMERA_CUT_DURATION = 0.28   # seconds — one-shot accent decay on a *directed* cut
 CAMERA_EASE = 0.30           # seconds — subject bias fades in over this after a cut
@@ -1124,12 +1135,15 @@ class CueEngine:
             return  # All off
 
         elif cue == CueByte.BLACKOUT_SPOTLIGHT:
-            # Single warm-white spotlight in the strip center, everything
-            # else dark. The mapper paints the spotlight when it sees
+            # Three tight warm-white spotlights spread across the strip,
+            # everything between them dark, with the emphasis chasing from one
+            # to the next on the beat. The mapper paints them when it sees
             # spotlight_only=(r,g,b) with a spotlight_region < 1.0.
             self._set_effects(
                 spotlight_only=(255, 200, 140),
-                spotlight_region=0.18,
+                spotlight_region=SPOTLIGHT_WIDTH_TIGHT,
+                spotlight_count=SPOTLIGHT_COUNT,
+                spotlight_chase=SPOTLIGHT_CHASE_RATE,
             )
             return
 
@@ -1266,10 +1280,14 @@ class CueEngine:
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.SILHOUETTES_SPOTLIGHT:
-            # Same breathing green, but constrained to a spotlight region
-            # in the middle of the strip — the rest stays dark, evoking
-            # a single performer lit on a darkened stage.
-            self._set_effects(breathing=0.08, spotlight_region=0.40)
+            # Same breathing green, but constrained to three spotlight pools
+            # spread across the strip — the gaps between them stay dark,
+            # evoking a few performers picked out on a darkened stage. Wider
+            # spots than BLACKOUT_SPOTLIGHT, so the two read as a pair.
+            self._set_effects(breathing=0.08,
+                              spotlight_region=SPOTLIGHT_WIDTH_WIDE,
+                              spotlight_count=SPOTLIGHT_COUNT,
+                              spotlight_chase=SPOTLIGHT_CHASE_RATE)
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.STOMP:

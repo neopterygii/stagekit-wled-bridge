@@ -288,6 +288,25 @@ def malformed_stream():
     return b.build()
 
 
+def spotlight_cues():
+    """Both spotlight cues, long enough for the beat chase to wrap.
+
+    The multi-spot spotlights are the one cue family whose look is pure
+    geometry, so a moved digest here means the spots or the chase moved. At
+    120 BPM each 3-second leg is 6 beats — two full trips around the three
+    spots, which catches a chase that advances at the wrong rate as well as one
+    that has stopped.
+
+    The leading beat-less second matters: beat_clock is 0.0 until the first
+    beat, and the cue has to be lit through that, not dark.
+    """
+    b = StreamBuilder(bpm=120.0)
+    b.play(1.0, cue=CueByte.BLACKOUT_SPOTLIGHT, beats=False)
+    b.play(3.0, cue=CueByte.BLACKOUT_SPOTLIGHT)
+    b.play(3.0, cue=CueByte.SILHOUETTES_SPOTLIGHT)
+    return b.build()
+
+
 def star_power_run():
     """A charge → overdrive → release cycle with per-player star power (v4)."""
     b = StreamBuilder(bpm=132.0)
@@ -316,6 +335,8 @@ FIXTURES = {
     "malformed_stream": (malformed_stream, "n/a",
                          "junk and future-version packets among good ones"),
     "star_power_run": (star_power_run, "n/a", "charge → overdrive → release"),
+    "spotlight_cues": (spotlight_cues, "n/a",
+                       "multi-spot spotlights, beat chase wrapping"),
 }
 
 

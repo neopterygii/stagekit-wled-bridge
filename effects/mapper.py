@@ -136,6 +136,15 @@ PERFORMER_COLORS = {
 }
 PERFORMER_BIAS_STRENGTH = 0.18   # max blend toward the highlighted hue
 
+# ── Spotlight cues ───────────────────────────────────────────────
+# The spotlight cues light several evenly spaced spots rather than one window:
+# a stage lit by a few lamps. A beat-driven chase pumps one spot to full while
+# the others hold at this floor, so all of them stay visible at every instant
+# and the movement reads as emphasis rather than as spots switching on and off.
+# The chase is driven from the engine's free-running beat_clock (like
+# gradient_roll below), NOT from beat events, so it stays replay-deterministic.
+SPOT_DIM_FLOOR = 0.35            # level of the spots the chase is not on
+
 # ── Song-section palette/energy bias (VISION signal inventory) ───
 # The song-section byte (Verse/Chorus, offset 13) leans the current look
 # toward a per-section hue and scales its energy — a slow, subtle modulation
@@ -348,11 +357,54 @@ class LEDMapper:
         buf[o + 2] = min(255, buf[o + 2] + b)
 
     @staticmethod
-    def _center_window(fraction: float) -> tuple[int, int]:
-        """(lo, hi) pixel bounds of a centered window covering *fraction* of the strip."""
+    def _spot_windows(count: int, fraction: float) -> list[tuple[int, int]]:
+        """`count` evenly tiled windows, each covering *fraction* of the strip.
+
+        Centres sit at the midpoint of each of `count` equal slices, so the
+        spots are evenly spread with equal gaps and equal margins at the ends.
+        `fraction` is the width of ONE spot, not of all of them together —
+        widening a spot does not move the others.
+
+        At count=1 the single slice's midpoint is the strip midpoint, so this
+        reduces exactly to the centred window this replaced (`_center_window`,
+        removed once the spotlight cues became its only callers) — pinned by
+        tests/test_spotlight.py so the reduction stays true.
+        """
         half = max(1, int(MAPPED_REGION * fraction / 2.0))
-        mid = MAPPED_REGION // 2
-        return max(0, mid - half), min(MAPPED_REGION, mid + half)
+        out = []
+        for i in range(count):
+            mid = MAPPED_REGION * (2 * i + 1) // (2 * count)
+            out.append((max(0, mid - half), min(MAPPED_REGION, mid + half)))
+        return out
+
+    @staticmethod
+    def _apply_spot_levels(buf: bytearray,
+                           windows: list[tuple[int, int]],
+                           levels: list[float]):
+        """Scale each window's pixels by its level; zero everything outside.
+
+        The multi-spot counterpart of `_mask_outside`: darkness between the
+        spots plus a per-spot brightness, so a chase can dim the spots it is
+        not currently on without extinguishing them.
+        """
+        lit = bytearray(MAPPED_REGION)   # 0 = gap, else level index + 1
+        for idx, (lo, hi) in enumerate(windows):
+            for i in range(lo, hi):
+                lit[i] = idx + 1
+        for i in range(MAPPED_REGION):
+            o = i * 3
+            slot = lit[i]
+            if not slot:
+                buf[o] = 0
+                buf[o + 1] = 0
+                buf[o + 2] = 0
+                continue
+            level = levels[slot - 1]
+            if level >= 1.0:
+                continue
+            buf[o] = int(buf[o] * level)
+            buf[o + 1] = int(buf[o + 1] * level)
+            buf[o + 2] = int(buf[o + 2] * level)
 
     @staticmethod
     def _camera_region(idx: int) -> tuple[int, int]:
@@ -572,6 +624,12 @@ class LEDMapper:
         reveal_progress = effects.get("reveal_progress", 1.0)    # < 1.0 = masking
         spotlight_region = effects.get("spotlight_region", 0.0)  # 0 = no mask
         spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
+        # Multi-spot spotlights. spotlight_region is the width of ONE spot;
+        # count is how many are tiled across the strip; chase is how many spots
+        # the emphasis advances per beat (0 = static, all spots at full).
+        # Defaults reproduce the single-window renderer exactly.
+        spotlight_count = effects.get("spotlight_count", 1)
+        spotlight_chase = effects.get("spotlight_chase", 0.0)
         fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
 
         # Note-hold accents (Phase 4): 4 decayed levels [gtr, bass, drum, keys]
@@ -638,6 +696,24 @@ class LEDMapper:
         gradient_roll = effects.get("gradient_roll", 0.0)
         beat_clock = effects.get("beat_clock", 0.0)
 
+        # Spot geometry + per-spot brightness, shared by both spotlight paths
+        # (the direct paint below and the mask near the end of the frame).
+        # beat_clock is free-running and tempo-locked, so the chase coasts
+        # through a dropped beat instead of stalling, and reads the same
+        # injected clock the rest of the render seam uses — replaying a capture
+        # reproduces it exactly. Before the first beat it is 0.0, which parks
+        # the emphasis on spot 0 rather than blanking the cue.
+        spot_windows = None
+        spot_levels = None
+        if spotlight_region > 0.0:
+            spot_windows = self._spot_windows(spotlight_count, spotlight_region)
+            if spotlight_chase > 0.0 and spotlight_count > 1:
+                active = int(beat_clock * spotlight_chase) % spotlight_count
+                spot_levels = [1.0 if i == active else SPOT_DIM_FLOOR
+                               for i in range(spotlight_count)]
+            else:
+                spot_levels = [1.0] * spotlight_count
+
         buf = self._buf
 
         # Reset accent-layer activity for this frame; their effect blocks below
@@ -678,9 +754,13 @@ class LEDMapper:
         if spotlight_only is not None:
             sr, sg, sb = remap(spotlight_only, ring, strict) if strict \
                 else spotlight_only
-            start, end = self._center_window(spotlight_region)
-            for pos in range(start, end):
-                self._set_px(buf, pos, sr, sg, sb)
+            for (start, end), level in zip(spot_windows, spot_levels):
+                if level >= 1.0:
+                    lr, lg, lb = sr, sg, sb
+                else:
+                    lr, lg, lb = int(sr * level), int(sg * level), int(sb * level)
+                for pos in range(start, end):
+                    self._set_px(buf, pos, lr, lg, lb)
 
         elif use_additive:
             for cell in range(NUM_CELLS):
@@ -1274,12 +1354,12 @@ class LEDMapper:
             self._mask_outside(buf, mid - radius, mid + radius)
 
         # ── Effect: Spotlight region mask ────────────────────────
-        # Used by SILHOUETTES_SPOTLIGHT (spotlight_only is None) — keep
-        # only the centre fraction of the strip visible. spotlight_only
-        # cues already painted the spotlight directly so they're skipped.
+        # Used by SILHOUETTES_SPOTLIGHT (spotlight_only is None) — keep only
+        # the spot windows visible, at their chase brightness, and darken the
+        # gaps between them. spotlight_only cues already painted their spots
+        # directly so they're skipped.
         if spotlight_region > 0.0 and spotlight_only is None:
-            lo, hi = self._center_window(spotlight_region)
-            self._mask_outside(buf, lo, hi)
+            self._apply_spot_levels(buf, spot_windows, spot_levels)
 
         # ── Effect: Beat pulse (beat oscillator) ─────────────────
         # A gentle global brightness pump locked to the beat: peaks the instant

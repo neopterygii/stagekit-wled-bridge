@@ -19,9 +19,10 @@ reliability workstreams. In order:
    behaviour is verified. Remaining: whether there is *also* drift during an
    active stream, which `tools/wled_soak.py` plus a sustained stream is there to
    answer. That soak is now unblocked.
-2. **[Spotlight cues are too narrow](#open--spotlight-cues-light-too-narrow-a-slice-of-the-strip)**
-   — a one-number change with an obvious answer, worth landing while the desync
-   evidence accumulates.
+2. ~~Spotlight cues are too narrow~~ — **built 2026-07-29**; see
+   [the write-up](#done-2026-07-29--spotlight-cues-light-too-narrow-a-slice-of-the-strip).
+   Not the one-number change this entry claimed: the operator wanted *more*
+   spotlights, not a wider one.
 3. ~~Newer layers ignore the selected palette~~ — **done, verified on the rig,
    and merged to `main` 2026-07-29**; see
    [the write-up](#done-2026-07-28--newer-reactivity-layers-ignore-the-selected-palette).
@@ -437,25 +438,73 @@ PID-exhaustion bug lived in, so it wants its own change and a look at the rig.
 
 ---
 
-## OPEN — Spotlight cues light too narrow a slice of the strip
+## DONE 2026-07-29 — Spotlight cues light too narrow a slice of the strip
 
 **Raised:** 2026-07-27 by the operator: the spotlight cues light one small
 section, and should cover roughly **2–3 sections**.
 
-The strip is 8 cells of 12 LEDs. Current widths in `effects/cue_engine.py`:
+**This entry's original write-up was wrong on both counts, and that is the
+main lesson in it.**
 
-- `BLACKOUT_SPOTLIGHT` — `spotlight_region=0.18`, about **1.4 cells** (~22 LEDs).
-  This is the narrow one.
-- `SILHOUETTES_SPOTLIGHT` — `spotlight_region=0.40`, about 3.2 cells, already in
-  the requested range.
+- It read the request as *one wider window* and called the fix "mostly one
+  number". On 2026-07-29 the operator clarified: they want **2–3 separate
+  spotlights, each about the size of the current one** — a stage lit by a few
+  lamps, not one bigger lamp. "Sections" meant *spotlights*, not cells.
+- Its arithmetic used a 12-LED cell (96px strip). `CELL_SIZE` is
+  `LED_COUNT // 8` = **15**, so the mapped strip is 120px and every figure
+  quoted was 25% low. `BLACKOUT_SPOTLIGHT` at 0.18 was 20px / 1.33 cells, not
+  "~22 LEDs / 1.4 cells".
 
-So the change is mostly `BLACKOUT_SPOTLIGHT`: 2–3 cells is `spotlight_region`
-≈ **0.25–0.375**. Worth checking the two cues read as a deliberate pair
-afterwards (a tight spot vs. a wider one) rather than collapsing into the same
-look. `SILHOUETTES_SPOTLIGHT` may want a small nudge for contrast.
+Both errors came from reasoning off the entry instead of the code. The widths
+now have tests; they did not before, which is how this drifted unnoticed.
 
-Cheap to try, and the replay harness can show the before/after on the same
-recorded passage instead of relying on memory of last night's show.
+**What was built.** `_center_window` was generalised to
+`LEDMapper._spot_windows(count, fraction)` — `count` evenly tiled windows,
+`fraction` the width of **one** spot. At `count=1` it is bit-identical to
+`_center_window` for every fraction, so no other caller moved. Two new effect
+keys (`spotlight_count`, default 1; `spotlight_chase`, default 0.0) leave every
+non-spotlight cue rendering exactly as before.
+
+| cue | before | after |
+|---|---|---|
+| `BLACKOUT_SPOTLIGHT` | 1 × 20px (px 50–70) | 3 × 20px (10–30, 50–70, 90–110) |
+| `SILHOUETTES_SPOTLIGHT` | 1 × 48px (px 36–84) | 3 × 30px (5–35, 45–75, 85–115) |
+
+`BLACKOUT_SPOTLIGHT`'s per-spot width is *unchanged*: `spotlight_region=0.18`
+already yielded exactly 20px (`int(120×0.18/2)=10`), so only the count changed
+— "about the size the current one is" holds by construction, not by rounding.
+The two cues stay a deliberate pair: tight 20px spots vs 30px pools.
+
+All three spots stay lit at every instant; a chase pumps one to full while the
+others hold at `SPOT_DIM_FLOOR` (0.35), advancing one spot per beat. **The
+chase is driven from the engine's free-running `beat_clock`**, the way
+`gradient_roll` already is — *not* from `_start_beat_pattern` /
+`_start_listen_pattern`. That was deliberate: those are the event-driven
+mechanism behind the five cues this backlog records as un-replayable, and these
+cues must not join that set. `beat_clock` is 0.0 before the first beat, which
+parks the emphasis on spot 0 rather than blanking the cue.
+
+**Cost:** +0.030 ms/frame on `SILHOUETTES_SPOTLIGHT` (the new level-mask pass
+vs. the old `_mask_outside`). Both spotlight cues still render cheaper than a
+plain wash.
+
+**Live-look change:** `BLACKOUT_SPOTLIGHT` now lights 50% of the strip where it
+lit 17%. That is a visible change to how dark a "blackout" cue leaves the
+stage, and is the thing to judge on the rig.
+
+`blackout_spotlight` was also added to `status_server.TEST_PATTERNS` — it was
+missing, so the operator could not trigger from the dashboard the very cue they
+reported.
+
+**Tests:** new `tests/test_spotlight.py` (15) pins the geometry, the chase
+levels/advance/wrap, that the chase reads the injected clock rather than the
+wall clock, and that the cue still lights before any beat arrives. A
+`spotlight_cues` replay fixture plus golden digest covers it end to end. The
+nine pre-existing golden digests did **not** move, confirming no prior fixture
+exercised either cue.
+
+**Rollback:** set `SPOTLIGHT_COUNT` to 1 and `SPOTLIGHT_WIDTH_WIDE` back to
+0.40; the default-1 path is the pre-change renderer exactly.
 
 ---
 

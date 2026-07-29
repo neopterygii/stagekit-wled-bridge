@@ -156,6 +156,7 @@ GOLDEN_DIGESTS = {
     "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
     "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
     "song_lifecycle": "0aa0b0ba616d0c2d9f6cb40c99bf5ff2e9bad6b537860bd0b210e76e2bca75fe",
+    "spotlight_cues": "49e171cfc867beba338f3b474da4113a647a477f3273a9842f9bf07433baaaa9",
     "star_power_run": "1410de93e6d6851cb352aa4203c9e6a662e3dc72c38084d29972de777ee4da59",
     "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
@@ -177,6 +178,11 @@ def test_golden_frame_digest(name):
 # operator's documented way back to the pre-palette look, so "bit-exact" is a
 # claim the suite should be able to keep making rather than one taken on trust
 # the day it was written.
+#
+# spotlight_cues is the exception: it was added with the multi-spot spotlights,
+# after strictness shipped, so its value here is not a pre-change capture — it
+# is what strictness 0.0 renders today. It still earns its place, because the
+# rollback path has to keep lighting these cues, but do not read it as history.
 PRE_STRICTNESS_DIGESTS = {
     "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
     "auto_generated_venue": "39ddaabb8e6cf7fcc93b69dbcfd44fa44850b1982e376d1f2b47ad82650d7aa6",
@@ -184,6 +190,7 @@ PRE_STRICTNESS_DIGESTS = {
     "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
     "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
     "song_lifecycle": "333d3654a248709bc8386d8b99aff493d93107123c8a433d3e242a90903e0365",
+    "spotlight_cues": "c7df29b2439f4e8f19016d5753275d96b506720aa5ad3872b7f810caf810493a",
     "star_power_run": "c64cf03b7273438f7f95512261355f6ce250edcebb0712646258782d3bc90424",
     "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",

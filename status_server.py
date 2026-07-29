@@ -53,6 +53,7 @@ TEST_PATTERNS = {
     "flare_fast": CueByte.FLARE_FAST,
     "silhouettes": CueByte.SILHOUETTES,
     "silhouettes_spotlight": CueByte.SILHOUETTES_SPOTLIGHT,
+    "blackout_spotlight": CueByte.BLACKOUT_SPOTLIGHT,
     "menu": CueByte.MENU,
     "score": CueByte.SCORE,
 }
