@@ -19,9 +19,10 @@ reliability workstreams. In order:
 2. **[Spotlight cues are too narrow](#open--spotlight-cues-light-too-narrow-a-slice-of-the-strip)**
    — a one-number change with an obvious answer, worth landing while the desync
    evidence accumulates.
-3. **[Newer layers ignore the selected palette](#open--newer-reactivity-layers-ignore-the-selected-palette)**
-   — the largest of the three and the one with a real design question in it
-   (pitch-class colour *means* something), so it wants a decision before code.
+3. ~~Newer layers ignore the selected palette~~ — **done 2026-07-28** on
+   `feat/palette-strictness`; see
+   [the write-up](#done-2026-07-28--newer-reactivity-layers-ignore-the-selected-palette).
+   Awaits a look on the real strip.
 
 Then back to the reliability push: W3 alignment trim, W4 read-only state/MQTT,
 W5 firmware qualification. Note item 1 above is an argument *for* W5 but also a
@@ -166,9 +167,11 @@ library, so it should not ride along with unrelated work.
 
 ---
 
-## OPEN — Newer reactivity layers ignore the selected palette
+## DONE (2026-07-28) — Newer reactivity layers ignore the selected palette
 
 **Raised:** 2026-07-27 by the operator, after watching the vocal ribbon.
+**Built:** 2026-07-28 on `feat/palette-strictness`. Still wants a look on the
+real strip before it is called finished.
 
 Several Phase 4–5 features paint from **fixed hue tables of their own** rather
 than from the active palette, so they look correct under `default` (RGBY) and
@@ -203,6 +206,58 @@ meaning away. Options, cheapest first:
 First step is the inventory above turned into a test: assert each layer's output
 hues fall inside the active palette when strictness is on. Do that before
 changing any of the maths.
+
+### What was built
+
+Option 1 (palette-relative hues) as the mechanism, option 2 (a strictness knob)
+as the control, and the operator's amendment that the layers **need not land on
+one of the four colours — only inside the palette's theme**. That amendment is
+what made option 1 workable, and it reframed the whole item: our four colours
+were *truncated* from richer LedFx/WLED gradients because four zones is all the
+Stage Kit model holds, so the fix is to go back to the sources and recover the
+family, not to synthesise one from four swatches.
+
+- `tools/extract_palette_ramps.py` parses the three vendored upstream formats
+  (LedFx CSS gradients, WLED `_gp[]` quads, WLED `TProgmemRGBPalette16` with
+  `CRGB::` names resolved against the vendored FastLED enum) and emits literals
+  pasted into `settings.PALETTES[*]["ramp"]`. Runtime never reads the clones.
+  `--check` audits each ramp against that palette's four colours **in both
+  directions**; six palettes pass, six fall back to a ring built from their own
+  four. Party has no green in it and our Party palette does; LedFx Frost runs on
+  into purple and pink and ours is ice. Those are mislabels in the
+  `description` strings, now stated in `settings.py`.
+- `effects/palette_map.py` builds the ring and does the remap. Three decisions
+  worth keeping: the ring closes with a short **return arc rather than a
+  mirror** (mirroring maps pitch class p and 12-p to one colour); stops are
+  spaced by **perceptual distance, not the upstream's own positions** (lava_gp
+  spends its first quarter deepening a single red, which swallowed three pitch
+  classes); and layers whose meaning is a *parameter* rather than a *colour* —
+  the ribbon, cue gradients — index the ring by that parameter instead of by
+  hue, because hue-indexing collapses wherever a ramp holds one hue at several
+  brightnesses.
+- Scope went beyond the four layers listed above to the **cue gradient
+  recolour** (which repaints every lit pixel's hue, a louder violation than any
+  bias), the star-power tint and the spotlight-only colour.
+- `palette_strictness` 0.0–1.0, **default 1.0**, with a dashboard slider,
+  `POST /api/settings`, persistence, and a pin in `replay/player.py`.
+
+**Cost:** +0.037 ms/frame with every remapped layer active — 0.2% of the 60 FPS
+budget. The remap runs on a handful of colours per frame, not per pixel; cue
+gradients are remapped LUT-wise once and cached.
+
+**Verification:** 457 tests green, up from 357 on the base branch — 91 new in
+the two palette files plus 9 pinning the rollback path.
+`tests/test_palette_strictness.py` asserts
+family membership per layer over four differently shaped palettes, plus that an
+octave still sweeps the palette and that pitch classes do not collapse.
+`tests/test_replay.py::test_zero_strictness_reproduces_the_pre_palette_look`
+pins all nine pre-change golden digests at strictness 0.0, so the rollback path
+stays bit-exact under test rather than on trust. Three of the nine goldens moved
+at strictness 1.0 — exactly the fixtures that drive a remapped layer.
+
+**Not done:** nobody has looked at this on the strip. Default-on changes the
+live look, including under `default` (its ring is the four-colour fallback,
+close to but not the rainbow). Rollback is the slider to 0.0, or `:1.0.0`.
 
 ---
 

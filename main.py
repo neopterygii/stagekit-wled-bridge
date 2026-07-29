@@ -30,6 +30,7 @@ from protocol.ddp_sender import DDPSender
 from protocol.wled_api import WLEDApi
 from effects.cue_engine import CueEngine
 from effects.mapper import LEDMapper, MAPPED_REGION, PREVIEW_CELLS
+from effects.palette_map import build_ring
 from status_server import StatusTracker, StatusServer
 from settings import BridgeSettings
 from replay.controller import CaptureController
@@ -403,6 +404,7 @@ class RenderThread(threading.Thread):
         # Cached palette colours — refreshed when palette name changes
         self._cached_palette = ""
         self._cached_colors: dict = {}
+        self._cached_ring = None
 
         # Cue cross-fade state. When the engine signals a cue change, we
         # snapshot the previously sent frame into _fade_from and linearly
@@ -518,6 +520,11 @@ class RenderThread(threading.Thread):
         palette_name = self._settings.palette_name
         if palette_name != self._cached_palette:
             self._cached_colors = self._settings.zone_colors
+            # The colour family the reactivity layers are constrained to. Built
+            # here rather than per frame: it depends only on the palette, and
+            # this branch is already the "palette changed" one.
+            self._cached_ring = build_ring(self._cached_colors,
+                                           self._settings.palette_ramp)
             self._cached_palette = palette_name
 
         # Advance time-based patterns (zone bitmasks computed from the injected
@@ -565,6 +572,8 @@ class RenderThread(threading.Thread):
             zone_cell_levels=self._engine.zone_cell_levels,
             motion_sources=self._engine.motion_sources,
             preview=want_preview,
+            palette_ring=self._cached_ring,
+            palette_strictness=self._settings.palette_strictness,
         )
 
         # Apply strobe (replace with pre-allocated black)

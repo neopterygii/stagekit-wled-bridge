@@ -26,8 +26,13 @@ _COLORS = {"red": (255, 0, 0), "green": (0, 255, 0),
 def _render(performers, zones=(0xFF, 0, 0, 0)):
     # Default scene: a solid red wash so a hue lean is measurable.
     m = LEDMapper(MAPPED_REGION)
+    # palette_strictness=0.0 keeps these tests about the bias *maths*: the
+    # fixed PERFORMER_COLORS go through unremapped, so the formula assertions
+    # below stay exact. That the same colours land in the palette's family when
+    # strictness is on is tests/test_palette_strictness.py's job.
     return m.render(list(zones), zone_colors=_COLORS,
-                    effects={"performers": performers}, brightness=1.0)
+                    effects={"performers": performers}, brightness=1.0,
+                    palette_strictness=0.0)
 
 
 # ── Engine union ─────────────────────────────────────────────────

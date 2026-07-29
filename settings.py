@@ -18,6 +18,26 @@ SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "/data/settings.json")
 # ── Color palettes ─────────────────────────────────────────────────
 # Each palette maps the 4 zone names to (R, G, B) tuples.
 # "red" zone doesn't have to be red — it's just the Stage Kit zone ID.
+#
+# `colors` is what the Stage Kit model can carry: four zones, four colours. Most
+# of these were derived by *truncating* a richer LedFx or WLED gradient down to
+# four, and that truncation is what made the newer continuous layers (vocal
+# ribbon, the biases, cue gradients) look foreign — they need a whole colour
+# family, not four swatches.
+#
+# So a palette may also carry `ramp`: the full upstream gradient, as
+# `(position, (r, g, b))` stops over [0, 1], recovered by
+# `tools/extract_palette_ramps.py` from the vendored LedFx/WLED checkouts and
+# pasted here as literals (the deployed image ships only this directory, so
+# runtime never reads those clones). `effects/palette_map.py` turns it into the
+# ring every non-zone layer draws from.
+#
+# Six palettes have no `ramp` and fall back to a ring built from their four
+# colours: `default` and `neon` are ours with no upstream at all, while `party`,
+# `forest`, `sakura` and `frost` failed the generator's audit — their four
+# colours are not actually the upstream family the description claims (Party has
+# no green in it; LedFx Frost runs on into purple and pink, and ours is ice).
+# Run `tools/extract_palette_ramps.py --check` to see that audit.
 
 PALETTES = {
     "default": {
@@ -48,6 +68,11 @@ PALETTES = {
             "blue": (0, 50, 255),
             "yellow": (255, 50, 200),
         },
+        "ramp": [
+            (0.0, (255, 0, 0)),
+            (0.5, (255, 0, 178)),
+            (1.0, (0, 0, 255)),
+        ],
     },
     "plasma": {
         "label": "Plasma",
@@ -58,6 +83,13 @@ PALETTES = {
             "blue": (255, 0, 120),
             "yellow": (255, 120, 0),
         },
+        "ramp": [
+            (0.0, (0, 0, 255)),
+            (0.25, (128, 0, 128)),
+            (0.5, (255, 0, 0)),
+            (0.75, (255, 40, 0)),
+            (1.0, (255, 200, 0)),
+        ],
     },
     "lava": {
         "label": "Lava",
@@ -68,6 +100,19 @@ PALETTES = {
             "blue": (140, 0, 10),
             "yellow": (255, 180, 0),
         },
+        "ramp": [
+            (0.0, (77, 0, 0)),
+            (0.2525, (177, 0, 0)),
+            (0.3131, (196, 38, 9)),
+            (0.3687, (215, 76, 19)),
+            (0.5051, (235, 115, 29)),
+            (0.6465, (255, 153, 41)),
+            (0.7172, (255, 178, 41)),
+            (0.7879, (255, 204, 41)),
+            (0.8687, (255, 230, 41)),
+            (0.9495, (255, 255, 41)),
+            (1.0, (255, 255, 143)),
+        ],
     },
     "ocean": {
         "label": "Ocean",
@@ -78,6 +123,23 @@ PALETTES = {
             "blue": (0, 10, 100),
             "yellow": (80, 220, 240),
         },
+        "ramp": [
+            (0.0, (25, 25, 112)),
+            (0.0667, (0, 0, 139)),
+            (0.1333, (25, 25, 112)),
+            (0.2, (0, 0, 128)),
+            (0.3333, (0, 0, 205)),
+            (0.4, (46, 139, 87)),
+            (0.4667, (0, 128, 128)),
+            (0.5333, (95, 158, 160)),
+            (0.6, (0, 0, 255)),
+            (0.6667, (0, 139, 139)),
+            (0.7333, (100, 149, 237)),
+            (0.8, (127, 255, 212)),
+            (0.8667, (46, 139, 87)),
+            (0.9333, (0, 255, 255)),
+            (1.0, (135, 206, 250)),
+        ],
     },
     "forest": {
         "label": "Forest",
@@ -98,6 +160,13 @@ PALETTES = {
             "blue": (160, 0, 100),
             "yellow": (255, 200, 40),
         },
+        "ramp": [
+            (0.0, (181, 0, 0)),
+            (0.163, (218, 85, 0)),
+            (0.3778, (255, 170, 0)),
+            (0.6296, (211, 85, 77)),
+            (1.0, (167, 0, 169)),
+        ],
     },
     "borealis": {
         "label": "Borealis",
@@ -108,6 +177,11 @@ PALETTES = {
             "blue": (80, 0, 200),
             "yellow": (0, 220, 160),
         },
+        "ramp": [
+            (0.0, (128, 0, 128)),
+            (0.5001, (0, 199, 140)),
+            (1.0, (0, 255, 0)),
+        ],
     },
     "frost": {
         "label": "Frost",
@@ -217,6 +291,13 @@ DEFAULT_SETTINGS = {
     # Song-section bias intensity 0.0-1.0 (Phase 8). Scales the verse/chorus
     # hue-lean + energy bias; 0 = off (bit-exact), 1 = full.
     "section_intensity": 1.0,
+    # How tightly the reactivity layers follow the selected palette, 0.0-1.0.
+    # The vocal ribbon, performer/camera/section biases, cue gradients and
+    # star-power tint each paint from a fixed colour table of their own, which
+    # looks right under `default` (RGBY) and foreign under every other palette.
+    # 1.0 constrains them all to the palette's family; 0.0 restores the fixed
+    # tables exactly. Defaults on — following the palette is the point.
+    "palette_strictness": 1.0,
     # Each toggle defaults on unless its registry row opts out with default:False.
     "effects": {tid: meta.get("default", True) for tid, meta in EFFECT_TOGGLES.items()},
 }
@@ -275,6 +356,8 @@ class BridgeSettings:
             self._data["venue_intensity"] = max(0.0, min(1.0, float(stored["venue_intensity"])))
         if isinstance(stored.get("section_intensity"), (int, float)):
             self._data["section_intensity"] = max(0.0, min(1.0, float(stored["section_intensity"])))
+        if isinstance(stored.get("palette_strictness"), (int, float)):
+            self._data["palette_strictness"] = max(0.0, min(1.0, float(stored["palette_strictness"])))
         stored_effects = stored.get("effects")
         if isinstance(stored_effects, dict):
             for tid in EFFECT_TOGGLES:
@@ -373,6 +456,18 @@ class BridgeSettings:
             self._save()
 
     @property
+    def palette_strictness(self) -> float:
+        with self._lock:
+            return self._data["palette_strictness"]
+
+    @palette_strictness.setter
+    def palette_strictness(self, value: float):
+        value = max(0.0, min(1.0, float(value)))
+        with self._lock:
+            self._data["palette_strictness"] = value
+            self._save()
+
+    @property
     def direction(self) -> str:
         with self._lock:
             return self._data["direction"]
@@ -390,6 +485,18 @@ class BridgeSettings:
         """Current palette's zone color mapping."""
         with self._lock:
             return dict(PALETTES[self._data["palette"]]["colors"])
+
+    @property
+    def palette_ramp(self):
+        """Current palette's full upstream gradient, or None.
+
+        Six palettes have none — see the note above `PALETTES`. Callers pass
+        this to `palette_map.build_ring`, which falls back to the four zone
+        colours when it is absent.
+        """
+        with self._lock:
+            ramp = PALETTES[self._data["palette"]].get("ramp")
+        return list(ramp) if ramp else None
 
     # ── Effect toggles ─────────────────────────────────────────────
     @property
@@ -442,6 +549,7 @@ class BridgeSettings:
                 "blur_amount": self._data["blur_amount"],
                 "venue_intensity": self._data["venue_intensity"],
                 "section_intensity": self._data["section_intensity"],
+                "palette_strictness": self._data["palette_strictness"],
                 "effects": dict(self._data["effects"]),
                 "effect_toggles": {
                     tid: {"label": m["label"], "description": m["description"]}

@@ -10,6 +10,7 @@ Translates all Stage Kit cues (Warm Auto, Cool Auto, Frenzy, Sweep, Big Rock End
 - **Per-pixel effects** — decay trails, sine breathing, sparkle overlay, gradient blending, glitch overlay, initial flash
 - **Layer/slot compositor** — wash, motion, sparkle, flash, bonus, note, and vocal layers composed in a fixed order rather than overwritten in place
 - **12 color palettes** — Default RGBY, Party, Dancefloor, Plasma, Lava, Ocean, Forest, Sunset, Borealis, Frost, Sakura, Neon
+- **Palette strictness** — the reactivity layers (vocal ribbon, performer/camera/section biases, cue gradients, star-power tint) each paint from a fixed colour table of their own, which looks right under Default and foreign under everything else. Strictness constrains them to the selected palette's family, drawn where possible from the full upstream LedFx/WLED gradient rather than the four colours the Stage Kit's zone model can carry. On by default; slide to 0% for the original fixed colours
 - **Beat oscillator** — continuous beat clock that coasts through dropped beat pulses, phase-locked chase motion (PLL with free-run fallback), and beat-locked gradient scroll
 - **Instrument and vocal reactivity** — per-instrument note-hold accents in each instrument's slice of the strip, and a colour-by-pitch vocal ribbon for lead plus three harmonies
 - **Performer and camera awareness** — spotlight/singalong bias toward the featured players, and camera-cut subject region/hue bias with a directed-cut accent
@@ -21,7 +22,7 @@ Translates all Stage Kit cues (Warm Auto, Cool Auto, Frenzy, Sweep, Big Rock End
 - **Interleaved zone layout** — 4 color zones spread across 8 cells of 12 LEDs each for smooth chase/sweep effects
 - **Live web dashboard** — live strip and per-layer preview, beat clock, zone visualization, event log, SSE streaming, palette preview
 - **Built-in test controls** — trigger any of 21 cues from the web UI with adjustable BPM and strobe, no need to run YARG
-- **Persistent settings** — brightness, palette, FPS, direction, blur/venue/section intensities and per-effect toggles stored in JSON, survive restarts
+- **Persistent settings** — brightness, palette, FPS, direction, blur/venue/section intensities, palette strictness and per-effect toggles stored in JSON, survive restarts
 - **WLED power management** — auto-on when YARG starts, auto-off after idle timeout
 - **Pure Python stdlib** — zero external dependencies, runs on Python 3.12+
 - **Multi-arch Docker image** — builds for both `amd64` and `arm64`, gated on the test suite in CI
@@ -177,6 +178,7 @@ The built-in web dashboard at port 8080 shows:
 - **WLED power** — on/off state with idle countdown timer and manual toggle
 - **Brightness** — 5 step controls (10%, 25%, 50%, 75%, 100%)
 - **Color palette** — dropdown to switch between 12 palettes with live preview swatches
+- **Palette strictness** — slider for how tightly the reactivity layers follow the selected palette (0% = their original fixed colours)
 - **Zone bitmask visualization** — 4×8 LED grid with colors matching the active palette
 - **Event log** — scrolling log of cue changes, beats, and strobe events (capped at 200 entries)
 

@@ -42,6 +42,7 @@ import time
 from config import LED_COUNT
 from effects.compositor import Layer, Compositor, MIX, MIX_PREMULT
 from effects.gradient import GRADIENTS
+from effects.palette_map import build_ring, remap, remap_at, remap_gradient
 from protocol.yarg_packet import Performer, PostProcessing
 
 # Chroma ramp for the vocal ribbon: pitch-class (0..1 across an octave) → hue.
@@ -241,6 +242,10 @@ class LEDMapper:
 
         # Second working buffer for gradient blending pass
         self._blend = bytearray(MAPPED_REGION * 3)
+
+        # Palette-constrained cue gradients, keyed by (gradient, ring,
+        # strength). See _ring_gradient.
+        self._gradient_cache = {}
 
         # Ping-pong buffers for the post-process blur (Phase 6), pre-allocated
         # so the per-frame kernel passes never allocate.
@@ -468,6 +473,25 @@ class LEDMapper:
                 for k in range(cells * 3):
                     out[k] = v
 
+    def _ring_gradient(self, gradient, ring, strength):
+        """Palette-constrained copy of a cue gradient, built once and kept.
+
+        The gradient recolour is the one remap that would otherwise run per
+        *pixel* — it replaces the hue of every lit pixel — so remap the ramp
+        instead of the pixels. Cue gradients come from the module-level
+        `GRADIENTS`, and the ring changes only when the operator changes
+        palette, so the cache is small and effectively permanent. Keyed by
+        identity with the source objects held in the value, so a key can't be
+        recycled onto a different object.
+        """
+        key = (id(gradient), id(ring), round(strength, 3))
+        hit = self._gradient_cache.get(key)
+        if hit is not None:
+            return hit[2]
+        built = remap_gradient(gradient, ring, strength)
+        self._gradient_cache[key] = (gradient, ring, built)
+        return built
+
     def layer_preview(self) -> dict:
         """Serializable per-layer preview from the most recent preview capture.
 
@@ -489,7 +513,9 @@ class LEDMapper:
                reverse: bool = False,
                zone_cell_levels: list[list[float]] | None = None,
                motion_sources: list | None = None,
-               preview: bool = False) -> bytes:
+               preview: bool = False,
+               palette_ring=None,
+               palette_strictness: float = 1.0) -> bytes:
         """Render pixels from 4 zone bitmasks with optional effects.
 
         Args:
@@ -508,6 +534,15 @@ class LEDMapper:
                 Painted as soft profiles at a sub-pixel position and composited
                 over the static base. Zones a motion pattern owns arrive with
                 their cell levels zeroed, so the two models don't double-paint.
+            palette_ring: the palette's colour family, from
+                `palette_map.build_ring`. Layers that paint from fixed colour
+                tables of their own (vocal ribbon, the biases, cue gradients,
+                star-power tint) are constrained to it, so they stop looking
+                foreign under every palette but `default`. Built from
+                zone_colors alone when not supplied.
+            palette_strictness: how far to constrain them, 0.0-1.0. 0.0 leaves
+                every layer painting its original colours — the operator's way
+                back to the pre-palette look.
 
         Returns:
             Flat bytes of R,G,B,R,G,B,... for all LEDs with brightness applied.
@@ -615,6 +650,17 @@ class LEDMapper:
         # Resolve zone colors to flat ints once
         zc = [zone_colors[ZONE_NAMES[z]] for z in range(4)]
 
+        # Resolve the palette's colour family once per frame. Every remap below
+        # goes through this; `strict` short-circuits the whole feature to a
+        # branch-not-taken when the operator has dialled it out.
+        strict = palette_strictness if palette_strictness > 0.0 else 0.0
+        if strict:
+            if palette_ring is None:
+                palette_ring = build_ring(zone_colors)
+            ring = palette_ring
+        else:
+            ring = None
+
         # Derive fractional cell levels from bitmasks if engine didn't.
         if zone_cell_levels is None:
             zone_cell_levels = [
@@ -630,7 +676,8 @@ class LEDMapper:
         # Spotlight-only mode (BLACKOUT_SPOTLIGHT): paint a fixed colour in
         # the centre region and skip the normal zone mapping entirely.
         if spotlight_only is not None:
-            sr, sg, sb = spotlight_only
+            sr, sg, sb = remap(spotlight_only, ring, strict) if strict \
+                else spotlight_only
             start, end = self._center_window(spotlight_region)
             for pos in range(start, end):
                 self._set_px(buf, pos, sr, sg, sb)
@@ -767,6 +814,8 @@ class LEDMapper:
         # trails so decay/breathing/sparkle all operate on the gradient colour.
         if gradient is not None:
             offset = (beat_clock * gradient_roll) % 1.0 if gradient_roll else 0.0
+            if strict:
+                gradient = self._ring_gradient(gradient, ring, strict)
             color_at = gradient.color_at
             inv_region = 1.0 / MAPPED_REGION
             for i in range(MAPPED_REGION):
@@ -1012,7 +1061,7 @@ class LEDMapper:
             lift = 1.0 + SP_SURGE_LIFT * surge
             tint_t = SP_TINT_STRENGTH * surge
             inv_t = 1.0 - tint_t
-            tr, tg, tb = SP_TINT
+            tr, tg, tb = remap(SP_TINT, ring, strict) if strict else SP_TINT
             density = min(0.25, SP_SHIMMER_DENSITY *
                           (1.0 + SP_SHIMMER_MULTI * max(0, sp_active_count - 1)))
             shimmer_life = max(2, round(fps * 0.12))  # ~120 ms
@@ -1036,7 +1085,7 @@ class LEDMapper:
                     t = min(1.0, shimmer[i] / life_div)
                     v = buf[o] + int(tr * t);       buf[o] = v if v < 255 else 255
                     v = buf[o + 1] + int(tg * t);   buf[o + 1] = v if v < 255 else 255
-                    v = buf[o + 2] + int(255 * t);  buf[o + 2] = v if v < 255 else 255
+                    v = buf[o + 2] + int(tb * t);   buf[o + 2] = v if v < 255 else 255
                     shimmer[i] -= 1
         elif sp_charge > 0.0:
             # Charging only: a subtle cool tint on lit pixels, proportional to
@@ -1044,7 +1093,7 @@ class LEDMapper:
             # shimmer — it should be barely-there anticipation.
             tint_t = SP_CHARGE_TINT * sp_charge
             inv_t = 1.0 - tint_t
-            tr, tg, tb = SP_TINT
+            tr, tg, tb = remap(SP_TINT, ring, strict) if strict else SP_TINT
             for i in range(MAPPED_REGION):
                 o = i * 3
                 if buf[o] | buf[o + 1] | buf[o + 2]:
@@ -1084,8 +1133,16 @@ class LEDMapper:
                     elif pos01 > 1.0:
                         pos01 = 1.0
                     center = pos01 * (MAPPED_REGION - 1)
-                    # Hue from pitch class (note within the octave).
-                    cr, cg, cb = VOCAL_CHROMA.color_at((pitch % 12.0) / 12.0)
+                    # Hue from pitch class (note within the octave). Under
+                    # strictness the ring is indexed by the same pitch class
+                    # rather than by the chroma ramp's hue — the ribbon's
+                    # meaning lives in the *parameter*, so an octave keeps
+                    # sweeping the palette instead of collapsing wherever the
+                    # palette holds one hue at several brightnesses.
+                    pc = (pitch % 12.0) / 12.0
+                    cr, cg, cb = VOCAL_CHROMA.color_at(pc)
+                    if strict:
+                        cr, cg, cb = remap_at((cr, cg, cb), ring, pc, strict)
                     lo = int(math.ceil(center - half))
                     hi = int(math.floor(center + half))
                     if lo < 0:
@@ -1125,6 +1182,10 @@ class LEDMapper:
                 tr //= count
                 tg //= count
                 tb //= count
+                # Remap the average, not each contributor: a two-performer
+                # highlight should read as one coherent tint.
+                if strict:
+                    tr, tg, tb = remap((tr, tg, tb), ring, strict)
                 t = PERFORMER_BIAS_STRENGTH
                 inv_t = 1.0 - t
                 tr_t = tr * t
@@ -1143,7 +1204,13 @@ class LEDMapper:
         # eased gain so a verse→chorus change drifts in over SECTION_EASE
         # instead of snapping. Lit pixels only; never lifts a blackout.
         if section_hue is not None and section_t > 0.0:
-            sr, sg, sb = section_hue
+            # The engine has already cross-faded verse hue into chorus hue, so
+            # what arrives is a blend — remapping it here (rather than the
+            # engine's endpoints) keeps the engine free of any palette
+            # knowledge. `remap` weights by saturation, which is what stops the
+            # cross-fade snapping as it passes through its desaturated middle.
+            sr, sg, sb = remap(section_hue, ring, strict) if strict \
+                else section_hue
             inv_t = 1.0 - section_t
             sr_t = sr * section_t
             sg_t = sg * section_t
@@ -1172,6 +1239,8 @@ class LEDMapper:
                 inv_t = 1.0 - t
                 for name in channels:
                     cr, cg, cb = CAMERA_CHANNEL_COLORS[name]
+                    if strict:
+                        cr, cg, cb = remap((cr, cg, cb), ring, strict)
                     cr_t, cg_t, cb_t = cr * t, cg * t, cb * t
                     lo, hi = self._camera_region(CAMERA_CHANNEL_ORDER.index(name))
                     for i in range(lo, hi):

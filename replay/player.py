@@ -230,7 +230,7 @@ class ReplayBridge:
     def __init__(self, fps: int = 40, sink: FrameSink | None = None,
                  start_time: float = DEFAULT_EPOCH, wled_on: bool = True,
                  brightness: int = 255, palette: str = "default",
-                 seed: int = 0):
+                 palette_strictness: float = 1.0, seed: int = 0):
         self._now = float(start_time)
         clock = self._clock
 
@@ -248,6 +248,10 @@ class ReplayBridge:
                                        warn_unwritable=False)
         self.settings.brightness = brightness
         self.settings.palette_name = palette
+        # Pinned like the palette itself: the reactivity layers are constrained
+        # to the palette's family, so a capture recorded under one strictness
+        # would not reproduce under another.
+        self.settings.palette_strictness = palette_strictness
         self.settings.fps = fps
         self.fps = fps
 

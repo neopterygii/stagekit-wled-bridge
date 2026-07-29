@@ -144,14 +144,19 @@ def test_strobe_frames_are_reproducible():
 # update. `python -m pytest tests/test_replay.py -k golden -v` prints the new
 # values on failure.
 
+# Three of these moved when palette strictness landed and shipped on by default
+# (auto_generated_venue, song_lifecycle, star_power_run — the fixtures that
+# actually drive a remapped layer). The other six were unchanged, which is the
+# expected signal: a plain zone wash paints from the palette already.
+# PRE_STRICTNESS_DIGESTS below keeps the old values under test.
 GOLDEN_DIGESTS = {
     "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
-    "auto_generated_venue": "39ddaabb8e6cf7fcc93b69dbcfd44fa44850b1982e376d1f2b47ad82650d7aa6",
+    "auto_generated_venue": "b7ad4ec42b45a9453a606ba0e9c49561e339575d997e28e4448b5eeb71b0c522",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
     "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
-    "song_lifecycle": "333d3654a248709bc8386d8b99aff493d93107123c8a433d3e242a90903e0365",
-    "star_power_run": "c64cf03b7273438f7f95512261355f6ce250edcebb0712646258782d3bc90424",
+    "song_lifecycle": "0aa0b0ba616d0c2d9f6cb40c99bf5ff2e9bad6b537860bd0b210e76e2bca75fe",
+    "star_power_run": "1410de93e6d6851cb352aa4203c9e6a662e3dc72c38084d29972de777ee4da59",
     "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
@@ -166,6 +171,31 @@ def test_golden_frame_digest(name):
         f"  frames: {result.frame_count}, dark: {result.dark_frames()}\n"
         "If the change is intended, update GOLDEN_DIGESTS."
     )
+
+
+# Digests as they stood before palette strictness. Strictness 0.0 is the
+# operator's documented way back to the pre-palette look, so "bit-exact" is a
+# claim the suite should be able to keep making rather than one taken on trust
+# the day it was written.
+PRE_STRICTNESS_DIGESTS = {
+    "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
+    "auto_generated_venue": "39ddaabb8e6cf7fcc93b69dbcfd44fa44850b1982e376d1f2b47ad82650d7aa6",
+    "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
+    "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
+    "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
+    "song_lifecycle": "333d3654a248709bc8386d8b99aff493d93107123c8a433d3e242a90903e0365",
+    "star_power_run": "c64cf03b7273438f7f95512261355f6ce250edcebb0712646258782d3bc90424",
+    "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
+    "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
+}
+
+
+@pytest.mark.parametrize("name", sorted(PRE_STRICTNESS_DIGESTS))
+def test_zero_strictness_reproduces_the_pre_palette_look(name):
+    result = _replay(name, bridge=ReplayBridge(fps=40, palette_strictness=0.0))
+    assert result.sampled_digest() == PRE_STRICTNESS_DIGESTS[name], (
+        f"palette_strictness=0.0 no longer reproduces the pre-palette look for "
+        f"{name!r} — the rollback path has drifted.")
 
 
 # ── lifecycle ───────────────────────────────────────────────────

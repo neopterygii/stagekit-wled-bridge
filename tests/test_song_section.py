@@ -46,8 +46,12 @@ def _render(section, zones=(0xFF, 0, 0, 0), **effects):
     m = LEDMapper(MAPPED_REGION)
     if section is not None:
         effects["section"] = section
+    # palette_strictness=0.0 keeps these tests about the bias *maths*: the
+    # section hue goes through unremapped, so the convexity assertions below
+    # stay exact. That the same hue lands in the palette's family when
+    # strictness is on is tests/test_palette_strictness.py's job.
     return m.render(list(zones), zone_colors=_COLORS,
-                    effects=effects, brightness=1.0)
+                    effects=effects, brightness=1.0, palette_strictness=0.0)
 
 
 # ── Parsing + enum ───────────────────────────────────────────────

@@ -475,6 +475,13 @@ STATUS_HTML = """\
     <input type="range" id="section-intensity-slider" min="0" max="100" value="100" step="1"
            style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
   </div>
+  <div class="card" id="palette-strictness-card"
+       title="How tightly the vocal ribbon, biases, cue gradients and star-power tint follow the selected palette. 0% restores their original fixed colours.">
+    <div class="label">Palette Strictness</div>
+    <div class="value" id="palette-strictness-pct">100%</div>
+    <input type="range" id="palette-strictness-slider" min="0" max="100" value="100" step="1"
+           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
+  </div>
 </div>
 
 <h3 style="margin-bottom:0.5rem">Live Strip</h3>
@@ -688,6 +695,8 @@ const venueIntensity = wireIntensitySlider(
   'venue-intensity-slider', 'venue-intensity-pct', 'venue_intensity');
 const sectionIntensity = wireIntensitySlider(
   'section-intensity-slider', 'section-intensity-pct', 'section_intensity');
+const paletteStrictness = wireIntensitySlider(
+  'palette-strictness-slider', 'palette-strictness-pct', 'palette_strictness');
 
 // Palette select
 const paletteSelect = document.getElementById('palette-select');
@@ -775,7 +784,8 @@ function updateSettings(s) {
   }
   // Sync the intensity sliders from server values (skip while dragging).
   for (const [knob, key] of [[venueIntensity, 'venue_intensity'],
-                             [sectionIntensity, 'section_intensity']]) {
+                             [sectionIntensity, 'section_intensity'],
+                             [paletteStrictness, 'palette_strictness']]) {
     if (typeof s[key] === 'number' && !knob.isDragging()) {
       const pct = Math.round(s[key] * 100);
       if (parseInt(knob.slider.value) !== pct) knob.slider.value = pct;
@@ -1327,6 +1337,14 @@ class StatusServer:
                     changed.append(f"section_intensity={self.settings.section_intensity:.2f}")
             except (ValueError, TypeError):
                 return 400, "Invalid section_intensity value"
+        if "palette_strictness" in body:
+            try:
+                old_ps = self.settings.palette_strictness
+                self.settings.palette_strictness = float(body["palette_strictness"])
+                if self.settings.palette_strictness != old_ps:
+                    changed.append(f"palette_strictness={self.settings.palette_strictness:.2f}")
+            except (ValueError, TypeError):
+                return 400, "Invalid palette_strictness value"
         if "effects" in body:
             updates = body["effects"]
             if not isinstance(updates, dict):
