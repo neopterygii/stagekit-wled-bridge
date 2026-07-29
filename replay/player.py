@@ -230,7 +230,8 @@ class ReplayBridge:
     def __init__(self, fps: int = 40, sink: FrameSink | None = None,
                  start_time: float = DEFAULT_EPOCH, wled_on: bool = True,
                  brightness: int = 255, palette: str = "default",
-                 palette_strictness: float = 1.0, seed: int = 0):
+                 palette_strictness: float = 1.0, seed: int = 0,
+                 cue_fade_ms: int = 120, cue_fade_overrides: dict | None = None):
         self._now = float(start_time)
         clock = self._clock
 
@@ -245,13 +246,20 @@ class ReplayBridge:
         # Pin the operator-tunable knobs so a replay depends only on the
         # capture, not on the environment or a saved settings file.
         self.settings = BridgeSettings(path=_NO_SETTINGS_FILE,
-                                       warn_unwritable=False)
+                                       warn_unwritable=False,
+                                       cue_fade_overrides=cue_fade_overrides)
         self.settings.brightness = brightness
         self.settings.palette_name = palette
         # Pinned like the palette itself: the reactivity layers are constrained
         # to the palette's family, so a capture recorded under one strictness
         # would not reproduce under another.
         self.settings.palette_strictness = palette_strictness
+        # Same reasoning for the cue cross-fade: it blends every cue change over
+        # a wall-clock window, so a capture replayed under a different fade
+        # renders different light. `cue_fade_overrides=None` means the
+        # production per-cue table; `{}` plus cue_fade_ms=250 is the documented
+        # rollback to the pre-2026-07-29 look.
+        self.settings.cue_fade_ms = cue_fade_ms
         self.settings.fps = fps
         self.fps = fps
 

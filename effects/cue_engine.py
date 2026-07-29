@@ -525,6 +525,10 @@ class CueEngine:
         fx["bonus_t"] = self._bonus_remaining(now)
         fx["paused"] = self.paused
         fx["cue_change_at"] = self._cue_change_at
+        # The render thread picks the cross-fade duration from the *incoming*
+        # cue (settings.fade_seconds_for_cue), so it needs the byte, not just
+        # the timestamp.
+        fx["cue"] = self._current_cue
         fx["sp_active"] = self._sp_active
         fx["sp_amount"] = self._sp_amount
         fx["sp_charge"] = self._sp_charge

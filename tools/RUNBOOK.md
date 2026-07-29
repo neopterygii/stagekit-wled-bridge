@@ -51,6 +51,8 @@ Answers "is it the bridge, the network, or the device". Healthy values measured
 
 ```bash
 # Whole path, via the bridge. Injects cues, so NOT during a real YARG session.
+# The 145-164 ms reading predates the cue-fade change; expect ~55-80 ms once
+# that is deployed, and note the number now depends on which cue is injected.
 .venv/bin/python -m tools.wled_lag step --cycles 12                 # [145-164 ms]
 
 # Bridge removed. Stop the bridge's DDP output first, or both fight for the
@@ -60,8 +62,15 @@ curl -s -X POST http://192.168.0.230:36180/api/power -d '{"action":"off"}'
 curl -s -X POST http://192.168.0.230:36180/api/power -d '{"action":"on"}'
 ```
 
-The gap between those two is the bridge's own contribution — ~120 ms of it is
-the 250 ms cue crossfade at `main.py:416`.
+The gap between those two is the bridge's own contribution — ~120 ms of it was
+the cue crossfade, which was a flat 250 ms until 2026-07-29.
+
+**That is now `settings.cue_fade_ms` (default 120 ms) with per-cue overrides in
+`settings.CUE_FADE_MS_OVERRIDES`**, so this measurement depends on which cue
+`wled_lag step` injects: the cues YARG names "fast" (`BLACKOUT_FAST`,
+`FLARE_FAST`, `FRENZY`, `STROBE_*`) now snap with no fade at all, and
+`BLACKOUT_SLOW`/`FLARE_SLOW` still take 250 ms. Compare like against like when
+reading a before/after, and record which cue was used.
 
 ## Reproducing the original failure
 
@@ -100,7 +109,7 @@ asking "does it look bad to you".
 | | Healthy |
 |---|---|
 | lag, via bridge, song playing | −40 to −60 ms, corr > 0.9 |
-| step latency, via bridge | 145–164 ms median |
+| step latency, via bridge | 145–164 ms median at the old flat 250 ms crossfade; expect ~55–80 ms on a base-fade cue once `cue_fade_ms=120` is deployed, and ~25–35 ms on a snapping cue |
 | step latency, direct DDP | ~23 ms median |
 | frame match | mean per-channel diff ~0.1, worst ~1 |
 | device RSSI | −34 fresh; drifts ~−1.4 dB/h, benign to at least −40 |

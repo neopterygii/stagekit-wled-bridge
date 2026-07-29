@@ -307,6 +307,29 @@ def spotlight_cues():
     return b.build()
 
 
+def rapid_cue_changes():
+    """Cue changes faster than the cross-fade can finish.
+
+    Each new fade starts from the last *sent* frame, which during a fade is
+    itself a blend — so a stream that changes cue faster than the fade duration
+    could in principle never reach any cue's real colour, and would read as a
+    permanent smear rather than as clean transitions. That was an open question
+    in BACKLOG.md; `tests/test_cue_fade.py` answers it against this fixture.
+
+    Deliberately built from cues that use the *base* fade — the blackout/flare/
+    strobe cues snap, so they would prove nothing here. 80 ms per leg is well
+    inside the 120 ms default, and the trailing hold gives the last cue room to
+    settle so the test can tell "never converges" from "converges late".
+    """
+    b = StreamBuilder(bpm=140.0)
+    cues = (CueByte.WARM_AUTOMATIC, CueByte.COOL_AUTOMATIC,
+            CueByte.CHORUS, CueByte.VERSE)
+    for i in range(48):
+        b.play(0.08, cue=cues[i % len(cues)])
+    b.play(1.5, cue=CueByte.WARM_AUTOMATIC)
+    return b.build()
+
+
 def star_power_run():
     """A charge → overdrive → release cycle with per-player star power (v4)."""
     b = StreamBuilder(bpm=132.0)
@@ -337,6 +360,8 @@ FIXTURES = {
     "star_power_run": (star_power_run, "n/a", "charge → overdrive → release"),
     "spotlight_cues": (spotlight_cues, "n/a",
                        "multi-spot spotlights, beat chase wrapping"),
+    "rapid_cue_changes": (rapid_cue_changes, "n/a",
+                          "cues changing faster than the cross-fade"),
 }
 
 

@@ -10,10 +10,45 @@ import os
 import threading
 
 from config import GLOBAL_BRIGHTNESS, TARGET_FPS
+from protocol.yarg_packet import CueByte
 
 log = logging.getLogger(__name__)
 
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "/data/settings.json")
+
+# ── Cue cross-fade ─────────────────────────────────────────────────
+# How long the render thread blends a new cue against the last frame it sent.
+# The base duration is the operator's `cue_fade_ms` setting; these cues override
+# it, because YARG already tells us which transitions are meant to be abrupt —
+# BLACKOUT_FAST and BLACKOUT_SLOW are separate cue bytes, and fading both over
+# the same 250 ms (as the bridge did until 2026-07-29) throws that away.
+#
+# The fade is not decoration: it removes a one-frame black blink between cues.
+# But it was measured as the single largest latency term in the whole pipeline
+# — ~120 ms of the 145-164 ms cue-change step, against ~23 ms for the entire
+# network and device path. See BACKLOG.md.
+#
+# Every cue not listed here uses `cue_fade_ms`. That deliberately includes
+# STROBE_OFF (a *return* to a lit look, where softness is still wanted),
+# BIG_ROCK_ENDING, MENU and SCORE.
+#
+# Setting this to {} and cue_fade_ms to 250 restores the pre-2026-07-29
+# behaviour exactly; tests/test_replay.py pins that combination.
+CUE_FADE_MS_OVERRIDES = {
+    CueByte.BLACKOUT_FAST: 0,     # these cue bytes say "fast"
+    CueByte.FLARE_FAST: 0,
+    CueByte.FRENZY: 0,
+    CueByte.STROBE_FASTEST: 0,
+    CueByte.STROBE_FAST: 0,
+    CueByte.STROBE_MEDIUM: 0,
+    CueByte.STROBE_SLOW: 0,
+    CueByte.BLACKOUT_SLOW: 250,   # and these say "slow"
+    CueByte.FLARE_SLOW: 250,
+}
+
+# Clamp for the operator-set base duration. 1000 ms is far past anything
+# usable; it exists so a bad API call can't park the strip in a fade forever.
+CUE_FADE_MS_MAX = 1000
 
 # ── Color palettes ─────────────────────────────────────────────────
 # Each palette maps the 4 zone names to (R, G, B) tuples.
@@ -298,6 +333,10 @@ DEFAULT_SETTINGS = {
     # 1.0 constrains them all to the palette's family; 0.0 restores the fixed
     # tables exactly. Defaults on — following the palette is the point.
     "palette_strictness": 1.0,
+    # Base cue cross-fade in milliseconds, 0-CUE_FADE_MS_MAX. The cues in
+    # CUE_FADE_MS_OVERRIDES ignore this and use their own duration. 0 makes
+    # every non-overridden cue snap; 250 was the old hardcoded value.
+    "cue_fade_ms": 120,
     # Each toggle defaults on unless its registry row opts out with default:False.
     "effects": {tid: meta.get("default", True) for tid, meta in EFFECT_TOGGLES.items()},
 }
@@ -306,9 +345,17 @@ DEFAULT_SETTINGS = {
 class BridgeSettings:
     """Thread-safe persistent settings manager."""
 
-    def __init__(self, path: str = SETTINGS_FILE, warn_unwritable: bool = True):
+    def __init__(self, path: str = SETTINGS_FILE, warn_unwritable: bool = True,
+                 cue_fade_overrides: dict | None = None):
         self._path = path
         self._lock = threading.Lock()
+        # Per-cue fade durations. An instance copy rather than the module table
+        # so replay can pin it — passing {} plus cue_fade_ms=250 is the
+        # documented way back to the pre-2026-07-29 look, and
+        # tests/test_replay.py keeps that claim under test.
+        self._cue_fade_overrides = dict(
+            CUE_FADE_MS_OVERRIDES if cue_fade_overrides is None
+            else cue_fade_overrides)
         self._data = dict(DEFAULT_SETTINGS)
         # Deep-copy the nested effects dict so instances (and the module-level
         # DEFAULT_SETTINGS) don't share one mutable object.
@@ -358,6 +405,8 @@ class BridgeSettings:
             self._data["section_intensity"] = max(0.0, min(1.0, float(stored["section_intensity"])))
         if isinstance(stored.get("palette_strictness"), (int, float)):
             self._data["palette_strictness"] = max(0.0, min(1.0, float(stored["palette_strictness"])))
+        if isinstance(stored.get("cue_fade_ms"), (int, float)):
+            self._data["cue_fade_ms"] = max(0, min(CUE_FADE_MS_MAX, int(stored["cue_fade_ms"])))
         stored_effects = stored.get("effects")
         if isinstance(stored_effects, dict):
             for tid in EFFECT_TOGGLES:
@@ -468,6 +517,30 @@ class BridgeSettings:
             self._save()
 
     @property
+    def cue_fade_ms(self) -> int:
+        with self._lock:
+            return self._data["cue_fade_ms"]
+
+    @cue_fade_ms.setter
+    def cue_fade_ms(self, value: int):
+        value = max(0, min(CUE_FADE_MS_MAX, int(value)))
+        with self._lock:
+            self._data["cue_fade_ms"] = value
+            self._save()
+
+    def fade_seconds_for_cue(self, cue: int | None) -> float:
+        """Cross-fade duration in seconds for an incoming cue byte.
+
+        The render thread latches this once per cue change rather than reading
+        it every frame — see the note at `RenderThread.render_frame`.
+        """
+        ms = self._cue_fade_overrides.get(cue)
+        if ms is None:
+            with self._lock:
+                ms = self._data["cue_fade_ms"]
+        return ms / 1000.0
+
+    @property
     def direction(self) -> str:
         with self._lock:
             return self._data["direction"]
@@ -550,6 +623,8 @@ class BridgeSettings:
                 "venue_intensity": self._data["venue_intensity"],
                 "section_intensity": self._data["section_intensity"],
                 "palette_strictness": self._data["palette_strictness"],
+                "cue_fade_ms": self._data["cue_fade_ms"],
+                "cue_fade_ms_max": CUE_FADE_MS_MAX,
                 "effects": dict(self._data["effects"]),
                 "effect_toggles": {
                     tid: {"label": m["label"], "description": m["description"]}

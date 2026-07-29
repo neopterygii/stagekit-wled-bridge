@@ -483,6 +483,13 @@ STATUS_HTML = """\
     <input type="range" id="palette-strictness-slider" min="0" max="100" value="100" step="1"
            style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
   </div>
+  <div class="card" id="cue-fade-card"
+       title="How long a cue change is blended against the previous frame. This is the largest latency term in the pipeline — 250 ms was the old value and cost ~120 ms per cue change. Cues YARG names 'fast' (blackout/flare/strobe/frenzy) always snap, and the 'slow' ones always take 250 ms, whatever this is set to.">
+    <div class="label">Cue Fade</div>
+    <div class="value" id="cue-fade-ms">120 ms</div>
+    <input type="range" id="cue-fade-slider" min="0" max="250" value="120" step="5"
+           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
+  </div>
 </div>
 
 <h3 style="margin-bottom:0.5rem">Live Strip</h3>
@@ -667,21 +674,23 @@ blurSlider.addEventListener('change', () => {
   sendBlur(parseInt(blurSlider.value));
 });
 
-// Intensity sliders (venue sparkle, section bias) — same 0-100% → 0.0-1.0
-// debounced POST as blur. Each returns its dragging-flag getter so the live
-// update() poll can skip syncing the slider back while the user drags it.
-function wireIntensitySlider(sliderId, pctId, settingsKey) {
+// Intensity sliders (venue sparkle, section bias) — same debounced POST as
+// blur. `scale` divides the slider position to get the value sent: 100 for the
+// 0-100% → 0.0-1.0 knobs, 1 for one sent in its own raw units (cue fade, in
+// ms). Each returns its dragging-flag getter so the live update() poll can skip
+// syncing the slider back while the user drags it.
+function wireIntensitySlider(sliderId, pctId, settingsKey, scale = 100, unit = '%') {
   const slider = document.getElementById(sliderId);
   const pctEl = document.getElementById(pctId);
   let sendTimer = null;
   let dragging = false;
   const send = (pct) => fetch('/api/settings',
     { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [settingsKey]: pct / 100 }) });
+      body: JSON.stringify({ [settingsKey]: pct / scale }) });
   slider.addEventListener('input', () => {
     dragging = true;
     const pct = parseInt(slider.value);
-    pctEl.textContent = pct + '%';
+    pctEl.textContent = pct + unit;
     clearTimeout(sendTimer);
     sendTimer = setTimeout(() => send(pct), 80);
   });
@@ -690,7 +699,7 @@ function wireIntensitySlider(sliderId, pctId, settingsKey) {
     clearTimeout(sendTimer);
     send(parseInt(slider.value));
   });
-  return { slider, pctEl, isDragging: () => dragging };
+  return { slider, pctEl, isDragging: () => dragging, scale, unit };
 }
 const venueIntensity = wireIntensitySlider(
   'venue-intensity-slider', 'venue-intensity-pct', 'venue_intensity');
@@ -698,6 +707,8 @@ const sectionIntensity = wireIntensitySlider(
   'section-intensity-slider', 'section-intensity-pct', 'section_intensity');
 const paletteStrictness = wireIntensitySlider(
   'palette-strictness-slider', 'palette-strictness-pct', 'palette_strictness');
+const cueFade = wireIntensitySlider(
+  'cue-fade-slider', 'cue-fade-ms', 'cue_fade_ms', 1, ' ms');
 
 // Palette select
 const paletteSelect = document.getElementById('palette-select');
@@ -786,11 +797,12 @@ function updateSettings(s) {
   // Sync the intensity sliders from server values (skip while dragging).
   for (const [knob, key] of [[venueIntensity, 'venue_intensity'],
                              [sectionIntensity, 'section_intensity'],
-                             [paletteStrictness, 'palette_strictness']]) {
+                             [paletteStrictness, 'palette_strictness'],
+                             [cueFade, 'cue_fade_ms']]) {
     if (typeof s[key] === 'number' && !knob.isDragging()) {
-      const pct = Math.round(s[key] * 100);
+      const pct = Math.round(s[key] * knob.scale);
       if (parseInt(knob.slider.value) !== pct) knob.slider.value = pct;
-      knob.pctEl.textContent = pct + '%';
+      knob.pctEl.textContent = pct + knob.unit;
     }
   }
   // Populate palette dropdown once
@@ -1346,6 +1358,14 @@ class StatusServer:
                     changed.append(f"palette_strictness={self.settings.palette_strictness:.2f}")
             except (ValueError, TypeError):
                 return 400, "Invalid palette_strictness value"
+        if "cue_fade_ms" in body:
+            try:
+                old_cf = self.settings.cue_fade_ms
+                self.settings.cue_fade_ms = int(body["cue_fade_ms"])
+                if self.settings.cue_fade_ms != old_cf:
+                    changed.append(f"cue_fade_ms={self.settings.cue_fade_ms}")
+            except (ValueError, TypeError):
+                return 400, "Invalid cue_fade_ms value"
         if "effects" in body:
             updates = body["effects"]
             if not isinstance(updates, dict):

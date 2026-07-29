@@ -408,14 +408,21 @@ class RenderThread(threading.Thread):
 
         # Cue cross-fade state. When the engine signals a cue change, we
         # snapshot the previously sent frame into _fade_from and linearly
-        # blend new frames against it for FADE_DURATION seconds. Removes
-        # the one-frame all-black blink between cues.
+        # blend new frames against it for the incoming cue's fade duration.
+        # Removes the one-frame all-black blink between cues.
+        #
+        # The duration comes from settings.fade_seconds_for_cue() — the
+        # operator's `cue_fade_ms` base, overridden per cue for the ones YARG
+        # names "fast" or "slow" (settings.CUE_FADE_MS_OVERRIDES). It is
+        # *latched* here at cue-change time rather than read every frame, so
+        # dragging the dashboard slider mid-fade can't rescale a running fade
+        # and make it jump.
         self._fade_from = bytearray(LED_COUNT * 3)
         self._fade_buf = bytearray(LED_COUNT * 3)
         self._last_sent = bytearray(LED_COUNT * 3)
         self._fade_until = 0.0
+        self._fade_duration = 0.0
         self._last_cue_change_at = 0.0
-        self._FADE_DURATION = 0.25  # seconds
 
         # Live dashboard preview (VISION Phase 7). Captured only while someone
         # is watching (tracker.has_subscribers) and throttled to ~11 Hz — the
@@ -580,18 +587,23 @@ class RenderThread(threading.Thread):
         if not self._engine.get_strobe_visible(now):
             pixel_data = self._black
 
-        # Cue cross-fade: snapshot the last sent frame on cue change,
-        # then blend incoming frames against it for FADE_DURATION.
+        # Cue cross-fade: snapshot the last sent frame on cue change, then
+        # blend incoming frames against it for that cue's fade duration.
         # Skipped when strobe is suppressing the frame to black, so
         # we don't fade *through* the strobe blackout.
         cue_change_at = effects.get("cue_change_at") or 0.0
         if cue_change_at > self._last_cue_change_at:
+            duration = self._settings.fade_seconds_for_cue(effects.get("cue"))
             self._fade_from[:] = self._last_sent
-            self._fade_until = cue_change_at + self._FADE_DURATION
+            self._fade_duration = duration
+            # A zero-duration cue leaves _fade_until at 0.0, so the guard below
+            # is false and the blend is skipped entirely — the cue snaps, and
+            # there is no division by zero to guard against.
+            self._fade_until = (cue_change_at + duration) if duration > 0.0 else 0.0
             self._last_cue_change_at = cue_change_at
 
         if pixel_data is not self._black and now < self._fade_until:
-            t = 1.0 - (self._fade_until - now) / self._FADE_DURATION
+            t = 1.0 - (self._fade_until - now) / self._fade_duration
             if t < 0.0:
                 t = 0.0
             inv_t = 1.0 - t

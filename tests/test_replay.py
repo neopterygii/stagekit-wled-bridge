@@ -144,21 +144,26 @@ def test_strobe_frames_are_reproducible():
 # update. `python -m pytest tests/test_replay.py -k golden -v` prints the new
 # values on failure.
 
-# Three of these moved when palette strictness landed and shipped on by default
-# (auto_generated_venue, song_lifecycle, star_power_run — the fixtures that
-# actually drive a remapped layer). The other six were unchanged, which is the
-# expected signal: a plain zone wash paints from the palette already.
-# PRE_STRICTNESS_DIGESTS below keeps the old values under test.
+# Seven of these moved when the cue cross-fade went from a flat 250 ms to a
+# 120 ms base with per-cue overrides (2026-07-29). The three that did not —
+# authored_venue, dropped_beats, warm_beats — are the fixtures that never change
+# cue mid-stream, which is the expected signal. PRE_FADE_DIGESTS below is the
+# table as it stood before that change, and it is what the rollback reproduces.
+#
+# Three had previously moved when palette strictness landed and shipped on by
+# default (auto_generated_venue, song_lifecycle, star_power_run — the fixtures
+# that actually drive a remapped layer).
 GOLDEN_DIGESTS = {
     "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
-    "auto_generated_venue": "b7ad4ec42b45a9453a606ba0e9c49561e339575d997e28e4448b5eeb71b0c522",
+    "auto_generated_venue": "538576dbc5c32bba140a440867f299c2150ae2fa3a6dacd8e8725fef1b264687",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
-    "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
-    "song_lifecycle": "0aa0b0ba616d0c2d9f6cb40c99bf5ff2e9bad6b537860bd0b210e76e2bca75fe",
-    "spotlight_cues": "49e171cfc867beba338f3b474da4113a647a477f3273a9842f9bf07433baaaa9",
-    "star_power_run": "1410de93e6d6851cb352aa4203c9e6a662e3dc72c38084d29972de777ee4da59",
-    "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
+    "malformed_stream": "f34b2836915ed0b2ead764626aa861d44d3860269fea93a55301e59756ca3c3e",
+    "rapid_cue_changes": "d7fd746fce81cffbc0287d7f07e45046cc454c3aeab6191aa3832a8eee63d300",
+    "repeated_beats": "fe551d135dccdf5a8450f85923020b6a33f7b25f19fe0872b44d30387482b86f",
+    "song_lifecycle": "2bdebd56a2d10f43bb4287f9762acd99a0f9770079cdaf89e033f2a7577da3c8",
+    "spotlight_cues": "a19d66440e7e1e8f96f5f0abfb2ef77fc51c7e779e6d2661adea35cdd9cf0fb4",
+    "star_power_run": "ce056eedb3c03ea341af7e792cd43986889e0fcec42b38d37cc7da9b75251eb5",
+    "strobe_and_blackout": "7ba49eaad60c6c9c72340969693d8a36f3a1954c88d90d19ee97091f53963ee3",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
 
@@ -174,20 +179,60 @@ def test_golden_frame_digest(name):
     )
 
 
+# Digests as they stood before the cue cross-fade change of 2026-07-29 — which
+# is to say, the previous contents of GOLDEN_DIGESTS above, unedited. The
+# documented rollback is `cue_fade_ms = 250` plus an empty override table, and
+# this asserts that combination still renders the old light exactly rather than
+# approximately.
+PRE_FADE_DIGESTS = {
+    "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
+    "auto_generated_venue": "b7ad4ec42b45a9453a606ba0e9c49561e339575d997e28e4448b5eeb71b0c522",
+    "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
+    "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
+    # No history — this fixture arrived with the fade change. It is what the
+    # rollback renders today, kept for coverage, not as a pre-change capture.
+    "rapid_cue_changes": "7ff4e04a57aaedf416c99f2c15ec4554087e5b80b8d102a4450b981d23e06e9c",
+    "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
+    "song_lifecycle": "0aa0b0ba616d0c2d9f6cb40c99bf5ff2e9bad6b537860bd0b210e76e2bca75fe",
+    "spotlight_cues": "49e171cfc867beba338f3b474da4113a647a477f3273a9842f9bf07433baaaa9",
+    "star_power_run": "1410de93e6d6851cb352aa4203c9e6a662e3dc72c38084d29972de777ee4da59",
+    "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
+    "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
+}
+
+# The pre-fade look is the whole strip, not one knob, so pin every knob at its
+# historical value.
+_PRE_FADE = dict(cue_fade_ms=250, cue_fade_overrides={})
+
+
+@pytest.mark.parametrize("name", sorted(PRE_FADE_DIGESTS))
+def test_pre_fade_settings_reproduce_the_old_look(name):
+    result = _replay(name, bridge=ReplayBridge(fps=40, **_PRE_FADE))
+    assert result.sampled_digest() == PRE_FADE_DIGESTS[name], (
+        f"cue_fade_ms=250 with no per-cue overrides no longer reproduces the "
+        f"pre-2026-07-29 look for {name!r} — the rollback path has drifted.")
+
+
 # Digests as they stood before palette strictness. Strictness 0.0 is the
 # operator's documented way back to the pre-palette look, so "bit-exact" is a
 # claim the suite should be able to keep making rather than one taken on trust
 # the day it was written.
 #
-# spotlight_cues is the exception: it was added with the multi-spot spotlights,
-# after strictness shipped, so its value here is not a pre-change capture — it
-# is what strictness 0.0 renders today. It still earns its place, because the
-# rollback path has to keep lighting these cues, but do not read it as history.
+# These are replayed with the *fade* knobs rolled back too (`_PRE_FADE`): the
+# pre-palette look is a historical claim, and reproducing it means putting every
+# knob back where it was, not just the palette one.
+#
+# spotlight_cues and rapid_cue_changes are the exceptions: both were added after
+# strictness shipped, so their values here are not pre-change captures — they
+# are what strictness 0.0 renders today. They still earn their place, because
+# the rollback path has to keep lighting these cues, but do not read them as
+# history.
 PRE_STRICTNESS_DIGESTS = {
     "authored_venue": "a2f88178909b177c6d3d05c4b14c4933d7f8636e3b0ae8befeeac5f9a480c154",
     "auto_generated_venue": "39ddaabb8e6cf7fcc93b69dbcfd44fa44850b1982e376d1f2b47ad82650d7aa6",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
+    "rapid_cue_changes": "6d758dd4c98cca4d2eaf5454eb3f5f536562dd4e36c75064b3ab150f196a49ae",
     "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
     "song_lifecycle": "333d3654a248709bc8386d8b99aff493d93107123c8a433d3e242a90903e0365",
     "spotlight_cues": "c7df29b2439f4e8f19016d5753275d96b506720aa5ad3872b7f810caf810493a",
@@ -199,7 +244,8 @@ PRE_STRICTNESS_DIGESTS = {
 
 @pytest.mark.parametrize("name", sorted(PRE_STRICTNESS_DIGESTS))
 def test_zero_strictness_reproduces_the_pre_palette_look(name):
-    result = _replay(name, bridge=ReplayBridge(fps=40, palette_strictness=0.0))
+    result = _replay(name, bridge=ReplayBridge(fps=40, palette_strictness=0.0,
+                                               **_PRE_FADE))
     assert result.sampled_digest() == PRE_STRICTNESS_DIGESTS[name], (
         f"palette_strictness=0.0 no longer reproduces the pre-palette look for "
         f"{name!r} — the rollback path has drifted.")

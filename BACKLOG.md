@@ -27,10 +27,20 @@ reliability workstreams. In order:
    and merged to `main` 2026-07-29**; see
    [the write-up](#done-2026-07-28--newer-reactivity-layers-ignore-the-selected-palette).
 
+Also **built 2026-07-29**, off the back of the latency work rather than the
+original three: the [cue crossfade](#done-2026-07-29--cue-changes-are-crossfaded-over-250-ms-and-that-is-the-visible-lag)
+is now an operator setting with per-cue overrides — it was the largest latency
+term in the pipeline and the one no hardware change touches.
+
 Then back to the reliability push: W3 alignment trim, W4 read-only state/MQTT,
 W5 firmware qualification. Note item 1 above is an argument *for* W5 but also a
 reason to gather evidence before it, since a firmware upgrade could mask the
 cause rather than fix it.
+
+**Three default-on look changes are now queued behind one template flip** —
+palette strictness (merged, already looked at), multi-spot spotlights, and the
+cue fade. All three are dashboard-adjustable, so they can be judged and A/B'd in
+a single session rather than needing three deploys.
 
 Blocking neither: the replay harness is **merged to `main` (2026-07-29)**, so
 items 1 and 2 can both lean on it — a recorded passage replayed before/after
@@ -585,7 +595,7 @@ airtime, so a flat RSSI correlation does not clear WiFi.
 
 ---
 
-## OPEN — Cue changes are crossfaded over 250 ms, and that is the visible "lag"
+## DONE 2026-07-29 — Cue changes are crossfaded over 250 ms, and that is the visible "lag"
 
 **Found:** 2026-07-28, measuring step latency end to end after the operator
 described the symptom precisely: *"changing patterns where I could see the
@@ -635,6 +645,83 @@ question for a capture of an actual dense song, not for synthetic patterns.
 **Classification for the hardware decision: this is bridge/code class.** An
 ethernet QuinLED will not change it by one millisecond. See the classification
 item below.
+
+### What was built
+
+Options 1, 2 and 3 together; option 4 was **measured and deliberately not
+acted on** — see below.
+
+- `settings.cue_fade_ms`, default **120**, 0–1000, with a dashboard slider,
+  `POST /api/settings`, persistence, and a pin in `replay/player.py`.
+- `settings.CUE_FADE_MS_OVERRIDES` gives per-cue durations, because **YARG
+  already tells us which transitions are meant to be abrupt** and the bridge
+  was throwing that away: `BLACKOUT_FAST` and `BLACKOUT_SLOW` are separate cue
+  bytes and both were fading over the same 250 ms. `BLACKOUT_FAST`,
+  `FLARE_FAST`, `FRENZY` and the four `STROBE_*` cues snap (0 ms);
+  `BLACKOUT_SLOW` and `FLARE_SLOW` hold 250 ms whatever the base is; everything
+  else uses the base. `STROBE_OFF` deliberately stays on the base — it is a
+  *return* to a lit look, where softness is still wanted.
+- The duration is **latched at cue-change time** rather than read per frame, so
+  dragging the slider mid-fade cannot rescale a fade in flight and make it
+  jump. A zero duration leaves `_fade_until` at 0.0 so the blend is skipped
+  entirely rather than run at zero length — there is no division to guard.
+- `CueEngine.get_effects()` now publishes `fx["cue"]` alongside
+  `cue_change_at`; the render thread needs the incoming byte, not just the
+  timestamp. That is the whole engine-side change.
+
+**Cost: none measurable.** 0.628 → 0.626 ms/frame across the
+`rapid_cue_changes` fixture, which is a worst case (the strip is fading
+essentially all the time). Fewer faded frames means fewer runs of the per-byte
+blend loop, but the saving is inside the noise; do not claim it as a win.
+
+### The compounding question (option 4) — measured, real, and left alone
+
+Each new fade starts from `_last_sent`, which during a fade is itself a blend,
+so a stream changing cue faster than the fade could in principle never reach
+any cue's real colour. That was written up here as "the part worth checking
+next". It is now measured, against a new `rapid_cue_changes` replay fixture
+(80 ms dwell per cue, built from base-fade cues, since the snapping ones would
+prove nothing), compared frame-by-frame against the same stream replayed with
+the fade disabled:
+
+| base fade | mean per-channel deviation from the un-faded target | frames landing exactly on a cue's colour (of 90) |
+|---|---|---|
+| 250 ms (old) | 66.4 | **0** |
+| 120 ms (new default) | 55.7 | **0** |
+| 40 ms | 25.3 | 43 |
+
+So the compounding is **real**: at an 80 ms dwell the strip never once shows
+any cue's actual colour at either 250 ms or the new 120 ms. Shortening the fade
+reduces the smear by ~16% but does not remove it. When the changes stop the
+strip lands exactly on target, so it recovers rather than drifting permanently.
+
+**What this does not establish is whether real songs change cue that fast.**
+The fixture is synthetic and was built to force the condition. Answering the
+exposure needs a capture of a genuinely dense song — which is exactly what this
+entry originally said, and it is still true, so the restart behaviour was not
+changed on synthetic evidence. `tests/test_cue_fade.py::
+test_fades_do_compound_when_the_dwell_is_shorter_than_the_fade` pins the
+limitation the same way the event-driven-cue test does: fixing it fails that
+test and prompts an update, rather than passing silently.
+
+**Verification:** 553 tests green, up from 524 — 17 new in
+`tests/test_cue_fade.py` plus the new fixture across the digest tables. Seven
+of the ten pre-existing golden digests moved (the three that did not —
+`authored_venue`, `dropped_beats`, `warm_beats` — are the fixtures that never
+change cue mid-stream, which is the expected signal).
+`tests/test_replay.py::test_pre_fade_settings_reproduce_the_old_look` pins the
+rollback: at `cue_fade_ms=250` with an empty override table, all ten reproduce
+their previous digests **exactly**, so "bit-exact rollback" is under test rather
+than asserted.
+
+**Not yet judged on the rig** — measure with
+`tools/wled_lag.py step` before and after, and expect the via-bridge median to
+fall from 145–164 ms toward ~55–80 ms against an unchanged ~23 ms direct floor.
+
+**Rollback is two things, and the slider alone is not enough:** `cue_fade_ms`
+to 250 restores the base, but exact pre-change behaviour also needs
+`CUE_FADE_MS_OVERRIDES = {}` in `settings.py`, because the per-cue table is
+code-level. Same shape as the spotlight rollback.
 
 ---
 
