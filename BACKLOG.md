@@ -13,9 +13,12 @@ reliability workstreams. In order:
 1. **[WLED desync after hours of DDP](#open--wled-drifts-out-of-sync-after-hours-of-ddp-only-a-physical-power-cycle-clears-it)**
    — first, because it's the only one that breaks a show rather than merely
    looking wrong, and because the diagnosis is *evidence gathering*, not a code
-   change. Do not touch lighting code for it until "desync" is pinned down to
-   constant latency, progressive drift, or dropped frames. Start with a
-   long-running replay loop rather than another 4-hour game session.
+   change. **Half-solved and half-fixed on 2026-07-28:** the "only a power cycle
+   clears it" behaviour was a WLED realtime-timeout misconfiguration on the
+   controller (which also blocked OTA); the timeout is now 2500 ms and the exit
+   behaviour is verified. Remaining: whether there is *also* drift during an
+   active stream, which `tools/wled_soak.py` plus a sustained stream is there to
+   answer. That soak is now unblocked.
 2. **[Spotlight cues are too narrow](#open--spotlight-cues-light-too-narrow-a-slice-of-the-strip)**
    — a one-number change with an obvious answer, worth landing while the desync
    evidence accumulates.
@@ -217,6 +220,88 @@ the bridge.** A container-side power-off is a JSON API call; it doesn't reset th
 device. So this is very unlikely to be a cue-engine or render-thread bug, and
 correspondingly unlikely to be fixed by anything in this repo.
 
+### Root cause found for the stuck half — 2026-07-28
+
+**The controller is latched in realtime mode permanently.** Full write-up with
+the source chain and the live readings:
+`~/yarg-lighting/evidence/wled-realtime-latch-2026-07-28.md`.
+
+`if.live.timeout` on `192.168.0.53` is **650**, which `cfg.cpp` scales to
+`realtimeTimeoutMs = 65000` — and 65000 is precisely the sentinel value
+`realtimeLock()` maps to `realtimeTimeout = UINT32_MAX`, i.e. *never time out*.
+The WLED settings page presents the field as a plain `max="65000"` number input
+with no hint that the top of its own range means "never", so this is a very easy
+setting to land on by accident while trying to stop the strip dropping out of
+realtime mid-song.
+
+Because `wled.cpp:96` gates the main loop on not being in realtime, a latched
+device permanently skips `strip.service()` — so no state change reaches the
+pixels (that's why `{"on": false}` did nothing), the strip holds its last DDP
+frame indefinitely, and **`ArduinoOTA.handle()` never runs, so OTA is blocked**.
+That last one was not previously known and directly affects W5 below: the
+controller cannot be OTA-upgraded while latched, and it latches on the first DDP
+frame after every boot.
+
+Confirmed live on 2026-07-28: twelve hours after the bridge's last
+`WLED: powered OFF (idle)`, with `ddp_frames_sent` static across repeated
+samples, the device still reported `"live": true, "lm": "DDP"` while
+`"on": false`.
+
+**Fix (device config, not code): `DONE` 2026-07-28.** Timeout set to `2500`
+(`if.live.timeout: 25`) and the controller rebooted — a config change alone does
+not clear an already-latched `realtimeTimeout`, because `realtimeLock()` only
+recomputes it when it is not already `UINT32_MAX`. Reversible by setting `65000`
+back.
+
+Verified by driving all-black DDP for 3 s and watching the device: `live` went
+`false → true (lm DDP, 58 fps) → false` ~3 s after the stream stopped, with
+strip FPS returning to 38. `strip.service()` runs again, so state changes reach
+the pixels and OTA is reachable between streams.
+
+A pre-change backup is at `~/wled-backups/192.168.0.53/2026-07-28/`. Note it is
+**not a complete restore image**: WLED never serves `wsec.json` over HTTP, so
+the WiFi/OTA passwords are absent (only their lengths are recorded). See W5
+below.
+
+**Still open:** progressive drift *during* an active stream. The evidence rules
+out the "growing UDP backlog" hypothesis — DDP lands on an AsyncUDP callback
+that overwrites the realtime pixel buffer rather than queueing — but heap
+fragmentation and WiFi power-save are untested. That needs the soak run, which
+is only meaningful once the latch is fixed, because until then the device never
+returns to a known state between tests.
+
+**Instrumentation is built.** Two tools, because the proxies and the actual
+symptom are different measurements:
+
+`tools/wled_soak.py` samples `/json/info` (heap, uptime, RSSI, live/lm, device
+FPS, HTTP reply time) and the bridge's `/api/status` (render gaps, DDP send
+timing, stalls, counters) onto one timeline. Its `analyse` subcommand reports
+trends, flags counter resets that void deltas, and detects the realtime latch.
+
+`tools/wled_lag.py` measures the symptom itself — how far the strip is behind
+the bridge. It works because the two ends are directly comparable on this rig:
+the bridge publishes what it just rendered at `/api/status` `preview.strip`
+(60 cells, a 2:1 downsample of the strip), WLED publishes what it is displaying
+at `/json/live` (120 hex triples out of the live buffer DDP writes into), and
+with `bri: 128` and `if.live["no-gc"]: true` the device is just a linear scale
+of the bridge. Each side is reduced to one scalar per sample (total frame
+brightness) and the lag is the shift that maximises cross-correlation;
+normalising each series cancels the brightness scale and the downsample.
+
+**Read only the deltas, not the absolute number.** The two endpoints are polled
+over HTTP with very different round trips (Tower is sub-millisecond, the ESP32
+is ~30 ms), and the probe attributes each reading to the midpoint of its own
+request, so there is an uncorrected systematic offset — the first baseline came
+back *negative* (`-60 ms`, correlation 0.66), which is physically impossible and
+is exactly that offset showing. Constant latency vs. progressive drift is
+answered by whether the number *moves* across a long soak, which is unaffected.
+
+```bash
+.venv/bin/python -m tools.wled_soak log --out soak.jsonl --interval 30 --duration 6h
+.venv/bin/python -m tools.wled_soak analyse soak.jsonl
+.venv/bin/python -m tools.wled_lag probe --seconds 45 --out lag-t0.json
+```
+
 What we know about the conditions:
 
 - Pausing does **not** stop the packet stream. YARG keeps sending ~90
@@ -227,11 +312,12 @@ What we know about the conditions:
 - Live baseline is WLED 0.14.4, APA102/type 51 on data GPIO 18 / clock GPIO 5 at
   5 MHz, 120 pixels (`evidence/wled-live-baseline-2026-07-27.md`).
 
-Candidate causes, in rough order of suspicion — **none confirmed**:
+Candidate causes, in rough order of suspicion — **none confirmed** when first
+written; see the root-cause section above for what has since been settled:
 
 1. ESP32-side accumulation over a long realtime session (heap fragmentation, a
    growing UDP backlog, or a WiFi power-save state) adding latency that never
-   drains.
+   drains. *(The UDP-backlog part of this is now ruled out.)*
 2. APA102 clock/data timing degrading at 5 MHz once the device has been warm and
    busy for hours.
 3. Something in WLED's realtime/DDP timeout handling that behaves differently
@@ -256,6 +342,45 @@ frames making motion stutter. Those have different causes. Cheapest evidence:
 Related: this is a strong argument *for* the firmware qualification item below —
 but note it also means a firmware upgrade could mask the cause rather than fix
 it. Capture the evidence first.
+
+---
+
+## OPEN — The bridge's cached WLED power state never resyncs after a device reboot
+
+**Found:** 2026-07-28, immediately after the realtime-latch fix, when the
+rebooted controller came up `on: true` and stayed lit with the bridge idle.
+
+`WLEDPower._wled_on` is only ever assigned in four places (`main.py`): the `False`
+initialiser, `_power_on()`, `_power_off()`, and the **one-shot** probe at the top
+of `_watchdog_run()`. The periodic reachability check discards its own answer:
+
+```python
+if check_counter >= 6:
+    check_counter = 0
+    if not self._wled_on:
+        await asyncio.to_thread(self._api.is_on)   # result thrown away
+    await asyncio.to_thread(self._api.fetch_wifi_info)
+
+if not self._wled_on:
+    continue
+```
+
+So if the device is powered on by anything other than the bridge — a reboot, the
+WLED UI, a button press — the bridge goes on believing it is off, skips the idle
+branch via that `continue`, and **never turns it off**. The strip stays lit
+indefinitely (measured ~1622 mA) until YARG next connects, which powers it on
+"again" and finally starts the idle timer.
+
+This was invisible before the latch fix, because a latched controller never
+rendered its own on-state: a reboot left the strip dark whatever WLED thought.
+Fixing the latch made the divergence visible rather than causing it.
+
+**The work:** assign the periodic `is_on()` result to `_wled_on`, so a device
+that came up on gets adopted and idled off normally. Guard against racing
+`_power_on_pending` / `_power_off_pending`, and note that adopting `True` should
+also seed `_last_activity` or the strip will be switched off within one watchdog
+tick of the bridge starting. Small, but it touches the code path the
+PID-exhaustion bug lived in, so it wants its own change and a look at the rig.
 
 ---
 
@@ -304,6 +429,170 @@ state" for the full description of each:
    pattern. Default 0 ms.
 4. `OPEN` — Expanded read-only game/bridge state, optionally over MQTT.
 5. `OPEN` — WLED 0.14.4 firmware upgrade qualification with backups, an exact
-   rollback image, and proven recovery.
+   rollback image, and proven recovery. **Blocked in practice until the realtime
+   latch above is fixed:** a latched controller never runs `ArduinoOTA.handle()`,
+   so it cannot be OTA-flashed at all, and it latches on the first DDP frame
+   after every boot.
+   Also revised on 2026-07-28: step 1 of the plan ("export `cfg.json`,
+   `presets.json`, …") is **not sufficient for restore**. WLED holds secrets in
+   `wsec.json`, which it never serves over HTTP, so an HTTP export comes back
+   with the WiFi and OTA passwords stripped — only their lengths survive. A
+   complete backup needs `wsec.json` off the flash over USB/serial, the same
+   physical access the plan already wants for recovery. The device has no
+   presets, so there is nothing to lose there.
 6. `DEFERRED` — Multi-WLED logical canvas and performer-region routing; blocked
    on having enough equivalent hardware to test geometry and partial failure.
+
+---
+
+## OPEN — Classify every rig finding by whether the wired QuinLED will fix it
+
+**Raised:** 2026-07-28 by the operator, who expects to move to a QuinLED quad
+with ethernet once it ships.
+
+Findings about the lighting rig fall into four classes, and conflating them
+leads to buying hardware that fixes nothing:
+
+1. **Transport** (WiFi RSSI, association, retries, airtime contention) — a
+   wired board fixes these outright.
+2. **This specific board** (Athom, APA102 at 5 MHz on GPIO 18/5, its power
+   design) — new hardware very likely fixes these, but check the replacement
+   actually supports **clocked** LEDs (data *and* clock) on the channel you
+   intend; digital LED boards differ on this and it is not safe to assume.
+3. **ESP32/WLED firmware architecture** (a single-threaded sketch where
+   `strip.service()` and the async web server contend) — a wired board does
+   **not** fix these. Same firmware, same loop.
+4. **WLED configuration** (e.g. the realtime-timeout latch above) — these
+   **follow you to the new board**. The realtime timeout must be set on the new
+   controller before streaming to it, or it will latch identically.
+
+The classification table lives in
+`~/yarg-lighting/evidence/wled-realtime-latch-2026-07-28.md`. Keep it current as
+findings land; it is the input to the buying decision, not a retrospective.
+
+**The measurement that decides class 1 vs class 3** is in `tools/wled_soak.py`:
+sample TCP connect time and HTTP reply time against the device together. TCP
+handshakes complete in lwIP/AsyncTCP, below the Arduino `loop()`; an HTTP
+response needs `loop()` to run. Both rising together means the network path is
+at fault (ethernet helps); HTTP rising while TCP stays flat means the main loop
+is blocking (ethernet does not help). `analyse` prints the verdict.
+
+Note RSSI alone cannot settle it — it reports link strength, not congestion or
+airtime, so a flat RSSI correlation does not clear WiFi.
+
+---
+
+## OPEN — Cue changes are crossfaded over 250 ms, and that is the visible "lag"
+
+**Found:** 2026-07-28, measuring step latency end to end after the operator
+described the symptom precisely: *"changing patterns where I could see the
+colour change lagging on the strip."*
+
+`main.py:416` sets `self._FADE_DURATION = 0.25`. On every cue change the render
+thread snapshots the last sent frame into `_fade_from` and linearly blends the
+incoming frames against it for a quarter of a second.
+
+**Measured, all with the same detection method so the overheads cancel:**
+
+| Path | Median | Range |
+|---|---|---|
+| Direct DDP, bridge bypassed | **22.8 ms** | 13.5–84.8 |
+| Via the bridge (cue-change step) | **145–164 ms** | 29–364 |
+| Downstream only (bridge's own frame → strip) | **31.7 ms** | — |
+
+The network and the device cost ~23–32 ms. The bridge adds ~120 ms, and the
+crossfade is where it goes. Confirmed by the fact that the added latency does
+**not** scale with tempo — 171 / 179 / 178 ms measured at 240 / 120 / 60 BPM. It
+is wall-clock, not beat-locked.
+
+**This is a design choice, not a defect** — the crossfade exists so cue changes
+don't snap harshly, and the code says so. But 250 ms is long enough to read as
+hesitation on cues that should land instantly (`BLACKOUT_FAST`, `FLARE_FAST`),
+and it is the single largest latency term in the whole pipeline by a factor of
+five.
+
+**The part worth checking next:** when cues change faster than 250 ms, each new
+fade restarts from `_last_sent`, which is itself mid-fade. Successive changes
+would then never reach their target colour and the strip would show a
+perpetually smeared blend — which would look exactly like "hitches and glitches"
+rather than clean transitions. Whether real songs change cues that fast is a
+question for a capture of an actual dense song, not for synthetic patterns.
+
+**Options:**
+
+1. Shorten `_FADE_DURATION` (e.g. 0.08–0.12 s) — one constant, immediately
+   testable by eye.
+2. Make it per-cue: instant for `BLACKOUT_*`/`FLARE_*`, longer for the
+   atmospheric cues where a soft change is the point.
+3. Make it an operator setting, defaulting to today's value so nothing changes
+   without a deliberate choice.
+4. Skip or shorten the fade when a new cue arrives while one is still running,
+   so dense passages don't compound.
+
+**Classification for the hardware decision: this is bridge/code class.** An
+ethernet QuinLED will not change it by one millisecond. See the classification
+item below.
+
+---
+
+## OPEN — Bridge keeps a stale lit cue after disconnect/power-off
+
+**Found:** 2026-07-28 by the operator, watching the dashboard during the latency
+work: *"the bridge is still on a cue, even though the device is off and the
+strip is dark."*
+
+Confirmed. With no YARG sender and WLED powered off through `/api/power`:
+
+```
+connected=False   cue=SCORE (id 31)   zones_raw=[136, 0, 0, 34]   preview sum=980
+```
+
+The render thread keeps producing a lit frame from the last cue; it is simply
+not sent. So the dashboard shows an active cue and a lit strip preview while the
+real strip is dark, and a later power-on resumes that stale frame instead of
+starting clean.
+
+`CueEngine.on_cue()` only reacts to a *change* of cue byte, and nothing resets
+cue/zone state on disconnect or power-off. Low severity — it misleads rather
+than breaks — but it directly contradicts what the operator sees in the room,
+which is the one thing the dashboard exists to avoid.
+
+**The work:** reset cue/zone state (and the preview) when the connection drops
+or WLED is powered off, or mark the status explicitly as "holding last cue, not
+sending" so the dashboard cannot be read as live output.
+
+---
+
+## OPEN — Desync: not reproduced since the realtime-timeout fix; testing is parked, not finished
+
+**Status 2026-07-28 (end of day):** two instrumented runs since the latch fix,
+neither reproduced the failure. Parked at the operator's request — the tooling
+stays ready and is called back up the next time the symptom appears.
+
+| Run | Condition | Result |
+|---|---|---|
+| 1 | 3.5 h continuous DDP, synthetic stimulus | step latency 145 ms → 164 ms. Flat. No reproduction. |
+| 2 | Real song, then **2h51m paused** with the stream still running (585,366 DDP frames) | lag −60/−40 ms before → **−50/−50 ms after**. Operator independently: "looks pretty good still". No reproduction. |
+
+Run 2 is the meaningful one: it is the operator's exact trigger, and their visual
+verdict and the instrument agreed **without either seeing the other first**.
+
+**Not settled.** The original failure took **4+ hours**; run 2's pause was
+2h51m. A longer pause is the remaining test and costs nothing but time.
+
+**Next time it appears — do not power cycle first.** The bad state is the
+evidence. `tools/RUNBOOK.md` has the capture sequence, the healthy reference
+values to compare against, and which probe to trust under which conditions.
+
+### Secondary finding: device RSSI degrades across a session
+
+Observed in both runs: −34 dBm fresh, drifting ~**−1.38 dB/hour**, restored by a
+power cycle. It is the only metric seen so far that accumulates over a session
+and clears only on power cycle — the same shape as the reported symptom.
+
+**But at the magnitude observed it is benign.** Across run 2's −34 → −39 dBm
+drift, heap, device FPS, TCP connect and HTTP reply were all flat, and neither
+the lag measurement nor the operator noticed anything. Worth continuing to watch;
+not worth acting on. It sits in the class a wired board would eliminate, but it
+is now well below the 250 ms cue crossfade in priority — that costs ~120 ms on
+every cue change and no hardware change will touch it.
