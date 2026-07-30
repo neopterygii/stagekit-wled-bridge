@@ -191,6 +191,55 @@ class WLEDPowerManager:
         self._dark_since = 0.0
         self._dark_warned = False
 
+    def _adopt_device_state(self, device_on: bool | None):
+        """Reconcile _wled_on with what the device actually reports.
+
+        The bridge is not the only thing that can power this strip — a reboot,
+        the WLED UI, a button press or a power blip all change the device
+        without telling us. Every probe result is therefore adopted, in *both*
+        directions; believing a stale value has a distinct failure mode either
+        way:
+
+          - believed OFF, device ON  → the idle timer never runs (the `continue`
+            below skips it), so the strip stays lit indefinitely at ~1.6 A;
+          - believed ON, device OFF  → on_activity() never queues a power-on, so
+            a song plays to a dark strip, and _check_dark_while_active() cannot
+            see it because it returns early while _wled_on is true.
+
+        Adopting ON grants the device a full idle timeout rather than switching
+        it off on the next tick, so turning the strip on deliberately from the
+        WLED UI is not stomped within 5 seconds.
+        """
+        # is_on() returns None when the request failed. Unreachable is not an
+        # answer about power — keep the last belief rather than inventing one.
+        if device_on is None:
+            return
+
+        # A queued command is newer than this answer. The probe blocks for up
+        # to 3 s on HTTP, and on_activity()/manual_power() can fire during that
+        # window, so adopting here would silently discard the operator's (or
+        # YARG's) intent. _process_pending_power() settles it on the next tick.
+        if self._power_on_pending or self._power_off_pending:
+            return
+
+        if device_on == self._wled_on:
+            return
+
+        if device_on:
+            # Seed the idle timer *only* on this transition. The probe repeats
+            # every 30 s; refreshing _last_activity on every adoption would
+            # push the deadline out forever and the strip would never idle off
+            # at all — a worse version of the bug being fixed here. Reaching
+            # this line means the belief actually changed, so it runs once per
+            # divergence, not once per probe.
+            self._last_activity = time.monotonic()
+            self._wled_on = True
+            log.info("WLED: adopted device state ON (powered on externally) — "
+                     "idle timer restarted")
+        else:
+            self._wled_on = False
+            log.info("WLED: adopted device state OFF (powered off externally)")
+
     def _check_dark_while_active(self):
         """Warn when YARG is feeding us but the strip is still dark.
 
@@ -294,9 +343,7 @@ class WLEDPowerManager:
 
     async def _watchdog_run(self):
         # Initial reachability check (non-blocking)
-        initial_state = await asyncio.to_thread(self._api.is_on)
-        if initial_state is not None:
-            self._wled_on = initial_state
+        self._adopt_device_state(await asyncio.to_thread(self._api.is_on))
         await asyncio.to_thread(self._api.fetch_wifi_info)
 
         # Do not make a live sender wait for the first watchdog sleep. Activity
@@ -314,7 +361,10 @@ class WLEDPowerManager:
                 wifi_counter += 1
                 if wifi_counter >= 6:
                     wifi_counter = 0
-                    await asyncio.to_thread(self._api.is_on)
+                    # No idle timeout here, so nothing powers the strip off —
+                    # but the render thread still gates all DDP on _wled_on, so
+                    # an accurate belief is what keeps output honest.
+                    self._adopt_device_state(await asyncio.to_thread(self._api.is_on))
                     await asyncio.to_thread(self._api.fetch_wifi_info)
             return
 
@@ -331,11 +381,14 @@ class WLEDPowerManager:
 
             check_counter += 1
 
-            # Reachability + WiFi check every ~30s (6 × 5s)
+            # Reachability + WiFi check every ~30s (6 × 5s). The probe is
+            # unconditional: gating it on `not self._wled_on` meant the
+            # believed-ON/device-OFF divergence was never even looked for. The
+            # extra request costs the same as the fetch_wifi_info below it,
+            # which has always run on this tick regardless of power state.
             if check_counter >= 6:
                 check_counter = 0
-                if not self._wled_on:
-                    await asyncio.to_thread(self._api.is_on)
+                self._adopt_device_state(await asyncio.to_thread(self._api.is_on))
                 await asyncio.to_thread(self._api.fetch_wifi_info)
 
             if not self._wled_on:
