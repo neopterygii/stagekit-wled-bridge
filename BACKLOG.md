@@ -611,6 +611,11 @@ mechanism behind the five cues this backlog records as un-replayable, and these
 cues must not join that set. `beat_clock` is 0.0 before the first beat, which
 parks the emphasis on spot 0 rather than blanking the cue.
 
+> **Superseded the same day.** The operator asked for the spots to **pulse to
+> the beat instead of chase**; see the entry below. The geometry above stands
+> unchanged — only the per-spot level does. `spotlight_chase` and
+> `SPOT_DIM_FLOOR` no longer exist.
+
 **Cost:** +0.030 ms/frame on `SILHOUETTES_SPOTLIGHT` (the new level-mask pass
 vs. the old `_mask_outside`). Both spotlight cues still render cheaper than a
 plain wash.
@@ -632,6 +637,175 @@ exercised either cue.
 
 **Rollback:** set `SPOTLIGHT_COUNT` to 1 and `SPOTLIGHT_WIDTH_WIDE` back to
 0.40; the default-1 path is the pre-change renderer exactly.
+
+---
+
+## DONE 2026-07-29 `feature` — Spotlights should pulse to the beat, not chase
+
+**Raised:** 2026-07-29 by the operator, on the multi-spot cues delivered earlier
+the same day (entry above): *"spotlights should pulse to the beat instead of
+chase."*
+
+The chase walked the emphasis spot→spot, one spot per beat. Two things were
+wrong with it, and both are reasons to prefer a pulse rather than to retune one:
+
+- it reads as the **lamps switching around** rather than as the stage responding
+  to the music — the movement is in space, where a real three-lamp rig's is not;
+- at three spots it imposes a **3-beat cycle** on 4/4 music, so the emphasis
+  landed on a different beat of the bar every bar and never agreed with the song.
+
+**What was built.** The per-spot level is now one shared beat envelope: full the
+instant a beat lands, easing back over the beat to a `1 - depth` trough.
+`spotlight_chase` (spots per beat) became `spotlight_pulse` (depth), and the
+`beat_clock` read became a `beat_phase` read.
+
+| | before | after |
+|---|---|---|
+| driver | `beat_clock` (free-running count) | `beat_phase` (0→1 across one beat) |
+| spot levels | one at 1.0, rest at 0.35 | all at `1 - 0.65·(1 - (1-phase)²)` |
+| period | 3 beats (one trip round the spots) | 1 beat |
+| geometry | unchanged | unchanged |
+
+The envelope is deliberately **the same squared decay as the global `beat_pulse`
+pump**, so where a cue has both they read as one gesture rather than two
+rhythms. `SPOTLIGHT_PULSE_DEPTH` is 0.65, leaving a 0.35 trough — exactly the
+level the un-emphasised spots of the chase sat at, so "2–3 spotlights, all
+visible at every instant" still holds at the dimmest point of the beat.
+
+**Two edge cases rest at full, not dark**, which is the part worth keeping:
+
+- **before the first beat** `beat_phase` is 0.0, which is the peak — the cue
+  lights fully, as it must for a song that never sends a beat;
+- **after the beats stop** `beat_phase` saturates at 1.0 and stays there, which
+  read alone would park a finished or disconnected song on a stage dimmed to the
+  trough. A new `CueEngine.beats_live()` (the `BEAT_LOCK_TIMEOUT` test that
+  `tick()` already used inline, promoted to a method and published as a
+  `beats_live` effect key) separates that from a single dropped beat packet,
+  which *does* rest at the trough — a beat's worth of no motion, which is what
+  `beat_phase`'s saturation is for.
+
+**Tests:** `tests/test_spotlight.py` reworked to 17. The chase tests became
+pulse tests: peak on the beat, monotonic decay across it (a pulse that
+brightened mid-beat would read as two hits), the trough's value, all spots in
+lockstep, and both rest-at-full edge cases. Levels are measured against the same
+cue rendered at its peak rather than a hardcoded colour, so the assertions read
+the envelope alone — `SILHOUETTES_SPOTLIGHT` also breathes.
+
+**Digest:** `spotlight_cues` moved, and **only** `spotlight_cues` — it is the
+only fixture using either cue, which is the confirmation the change is contained.
+
+**Rollback:** set `SPOTLIGHT_PULSE_DEPTH` to 0.0. The spots then hold at full
+and the cues are static geometry; the chase itself is gone, so restoring *it*
+means reverting the commit.
+
+---
+
+## DONE 2026-07-29 `bugfix` — Beat-locked cues lurch or freeze for up to a second at cue change
+
+**Raised:** 2026-07-29 by the operator, about `SEARCHLIGHTS`: *"a rough start
+before smoothing out."* It was neither specific to that cue nor cosmetic.
+
+**Cause.** `_TimePattern` launched with `pos = 0.0` — step 0 — no matter where
+the song was. The PLL's lock target is a function of the beat clock, so a cue
+starting at step 0 mid-song began with an arbitrary phase error of up to half the
+pattern, which the loop then ate at `PLL_TAU` (0.1 s). Because the correction is
+clamped forward-only (motion must never run backwards), the two signs of that
+error failed differently and both were visible:
+
+- **positive error → a sprint.** The first frame advanced up to 20× the steady
+  rate, decaying over ~0.3 s.
+- **negative error → a dead stop.** `advance` clamped to 0 and the chase froze
+  until the target came round — up to **1.0 s** with no motion at all.
+
+Measured by sweeping every launch phase and both beat parities (the sign depends
+on beat parity, which is why it looked intermittent):
+
+| cue | worst overspeed | worst freeze |
+|---|---|---|
+| `SEARCHLIGHTS` | 5.7× for ~0.27 s | 417 ms |
+| `CHORUS` | 10.7× | 917 ms |
+| `HARMONY` | 20.7× | 1000 ms |
+| `BIG_ROCK_ENDING` | 5.7× | 417 ms |
+
+Note the ordering: **the transient scaled inversely with the cue's speed**, so
+the calmest cues — the ones where a stutter is most obvious — were hit hardest.
+`SEARCHLIGHTS` was where the operator noticed it, not where it was worst.
+
+**Fix.** Seed `pos` from the beat clock at launch (`_launch_beat_clock` →
+`_TimePattern.beat_target`), so the loop starts with zero error. Every
+beat-locked cue now launches at exactly its steady rate, at every launch phase
+and beat parity — verified by the same sweep that measured the problem. This
+leaves the PLL doing what it is for: tracking tempo and beat drift *while* a cue
+runs, not absorbing a launch artefact.
+
+A cue's patterns are seeded from one beat clock, so several launched together —
+a cue's two counter-rotating scanners, at different rates — start in the phase
+relationship they would have had if the cue had been running all along.
+
+**Unseeded on purpose:** a cold start (no beat yet) and a launch after the beats
+have gone stale both keep `pos = 0.0`. Neither has a phase to lock to, and
+seeding from a coasted `beat_clock` would be inventing a position. `FRENZY`'s
+`reverse_on_beat` patterns are not beat-locked at all and keep the free-run
+scheduler.
+
+**A near-miss worth recording.** The first version of this also wrapped the PLL
+target into `[0, n)` inside `beat_target`, which is algebraically a no-op — the
+error is reduced mod `n` regardless — but not a *bit-identical* one. It moved
+`rapid_cue_changes`' digest on float rounding alone. Caught by attributing every
+moved digest to a specific change before touching the tables; `beat_target` now
+returns the unwrapped value and callers wrap. **The digest tables are the tool
+that found this**, which is the argument for the rule at the top of them.
+
+**Tests:** `tests/test_beat_lock.py` +5. The headline one sweeps all eight
+time-driven beat-locked cues × 4 beat parities × 10 launch phases and asserts
+every frame of the first second moves at the pattern's steady rate ±2%; it fails
+loudly with the seeding reverted. The rest pin the mechanism and the three
+deliberately-unseeded cases.
+
+**Digest:** six fixtures moved — every one that changes to a beat-locked cue
+mid-stream. The six that held still are the invariant: four launch their only
+beat-locked cue before any beat arrives (a cold start is bit-identical) and two
+use only counter-stepped cues, which this does not touch.
+
+**Rollback:** make `_launch_beat_clock` return `None` unconditionally.
+
+---
+
+## OPEN `bugfix` — The keyframe tempo fallback steps off the beat
+
+**Found 2026-07-29** by the transition sanity-check that produced the two entries
+above, not reported from the rig. It is the same defect as the launch-phase one,
+in the other pattern type — worth fixing for the same reason, and deliberately
+left out of that branch to keep one item per change.
+
+`_CounterPattern`'s tempo fallback exists so a keyframe-stepped cue does not
+freeze on a chart that sends no keyframes. It steps on a timer seeded at cue
+launch (`next_fallback_time = now + interval`), so **its phase is whatever the
+cue's launch instant happened to be** and it never aligns to the beat:
+
+| cue launched after a beat | wash flips at beat phase |
+|---|---|
+| 0.0 s | 0.00 (on the beat) |
+| 0.1 s | 0.20 |
+| 0.2 s | 0.40 |
+| 0.3 s | 0.60 |
+| 0.4 s | 0.80 |
+
+Stable, not drifting — just arbitrarily offset. On `DEFAULT` the step is a
+full-strip blue↔red swap with no fade (a 510/pixel frame-to-frame delta, the
+largest of any cue), so landing it squarely between beats is very visible.
+Affects the four cues with a keyframe fallback: `DEFAULT`, `WARM_MANUAL`,
+`COOL_MANUAL`, `STOMP`.
+
+Where the fallback is *running*, there is by definition no authored rhythm to
+respect, so quantising it to the beat clock is strictly better than an arbitrary
+phase. Note the fallback must still **re-arm from the event** when real keyframes
+resume (`resolve()` already does this) — quantising must not make a chart-driven
+cue snap to the beat, because a chart's keyframes are the rhythm and may be
+deliberately syncopated.
+
+Expect this to move the `default_keyframes` and `keyframe_starved` digests, which
+are the two fixtures built for exactly this path, and no others.
 
 ---
 

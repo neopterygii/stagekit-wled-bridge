@@ -138,12 +138,20 @@ PERFORMER_BIAS_STRENGTH = 0.18   # max blend toward the highlighted hue
 
 # ── Spotlight cues ───────────────────────────────────────────────
 # The spotlight cues light several evenly spaced spots rather than one window:
-# a stage lit by a few lamps. A beat-driven chase pumps one spot to full while
-# the others hold at this floor, so all of them stay visible at every instant
-# and the movement reads as emphasis rather than as spots switching on and off.
-# The chase is driven from the engine's free-running beat_clock (like
-# gradient_roll below), NOT from beat events, so it stays replay-deterministic.
-SPOT_DIM_FLOOR = 0.35            # level of the spots the chase is not on
+# a stage lit by a few lamps. All the spots PULSE together on the beat — full
+# the instant a beat lands, easing back to (1 - depth) over the beat — so the
+# lamps stay put and the movement lives in time. Until 2026-07-29 the emphasis
+# instead *chased* spot→spot, which read as the lamps switching around and
+# imposed a 3-beat cycle the music does not have.
+#
+# The envelope is the same squared decay as the global beat pump below, so the
+# two read as one gesture, and it is driven from the engine's continuous
+# beat_phase rather than from beat events — smooth between the ~88 Hz packets
+# and replay-deterministic. Both edge cases rest at full rather than dark: no
+# beat seen yet (phase 0.0) and beats stopped (beats_live False).
+#
+# The depth lives with the cues that ask for it (cue_engine.SPOTLIGHT_PULSE_DEPTH)
+# — the mapper only owns the envelope shape.
 
 # ── Song-section palette/energy bias (VISION signal inventory) ───
 # The song-section byte (Verse/Chorus, offset 13) leans the current look
@@ -384,8 +392,10 @@ class LEDMapper:
         """Scale each window's pixels by its level; zero everything outside.
 
         The multi-spot counterpart of `_mask_outside`: darkness between the
-        spots plus a per-spot brightness, so a chase can dim the spots it is
-        not currently on without extinguishing them.
+        spots plus a per-spot brightness, so the beat pulse can dim them without
+        extinguishing them. Levels stay per-spot rather than one shared scalar —
+        the pulse drives them in lockstep today, but the signature is what let
+        the chase this replaced dim spots independently, and it costs nothing.
         """
         lit = bytearray(MAPPED_REGION)   # 0 = gap, else level index + 1
         for idx, (lo, hi) in enumerate(windows):
@@ -625,11 +635,12 @@ class LEDMapper:
         spotlight_region = effects.get("spotlight_region", 0.0)  # 0 = no mask
         spotlight_only = effects.get("spotlight_only", None)     # (r,g,b) or None
         # Multi-spot spotlights. spotlight_region is the width of ONE spot;
-        # count is how many are tiled across the strip; chase is how many spots
-        # the emphasis advances per beat (0 = static, all spots at full).
-        # Defaults reproduce the single-window renderer exactly.
+        # count is how many are tiled across the strip; pulse is the depth of
+        # the on-beat brightness pulse applied to all of them together
+        # (0 = static, all spots at full). Defaults reproduce the single-window
+        # renderer exactly.
         spotlight_count = effects.get("spotlight_count", 1)
-        spotlight_chase = effects.get("spotlight_chase", 0.0)
+        spotlight_pulse = effects.get("spotlight_pulse", 0.0)
         fps = effects.get("fps", 30.0)  # render FPS, for frame-count effects
 
         # Note-hold accents (Phase 4): 4 decayed levels [gtr, bass, drum, keys]
@@ -682,8 +693,11 @@ class LEDMapper:
 
         # Beat oscillator: a gentle on-beat brightness pump. beat_pulse is the
         # depth (0 = off); beat_phase is the engine's continuous 0→1 phase.
+        # beats_live is False once the beats have genuinely stopped, as opposed
+        # to one being dropped — see CueEngine.beats_live.
         beat_pulse = effects.get("beat_pulse", 0.0)
         beat_phase = effects.get("beat_phase", 1.0)
+        beats_live = effects.get("beats_live", True)
         # Section energy scales the pump depth (chorus hits harder, a verse
         # settles); identity skips the multiply so the default is bit-exact.
         if section_energy != 1.0:
@@ -698,19 +712,21 @@ class LEDMapper:
 
         # Spot geometry + per-spot brightness, shared by both spotlight paths
         # (the direct paint below and the mask near the end of the frame).
-        # beat_clock is free-running and tempo-locked, so the chase coasts
-        # through a dropped beat instead of stalling, and reads the same
-        # injected clock the rest of the render seam uses — replaying a capture
-        # reproduces it exactly. Before the first beat it is 0.0, which parks
-        # the emphasis on spot 0 rather than blanking the cue.
+        # Every spot shares one level: the beat pulse, which is a moment in time
+        # rather than a position on the strip. beat_phase is the same injected,
+        # continuous clock the rest of the render seam uses, so replaying a
+        # capture reproduces the envelope exactly, and it saturates at 1.0 — a
+        # single dropped beat rests at the trough instead of jumping. Once the
+        # beats stop for good (beats_live False) the spots hold at full, so a
+        # finished or disconnected song leaves a lit stage, not a dim one.
         spot_windows = None
         spot_levels = None
         if spotlight_region > 0.0:
             spot_windows = self._spot_windows(spotlight_count, spotlight_region)
-            if spotlight_chase > 0.0 and spotlight_count > 1:
-                active = int(beat_clock * spotlight_chase) % spotlight_count
-                spot_levels = [1.0 if i == active else SPOT_DIM_FLOOR
-                               for i in range(spotlight_count)]
+            if spotlight_pulse > 0.0 and beats_live:
+                decay = 1.0 - beat_phase
+                level = 1.0 - spotlight_pulse * (1.0 - decay * decay)
+                spot_levels = [level] * spotlight_count
             else:
                 spot_levels = [1.0] * spotlight_count
 

@@ -161,19 +161,36 @@ def test_strobe_frames_are_reproducible():
 # one to describe their actual motion. The other ten holding still is the
 # evidence that migration preserved the look of everything else — the patterns
 # kept writing zones as cell blocks rather than becoming gliding motion heads.
+#
+# Seven moved again (2026-07-29) for the spotlight pulse and the pattern
+# launch-phase seeding. Each move was attributed to one change before the table
+# was touched, and the split is the evidence that both did what they claim:
+#
+#   - spotlight_cues moved for the *pulse*, and only for it: the spotlight cues
+#     now pulse all their spots together on the beat instead of chasing the
+#     emphasis spot→spot. It is the only fixture using either spotlight cue.
+#   - the other six moved for the *seeding*: a beat-locked pattern now launches
+#     in phase with the beat clock instead of always at step 0. authored_venue is
+#     in this set because DISCHORD's GREEN chase is time-driven (no `listen=`),
+#     which is easy to miss among its counter-stepped neighbours.
+#   - the six that held still are the invariant: dropped_beats, repeated_beats,
+#     star_power_run and warm_beats launch their only beat-locked cue at the head
+#     of the stream, before any beat has arrived, so there is no phase to seed
+#     and a cold start is bit-identical. default_keyframes and keyframe_starved
+#     use only counter-stepped cues, which the seeding does not touch at all.
 GOLDEN_DIGESTS = {
-    "authored_venue": "db197118404387de7a9ebe560c680ccc410b01b4cf6a0992545024990e8aefa1",
+    "authored_venue": "049a1300fd60b72abd77854ddd928f7a3e4ccddca098a4977ba2baddb56e6ce4",
     "default_keyframes": "5f0ecd51e0e21a2d9920ae8d991a574ce411649e1bf5a4f5408936da70c1411f",
     "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
-    "auto_generated_venue": "538576dbc5c32bba140a440867f299c2150ae2fa3a6dacd8e8725fef1b264687",
+    "auto_generated_venue": "7b8694b58d408588e5546ff5383a126ccab25aff54555c420d79354ea743a926",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "f34b2836915ed0b2ead764626aa861d44d3860269fea93a55301e59756ca3c3e",
-    "rapid_cue_changes": "d7fd746fce81cffbc0287d7f07e45046cc454c3aeab6191aa3832a8eee63d300",
+    "malformed_stream": "9ebb75cbffba65926e5d0014a178b23698547b72430dc2c5f15f976da71617ec",
+    "rapid_cue_changes": "13ae859d67fe02b0cf2f0578bccc5e64dac7a4a986c4fb13fc65a42d36d9afca",
     "repeated_beats": "fe551d135dccdf5a8450f85923020b6a33f7b25f19fe0872b44d30387482b86f",
-    "song_lifecycle": "2bdebd56a2d10f43bb4287f9762acd99a0f9770079cdaf89e033f2a7577da3c8",
-    "spotlight_cues": "a19d66440e7e1e8f96f5f0abfb2ef77fc51c7e779e6d2661adea35cdd9cf0fb4",
+    "song_lifecycle": "8c1defed9da772e4bb5c3a65320f113f68049d2cca308ec981ee58c0319238b3",
+    "spotlight_cues": "0be8dd4ca3c8ad52274900a6e52214053388f6e324a87d5d94093fb2fbe87bea",
     "star_power_run": "ce056eedb3c03ea341af7e792cd43986889e0fcec42b38d37cc7da9b75251eb5",
-    "strobe_and_blackout": "7ba49eaad60c6c9c72340969693d8a36f3a1954c88d90d19ee97091f53963ee3",
+    "strobe_and_blackout": "5f3ced65f5eabf053adfa8c1e4457472c8b845043ff65a1e4dedb676eba6b60f",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
 
@@ -201,23 +218,29 @@ def test_golden_frame_digest(name):
 # cues sitting motionless because their coroutines never ran off an event loop.
 # The claim these tests make is that the documented settings rollback is
 # bit-exact, and the other ten unchanged values are what carry it.
+#
+# Seven were re-derived the same way for the spotlight pulse and the launch-phase
+# seeding (see the attribution on GOLDEN_DIGESTS). Both are engine changes with
+# no knob, so — as above — their historical values describe a look no setting
+# reaches any more. The six values that did not move are what still carry the
+# bit-exactness claim for the fade rollback.
 PRE_FADE_DIGESTS = {
-    "authored_venue": "ae902983223e79a6670c47eef02ea37dfa68f66d5d6aeb293bb11f62e2703c31",
-    "auto_generated_venue": "b7ad4ec42b45a9453a606ba0e9c49561e339575d997e28e4448b5eeb71b0c522",
+    "authored_venue": "7f15860ee8de75d84ba8ffd89e98efab6c6aaa4e919acb701327d08ff820fb25",
+    "auto_generated_venue": "9a996d077f7dc1eef88a49c8d72b76328fa6b185d87e962b7ab846d8f09fc19a",
     # No history — these two arrived with the counter-pattern change, for
     # rollback coverage of the cues it touches. Not pre-change captures.
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
     "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
+    "malformed_stream": "8785effc58018a022b897f9f06ad37a9adba57f49f0d6fdd930075f9b46006d9",
     # No history — this fixture arrived with the fade change. It is what the
     # rollback renders today, kept for coverage, not as a pre-change capture.
-    "rapid_cue_changes": "7ff4e04a57aaedf416c99f2c15ec4554087e5b80b8d102a4450b981d23e06e9c",
+    "rapid_cue_changes": "d05280b1f20322ffb45a485ea9b6958b5202af64221855da7d0caad3e4e6a184",
     "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
-    "song_lifecycle": "0aa0b0ba616d0c2d9f6cb40c99bf5ff2e9bad6b537860bd0b210e76e2bca75fe",
-    "spotlight_cues": "49e171cfc867beba338f3b474da4113a647a477f3273a9842f9bf07433baaaa9",
+    "song_lifecycle": "1d2f73fabe3cae22e0cbb92243e832211d1bb1dcb9b9467a6005c0cdff2e8e64",
+    "spotlight_cues": "601167d268e4bd8287956cd575f3f67337b71e9e3ba321a9c6e12eeab9c2315e",
     "star_power_run": "1410de93e6d6851cb352aa4203c9e6a662e3dc72c38084d29972de777ee4da59",
-    "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
+    "strobe_and_blackout": "57d049adc9ee05dc3b4abdcbf4767f2800820d662b44acfa3973def3c5938b57",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
 
@@ -251,20 +274,22 @@ def test_pre_fade_settings_reproduce_the_old_look(name):
 #
 # authored_venue was likewise re-derived for the counter-pattern change; see the
 # note on PRE_FADE_DIGESTS. default_keyframes and keyframe_starved arrived with
-# it and are not history either.
+# it and are not history either. Seven were re-derived again for the spotlight
+# pulse and the launch-phase seeding, on the same reasoning — see the attribution
+# on GOLDEN_DIGESTS for which change moved which fixture.
 PRE_STRICTNESS_DIGESTS = {
-    "authored_venue": "918350075c7884bccc923b2743a97717c4243602b97bd37377dac5cf47545444",
-    "auto_generated_venue": "39ddaabb8e6cf7fcc93b69dbcfd44fa44850b1982e376d1f2b47ad82650d7aa6",
+    "authored_venue": "e464d3a89b46834a7fe8600e72c97a61d249494bfa349bea26869d9a30f0b83e",
+    "auto_generated_venue": "d2103232221d74768137e8bdff697ea1a7b118cf47f84818215570904149b686",
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
     "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "811d2c4e8c5d2b3ebb004c4dd1b6c3f8a7a3bcebba261f4de9f73fc8d9cbd526",
-    "rapid_cue_changes": "6d758dd4c98cca4d2eaf5454eb3f5f536562dd4e36c75064b3ab150f196a49ae",
+    "malformed_stream": "8785effc58018a022b897f9f06ad37a9adba57f49f0d6fdd930075f9b46006d9",
+    "rapid_cue_changes": "af9891dad3b1d53ec33e97b99675f061c725ea9640c996256e6b90cf93ff82c0",
     "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
-    "song_lifecycle": "333d3654a248709bc8386d8b99aff493d93107123c8a433d3e242a90903e0365",
-    "spotlight_cues": "c7df29b2439f4e8f19016d5753275d96b506720aa5ad3872b7f810caf810493a",
+    "song_lifecycle": "e9e757da80439ab659f573ce7b25a90f9feb7dbb5957e8d8bf2b7a06a97c5c76",
+    "spotlight_cues": "2e1ccd76e29b9936e0cc369c27359be84f3b404d8cf67dfcb8b0d12d6475535f",
     "star_power_run": "c64cf03b7273438f7f95512261355f6ce250edcebb0712646258782d3bc90424",
-    "strobe_and_blackout": "7694b79c2f55378fd9158445f9b14c20c8cae091b513c94221dee46bc3c4dd13",
+    "strobe_and_blackout": "57d049adc9ee05dc3b4abdcbf4767f2800820d662b44acfa3973def3c5938b57",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
 

@@ -67,7 +67,18 @@ BONUS_BURST_DURATION = 0.25  # bonus_effect white celebration flash
 SPOTLIGHT_COUNT = 3          # evenly tiled spots
 SPOTLIGHT_WIDTH_TIGHT = 0.18   # BLACKOUT_SPOTLIGHT — unchanged from single-spot
 SPOTLIGHT_WIDTH_WIDE = 0.25    # SILHOUETTES_SPOTLIGHT
-SPOTLIGHT_CHASE_RATE = 1.0   # spots the emphasis advances per beat
+# The spots PULSE together on the beat; they do not chase. A chase (emphasis
+# walking spot→spot, one per beat, which is what these cues did until
+# 2026-07-29) reads as the lamps switching around, and at three spots it also
+# implies a 3-beat cycle the music does not have. Pulsing all of them from the
+# beat envelope keeps "a few lamps on a dark stage" static in space and puts the
+# movement in time instead, where the beat actually is.
+#
+# The depth is how far the spots dip BETWEEN beats: they hit full the instant a
+# beat lands and ease back to (1 - depth) over the beat. 0.65 leaves a 0.35
+# trough — the level the un-emphasised spots of the old chase sat at — so every
+# spot still reads as a lit lamp at its dimmest, never as one that switched off.
+SPOTLIGHT_PULSE_DEPTH = 0.65
 
 # ── Camera-cut lighting (VISION Phase 5) ─────────────────────────
 CAMERA_CUT_DURATION = 0.28   # seconds — one-shot accent decay on a *directed* cut
@@ -208,7 +219,7 @@ class _TimePattern:
                  'last_tick')
 
     def __init__(self, steps, *, bpm_sync, param, now, init_bpm=120.0,
-                 direction=1, reverse_on_beat=False):
+                 direction=1, reverse_on_beat=False, beat_clock=None):
         self.steps = steps           # list of list[(zone, mask)]
         # Per-step {zone: mask} lookups, precomputed so tick() doesn't
         # rebuild a dict per pattern per frame during interpolation.
@@ -241,8 +252,42 @@ class _TimePattern:
         # oscillator (see tick()). Randomly-reversing chaos patterns (Frenzy)
         # and non-tempo timed patterns keep the free-run scheduler above.
         self.beat_lock = bpm_sync and not reverse_on_beat
-        self.pos = 0.0               # continuous step position for the PLL
+        # Continuous step position for the PLL, seeded *in phase* with the beat
+        # clock so the loop starts with zero error.
+        #
+        # This used to start at 0.0 unconditionally, which made every cue change
+        # land the pattern at step 0 no matter where the song was — an arbitrary
+        # phase error of up to half the pattern for the PLL to eat at launch.
+        # Because the correction is clamped forward-only, the two halves of that
+        # error looked quite different and both looked wrong: a positive error
+        # sprinted (measured up to 20x the steady rate for ~0.3 s) and a
+        # negative one stopped the chase dead until the target came round
+        # (measured up to 1.0 s frozen). SEARCHLIGHTS is where the operator saw
+        # it — "a rough start before smoothing out" — but every beat-locked cue
+        # had it, and the transient scaled with how slow the cue was, so the
+        # calmest cues were hit hardest.
+        #
+        # Seeding leaves the PLL for what it is for: tracking tempo and beat
+        # drift *while* a cue runs. It also means several patterns launched
+        # together (a cue's two counter-rotating scanners, at different rates)
+        # start in the same phase relationship they would have had if the cue
+        # had been running all along.
+        self.pos = ((self.beat_target(beat_clock) % len(steps))
+                    if beat_clock is not None and self.beat_lock else 0.0)
+        self.step = int(self.pos)
         self.last_tick = now         # wall-clock of the last PLL advance
+
+    def beat_target(self, beat_clock: float) -> float:
+        """Step position implied by the beat clock — the PLL's lock target.
+
+        `param` is pattern-cycles per beat, so one beat advances the position by
+        `len(steps) * param` steps. Deliberately NOT wrapped into
+        [0, len(steps)): tick() reduces the resulting error modulo the pattern
+        length anyway, so wrapping here would be algebraically a no-op but not a
+        bit-identical one, and it moved a golden digest (rapid_cue_changes) on
+        float rounding alone. Callers that need a position wrap it themselves.
+        """
+        return beat_clock * len(self.steps) * self.param
 
     def steps_per_second(self, bpm: float) -> float:
         """Free-run motion rate for a beat-locked pattern (steps/sec)."""
@@ -625,6 +670,10 @@ class CueEngine:
         fx["bar_phase"] = self.bar_phase(now)
         fx["bar_beat"] = self._bar_beat
         fx["beat_clock"] = self.beat_clock(now)
+        # Whether beat_phase/beat_clock are still being driven by real beats.
+        # Effects that would otherwise freeze somewhere dark when the beats stop
+        # (the spotlight pulse) rest at full instead.
+        fx["beats_live"] = self.beats_live(now)
         fx["note_accents"] = self._note_accents(now)
         fx["vocal_notes"] = self._vocal_notes
         fx["performers"] = self._spotlight | self._singalong
@@ -699,6 +748,19 @@ class CueEngine:
         next downbeat.
         """
         return self._bar_beat + self.beat_phase(now)
+
+    def beats_live(self, now: float) -> bool:
+        """Whether a beat has been seen recently enough to drive motion.
+
+        The line between "a beat packet was dropped" and "the beats have
+        genuinely stopped" (song over, paused, YARG disconnected). Beat-locked
+        motion follows the beat while this holds and free-runs on tempo
+        afterwards; the spotlight pulse rests at full rather than parking at its
+        trough. BEAT_LOCK_TIMEOUT is deliberately much longer than one beat, so
+        a lost datagram never trips it.
+        """
+        return (self._beat_at > 0.0 and
+                (now - self._beat_at) < BEAT_LOCK_TIMEOUT)
 
     def beat_clock(self, now: float) -> float:
         """Monotonic, free-running, tempo-locked beat count (beats + phase).
@@ -781,8 +843,7 @@ class CueEngine:
 
         # Beat-lock context: patterns lock to the beat only while beats are
         # fresh; otherwise they free-run on tempo (the fallback).
-        beats_live = (self._beat_at > 0.0 and
-                      (now - self._beat_at) < BEAT_LOCK_TIMEOUT)
+        beats_live = self.beats_live(now)
         beat_clock = self.beat_clock(now) if beats_live else 0.0
 
         motion: list[tuple[int, float, float]] = []
@@ -803,7 +864,7 @@ class CueEngine:
                 advance = dt * p.steps_per_second(bpm)
                 if beats_live:
                     # target position (in steps) implied by the beat clock
-                    target = beat_clock * n * p.param
+                    target = p.beat_target(beat_clock)
                     err = target - (p.pos + advance)
                     err = (err + n * 0.5) % n - n * 0.5   # shortest wrapped path
                     advance += err * (dt / PLL_TAU if dt < PLL_TAU else 1.0)
@@ -1278,14 +1339,14 @@ class CueEngine:
 
         elif cue == CueByte.BLACKOUT_SPOTLIGHT:
             # Three tight warm-white spotlights spread across the strip,
-            # everything between them dark, with the emphasis chasing from one
-            # to the next on the beat. The mapper paints them when it sees
+            # everything between them dark, all three pulsing together on the
+            # beat. The mapper paints them when it sees
             # spotlight_only=(r,g,b) with a spotlight_region < 1.0.
             self._set_effects(
                 spotlight_only=(255, 200, 140),
                 spotlight_region=SPOTLIGHT_WIDTH_TIGHT,
                 spotlight_count=SPOTLIGHT_COUNT,
-                spotlight_chase=SPOTLIGHT_CHASE_RATE,
+                spotlight_pulse=SPOTLIGHT_PULSE_DEPTH,
             )
             return
 
@@ -1425,11 +1486,12 @@ class CueEngine:
             # Same breathing green, but constrained to three spotlight pools
             # spread across the strip — the gaps between them stay dark,
             # evoking a few performers picked out on a darkened stage. Wider
-            # spots than BLACKOUT_SPOTLIGHT, so the two read as a pair.
+            # spots than BLACKOUT_SPOTLIGHT, so the two read as a pair, and the
+            # same beat pulse on all three.
             self._set_effects(breathing=0.08,
                               spotlight_region=SPOTLIGHT_WIDTH_WIDE,
                               spotlight_count=SPOTLIGHT_COUNT,
-                              spotlight_chase=SPOTLIGHT_CHASE_RATE)
+                              spotlight_pulse=SPOTLIGHT_PULSE_DEPTH)
             self._set_zone(GREEN, ALL)
 
         elif cue == CueByte.STOMP:
@@ -1511,8 +1573,18 @@ class CueEngine:
 
         self._time_patterns.append(_TimePattern(
             steps, bpm_sync=True, param=cycles_per_beat,
-            now=now, init_bpm=self.bpm,
+            now=now, init_bpm=self.bpm, beat_clock=self._launch_beat_clock(now),
         ))
+
+    def _launch_beat_clock(self, now: float) -> float | None:
+        """Beat clock to seed a launching pattern's phase with, or None.
+
+        None means "no musical phase to lock to" — no beat seen yet, or the
+        beats have stopped — and the pattern starts at step 0 as it always did.
+        Once beats resume, tick()'s PLL pulls it in from wherever it is; there is
+        no phase to be in the meantime.
+        """
+        return self.beat_clock(now) if self.beats_live(now) else None
 
     def _make_counter_pattern(self, steps, *, listen: str,
                               cycles_per_beat: float, now: float,
@@ -1591,6 +1663,7 @@ class CueEngine:
             steps, bpm_sync=True, param=cycles_per_beat,
             now=now, init_bpm=self.bpm,
             reverse_on_beat=reverse_on_beat,
+            beat_clock=self._launch_beat_clock(now),
         ))
 
     def _start_listen_pattern(self, zone: int, pattern: list[int], listen: str,

@@ -320,15 +320,14 @@ def malformed_stream():
 
 
 def spotlight_cues():
-    """Both spotlight cues, long enough for the beat chase to wrap.
+    """Both spotlight cues, over several beats of the pulse.
 
-    The multi-spot spotlights are the one cue family whose look is pure
-    geometry, so a moved digest here means the spots or the chase moved. At
-    120 BPM each 3-second leg is 6 beats — two full trips around the three
-    spots, which catches a chase that advances at the wrong rate as well as one
-    that has stopped.
+    The multi-spot spotlights are the one cue family whose look is pure geometry
+    plus one envelope, so a moved digest here means the spots moved or the pulse
+    did. At 120 BPM each 3-second leg is 6 beats — enough that a pulse running at
+    the wrong rate, or one that has stopped pulsing, shows up in the digest.
 
-    The leading beat-less second matters: beat_clock is 0.0 until the first
+    The leading beat-less second matters: beat_phase is 0.0 until the first
     beat, and the cue has to be lit through that, not dark.
     """
     b = StreamBuilder(bpm=120.0)
