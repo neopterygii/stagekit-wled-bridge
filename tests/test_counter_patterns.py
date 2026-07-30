@@ -218,6 +218,177 @@ def test_the_fallback_does_not_burst_after_a_long_gap():
     assert p.fallback_steps == 1
 
 
+# ── the fallback steps on the beat grid ──────────────────────────
+#
+# The fallback used to step on a wall-clock timer seeded at cue launch, so its
+# phase was whatever instant the cue started and it never aligned to the beat: a
+# cue launched 0.3 s after a beat flipped at beat phase 0.60 forever. On DEFAULT
+# the step is a full-strip blue↔red swap with no fade — the largest frame-to-
+# frame delta of any cue — so landing it between beats was very visible.
+#
+# Where the fallback is running there is by definition no authored rhythm to
+# respect, so it now steps on an absolute grid of KEYFRAME_FALLBACK_BEATS-spaced
+# beat-clock positions. The tests that matter are the two opposing constraints:
+# steps land on the beat, and a *chart-driven* step is still never quantised.
+
+FPS = 60.0
+BPM = 120.0
+BEAT = 60.0 / BPM
+FRAME_PHASE = (1.0 / FPS) / BEAT     # one frame, as a fraction of a beat
+
+
+def _on_beat(phase):
+    """Is this beat phase within one frame of a beat boundary?"""
+    return phase < FRAME_PHASE * 1.5 or phase > 1.0 - FRAME_PHASE * 1.5
+
+
+def _flip_phases(cue, launch_offset, seconds=3.0, keyframe_every=None,
+                 beats=True, nbeats=8):
+    """Beat phases at which `cue`'s zones change, launched `launch_offset` into
+    a beat. Returns [] if it never steps."""
+    t = [1000.0]
+    e = CueEngine(clock=lambda: t[0])
+    e.bpm = BPM
+    for i in range(nbeats if beats else 0):
+        t[0] = 1000.0 + i * BEAT
+        e.on_beat(BeatByte.MEASURE if i % 4 == 0 else BeatByte.STRONG, now=t[0])
+    last = t[0]
+    t[0] = last + launch_offset
+    e.on_cue(cue)
+
+    phases, prev, nb, nk = [], None, last, 0
+    for f in range(int(seconds * FPS)):
+        now = last + launch_offset + f / FPS
+        if beats:
+            while nb + BEAT <= now:
+                nb += BEAT
+                e.on_beat(BeatByte.STRONG, now=nb)
+        if keyframe_every and now - last >= (nk + 1) * keyframe_every:
+            nk += 1
+            _keyframe(e, now)
+        t[0] = now
+        e.tick(now)
+        state = tuple(e.zones)
+        if prev is not None and state != prev:
+            phases.append(((now - last) % BEAT) / BEAT)
+        prev = state
+    return phases
+
+
+def test_fallback_steps_land_on_the_beat_whatever_the_launch_phase():
+    """The defect, stated directly. Before the fix the flip phase simply equalled
+    the launch offset — 0.1 s in meant flipping at phase 0.20 forever."""
+    for cue in (CueByte.DEFAULT, CueByte.WARM_MANUAL, CueByte.COOL_MANUAL,
+                CueByte.STOMP):
+        for k in range(10):
+            offset = k * BEAT / 10
+            phases = _flip_phases(cue, offset)
+            assert phases, f"{cue!r} never stepped at launch offset {offset}"
+            for phase in phases:
+                assert _on_beat(phase), (
+                    f"{cue!r} launched {offset:.3f}s after a beat stepped at "
+                    f"beat phase {phase:.3f} — the fallback is off the beat")
+
+
+def test_the_fallback_honours_its_full_allowance_and_is_never_early():
+    """The grid must not pull a step *forward*. Arming just before a boundary has
+    to wait for the next one, or a cue would step almost immediately after the
+    keyframe that armed it."""
+    e = _engine()
+    e.on_cue(CueByte.STOMP)
+    p = e._counter_patterns[0]
+    interval = p.fallback_beats()
+    assert interval > 0.0
+
+    # Arm a hair before a grid boundary, then ask again exactly on it.
+    p.arm_beat = 10.0 * interval - 0.01
+    assert p.grid_steps_due(10.0 * interval) == 0, "fired inside its allowance"
+    # The next boundary a full interval later is the first one owed.
+    assert p.grid_steps_due(11.0 * interval) == 1
+    assert p.grid_steps_due(12.0 * interval) == 2
+
+
+def test_a_chart_keyframe_is_never_quantised_onto_the_beat():
+    """A chart's keyframes ARE the rhythm and may be deliberately syncopated, so
+    the grid must apply only to the fallback. Keyframes deliberately off the
+    beat here: 0.3 s against a 0.5 s beat."""
+    phases = _flip_phases(CueByte.WARM_MANUAL, 0.0, seconds=3.0,
+                          keyframe_every=0.3)
+    assert phases, "the chart-driven pattern never stepped"
+    assert any(not _on_beat(phase) for phase in phases), (
+        "every step landed on a beat while the chart was driving — chart "
+        "keyframes are being quantised, which would flatten a syncopated chart")
+
+
+def test_a_real_keyframe_still_re_arms_the_grid_fallback():
+    """The chart driving must suppress the fallback entirely, beats or no beats.
+    The pre-existing version of this test runs without beats (the wall-clock
+    path); this is the same claim on the grid path."""
+    t = [1000.0]
+    e = CueEngine(clock=lambda: t[0])
+    e.bpm = BPM
+    for i in range(8):
+        t[0] = 1000.0 + i * BEAT
+        e.on_beat(BeatByte.STRONG, now=t[0])
+    e.on_cue(CueByte.WARM_MANUAL)
+    p = e._counter_patterns[0]
+    assert e._fallback_beat_clock(t[0]) is not None, "not on the grid path"
+
+    # Keyframes comfortably inside the allowance (which is 2 beats here).
+    now = t[0]
+    for _ in range(8):
+        now += BEAT * 0.5
+        e.on_beat(BeatByte.STRONG, now=now)
+        _keyframe(e, now)
+        t[0] = now
+        e.tick(now)
+    assert p.fallback_steps == 0, "the fallback fired while the chart was driving"
+
+
+def test_the_grid_fallback_does_not_burst_after_a_long_gap():
+    """Same snap-forward rule as the wall-clock path: one step per tick, and a
+    long gap is absorbed rather than replayed as a flurry."""
+    t = [1000.0]
+    e = CueEngine(clock=lambda: t[0])
+    e.bpm = BPM
+    e.on_beat(BeatByte.STRONG, now=1000.0)
+    e.on_cue(CueByte.WARM_MANUAL)
+    p = e._counter_patterns[0]
+    assert e._fallback_beat_clock(1000.0) is not None, "not on the grid path"
+    t[0] = 1000.0
+    e.tick(1000.0)
+    t[0] = 1000.0 + 500 * BEAT          # a very long gap in one jump
+    e.tick(t[0])
+    assert p.fallback_steps == 1
+
+
+def test_with_no_beat_ever_seen_the_wall_clock_timer_still_carries_the_cue():
+    """beat_clock is pinned at 0.0 until the first beat, so there is no grid.
+    The cue must still not freeze — this is the path the older fallback tests
+    above exercise, and it has to keep working unchanged."""
+    e = _engine()                        # no beat is ever delivered
+    e.on_cue(CueByte.STOMP)
+    p = e._counter_patterns[0]
+    assert e._fallback_beat_clock(1000.0) is None
+    e.tick(1000.0)
+    before = list(e.zones)
+    e.tick(1000.0 + p.fallback_interval(e.bpm) * 1.01)
+    assert list(e.zones) != before, "the cue froze with no beats to grid to"
+
+
+def test_stale_beats_keep_using_the_grid():
+    """Unlike the launch-phase seeding, a stale beat clock is fine here: it
+    free-runs at tempo, so it still says where the beats would be, which is what
+    a fallback stepping on tempo wants."""
+    t = [1000.0]
+    e = CueEngine(clock=lambda: t[0])
+    e.bpm = BPM
+    e.on_beat(BeatByte.STRONG, now=1000.0)
+    t[0] = 1000.0 + 60.0                 # far past BEAT_LOCK_TIMEOUT
+    assert not e.beats_live(t[0])
+    assert e._fallback_beat_clock(t[0]) is not None
+
+
 # ── pause ────────────────────────────────────────────────────────
 
 def test_patterns_do_not_step_while_paused():

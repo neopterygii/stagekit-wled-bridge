@@ -50,6 +50,17 @@ firmware upgrade could mask the cause rather than fix it.
 
 ### Recently closed
 
+- ~~Spotlights should pulse to the beat, not chase~~ — built 2026-07-29;
+  [write-up](#done-2026-07-29-feature--spotlights-should-pulse-to-the-beat-not-chase).
+  Operator-reported. Only `spotlight_cues`' digest moved.
+- ~~Beat-locked cues lurch or freeze at cue change~~ — built 2026-07-29;
+  [write-up](#done-2026-07-29-bugfix--beat-locked-cues-lurch-or-freeze-for-up-to-a-second-at-cue-change).
+  Reported as "searchlights has a rough start"; it was every beat-locked cue, up
+  to 20× overspeed or a **full second frozen**, and worst on the calmest cues.
+- ~~The keyframe tempo fallback steps off the beat~~ — built 2026-07-29;
+  [write-up](#done-2026-07-29-bugfix--the-keyframe-tempo-fallback-steps-off-the-beat).
+  Found by sanity-checking the transitions for the item above, not from the rig —
+  the same defect in the other pattern type.
 - ~~Event-driven cue patterns still run on asyncio~~ — built 2026-07-29;
   [write-up](#done-2026-07-29-refactor--event-driven-cue-patterns-still-run-on-asyncio-so-replay-cant-judge-them).
   The harness now covers the library's most common cues. Only `authored_venue`'s
@@ -771,12 +782,11 @@ use only counter-stepped cues, which this does not touch.
 
 ---
 
-## OPEN `bugfix` — The keyframe tempo fallback steps off the beat
+## DONE 2026-07-29 `bugfix` — The keyframe tempo fallback steps off the beat
 
 **Found 2026-07-29** by the transition sanity-check that produced the two entries
 above, not reported from the rig. It is the same defect as the launch-phase one,
-in the other pattern type — worth fixing for the same reason, and deliberately
-left out of that branch to keep one item per change.
+in the other pattern type.
 
 `_CounterPattern`'s tempo fallback exists so a keyframe-stepped cue does not
 freeze on a chart that sends no keyframes. It steps on a timer seeded at cue
@@ -799,13 +809,66 @@ Affects the four cues with a keyframe fallback: `DEFAULT`, `WARM_MANUAL`,
 
 Where the fallback is *running*, there is by definition no authored rhythm to
 respect, so quantising it to the beat clock is strictly better than an arbitrary
-phase. Note the fallback must still **re-arm from the event** when real keyframes
-resume (`resolve()` already does this) — quantising must not make a chart-driven
-cue snap to the beat, because a chart's keyframes are the rhythm and may be
-deliberately syncopated.
+phase.
 
-Expect this to move the `default_keyframes` and `keyframe_starved` digests, which
-are the two fixtures built for exactly this path, and no others.
+**What was built.** The fallback now steps on an **absolute grid** of
+`KEYFRAME_FALLBACK_BEATS`-spaced positions on the beat clock, rather than on a
+wall-clock deadline seeded at launch. `fallback_beats()` (the interval in beats,
+tempo-independent) joins the existing `fallback_interval()` (the same in
+seconds), and `grid_steps_due()` is a pure function of the beat clock and the
+last arm point — so it stays replay-deterministic, like everything else on this
+seam.
+
+Two constraints pull against each other here and both are pinned by tests:
+
+- **steps land on the beat** — the grid is absolute (multiples of the interval on
+  the beat clock), *not* offsets from the arm point. Offsets from the arm point
+  would have reproduced the original bug exactly.
+- **the overdue allowance is still honoured in full** — the step lands on the
+  first grid boundary at or after `arm + interval`. Arming 0.9 beats before a
+  boundary must not fire 0.1 beats later, so a fallback step can be *late* by up
+  to one interval but never early. Firing early would mean a cue stepping almost
+  immediately after the keyframe that armed it.
+
+**A chart-driven step is still never quantised.** A real keyframe re-arms rather
+than snapping: a chart's keyframes *are* the rhythm and may be deliberately
+syncopated, so pulling them onto the beat would flatten the chart. This is the
+invariant most at risk from a future change here, so it has its own test that
+drives keyframes at 0.3 s against a 0.5 s beat and asserts the steps land off the
+beat.
+
+**The one case with no grid** is when no beat has *ever* arrived: `beat_clock` is
+pinned at 0.0 and frozen, so there is nothing to align to and the wall-clock
+timer carries the cue as before. Note this is a deliberately weaker test than the
+launch-phase seeding's (`_fallback_beat_clock` vs `_launch_beat_clock`): a
+**stale** beat clock is fine here, because it free-runs at tempo and so still
+says where the beats would be, which is exactly what a fallback stepping on
+tempo wants. Seeding a *position* from a coasted clock invents information;
+continuing a grid on one does not.
+
+**Digest:** exactly one moved — `keyframe_starved`, the fixture built for the
+starved path. The earlier draft of this entry predicted `default_keyframes` would
+move too; **it did not, and that is the better result.** It sends a keyframe on
+every packet, so its fallback never runs. `default_keyframes` holding still is
+the end-to-end proof that the grid has not leaked into the chart-driven path.
+
+**Tests:** `tests/test_counter_patterns.py` +7 (32 total). The headline one sweeps
+all four fallback cues × 10 launch phases and asserts every step lands within one
+frame of a beat; it fails with the fix reverted. The rest pin the allowance, the
+no-quantising-the-chart invariant, re-arming on the grid path, no burst after a
+long gap, the no-beats-ever path, and that stale beats still use the grid. Two of
+them assert they are *on* the grid path first, so they cannot silently drift onto
+the wall-clock path and pass for the wrong reason.
+
+**Not addressed:** the grid is aligned to the beat, not to the **bar**. All four
+cues work out to a 1.0- or 2.0-beat interval, and a 2.0-beat grid lands on every
+other beat-clock position, which is not necessarily a downbeat — `beat_clock`
+counts from the first beat seen, not from a bar boundary. Landing on a beat was
+the defect; landing on the *right* beat of the bar is a further refinement, and
+`bar_phase`/`_bar_beat` already carry what it would need.
+
+**Rollback:** make `_fallback_beat_clock` return `None` unconditionally — every
+pattern then takes the wall-clock path, which is the pre-change behaviour.
 
 ---
 

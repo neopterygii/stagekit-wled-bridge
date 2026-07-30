@@ -8,6 +8,7 @@ Based on YALCY's StageKitTalker behavior, enhanced with LedFx/WLED-inspired
 effects for a modern LED strip look.
 """
 
+import math
 import time
 
 from protocol.yarg_packet import (
@@ -125,6 +126,13 @@ PLL_DT_MAX = 0.2             # clamp per-frame dt so a stall can't fling motion
 # so the fallback cadence is unchanged where it already existed.
 KEYFRAME_DEDUP_WINDOW = 0.015   # seconds — reject a duplicated NEXT datagram
 KEYFRAME_FALLBACK_BEATS = 2.0   # nominal step intervals before stepping on tempo
+# The fallback steps on a grid of KEYFRAME_FALLBACK_BEATS-spaced beat-clock
+# positions, so its steps land on the beat rather than on whatever instant the
+# cue happened to launch. The beat clock is an integer at each beat only up to
+# float rounding, so the grid comparisons carry a tolerance — without it a
+# boundary can be missed by one frame, which is both visible as jitter and
+# non-reproducible across replays.
+_GRID_EPS = 1e-6
 
 # ── Venue-size density branching (VISION signal inventory) ──────
 # YALCY branches per cue on the venue-size byte (offset 8): Large venues get
@@ -377,10 +385,11 @@ class _CounterPattern:
     """
     __slots__ = ('steps', 'source', 'base', 'apply_delay',
                  'fallback_steps_per_beat', 'next_fallback_time',
-                 'fallback_steps', 'last_count')
+                 'fallback_steps', 'last_count', 'arm_beat', 'arm_steps')
 
     def __init__(self, steps, *, source, base, now, apply_delay=0,
-                 fallback_steps_per_beat=0.0, init_bpm=120.0):
+                 fallback_steps_per_beat=0.0, init_bpm=120.0,
+                 beat_clock=None):
         self.steps = steps                  # list of list[(zone, mask)]
         self.source = source                # 'keyframe' | 'beat'
         self.base = base                    # counter value at launch
@@ -396,36 +405,102 @@ class _CounterPattern:
         # Stored as a rate, not a duration, so the interval tracks tempo changes
         # — the coroutine recomputed its wait_for timeout on every step.
         self.fallback_steps_per_beat = fallback_steps_per_beat
-        self.next_fallback_time = now + self.fallback_interval(init_bpm)
-        self.fallback_steps = 0             # steps taken via the timer
+        self.fallback_steps = 0             # steps taken via the fallback
         self.last_count = base
+        # Fallback arming state. `arm_beat` is the beat clock at the last arm
+        # (launch, or the last real chart event); `arm_steps` counts the
+        # fallback steps taken since then, so the beat-grid path can tell a step
+        # it owes from one it has already made. `next_fallback_time` is the
+        # wall-clock deadline used only when there is no beat grid at all.
+        self.arm_beat = 0.0
+        self.arm_steps = 0
+        self.next_fallback_time = 0.0
+        self._arm(now, init_bpm, beat_clock)
+
+    def fallback_beats(self) -> float:
+        """Beats a keyframe may be overdue before the pattern steps on tempo.
+
+        Tempo-independent, unlike fallback_interval: this is the spacing of the
+        beat grid the fallback steps on.
+        """
+        if self.fallback_steps_per_beat <= 0.0:
+            return 0.0
+        return KEYFRAME_FALLBACK_BEATS / self.fallback_steps_per_beat
 
     def fallback_interval(self, bpm: float) -> float:
         """Seconds a keyframe may be overdue before the pattern steps on tempo."""
         if self.fallback_steps_per_beat <= 0.0:
             return 0.0
         effective_bpm = bpm if bpm > 0 else 120.0
-        return (KEYFRAME_FALLBACK_BEATS * 60.0 / effective_bpm
-                / self.fallback_steps_per_beat)
+        return self.fallback_beats() * 60.0 / effective_bpm
 
-    def resolve(self, count: int, now: float, bpm: float) -> int | None:
-        """Current step index, or None for "leave the zones alone"."""
+    def _arm(self, now: float, bpm: float, beat_clock: float | None):
+        """(Re)start the fallback's allowance from this instant."""
+        self.next_fallback_time = now + self.fallback_interval(bpm)
+        self.arm_beat = beat_clock if beat_clock is not None else 0.0
+        self.arm_steps = 0
+
+    def grid_steps_due(self, beat_clock: float) -> int:
+        """Fallback steps owed at `beat_clock`, counting from the last arm.
+
+        The first step lands on the first grid boundary at or after the *full*
+        overdue allowance, and every `fallback_beats()` after that. Two things
+        matter here and they pull in opposite directions:
+
+          - the grid is ABSOLUTE — multiples of the interval on the beat clock,
+            not offsets from the arm point. That is what puts the step on the
+            beat instead of on whenever the cue happened to launch.
+          - the allowance is still honoured in full. Arming 0.9 beats before a
+            grid boundary must not fire 0.1 beats later; it waits for the next
+            one. So a step can be *late* by up to one interval, never early.
+        """
+        interval = self.fallback_beats()
+        if interval <= 0.0:
+            return 0
+        first = math.ceil((self.arm_beat + interval) / interval - _GRID_EPS)
+        reached = math.floor(beat_clock / interval + _GRID_EPS)
+        due = int(reached) - int(first) + 1
+        return due if due > 0 else 0
+
+    def resolve(self, count: int, now: float, bpm: float,
+                beat_clock: float | None = None) -> int | None:
+        """Current step index, or None for "leave the zones alone".
+
+        *beat_clock* is the engine's beat clock, or None when no beat has ever
+        arrived and there is therefore no grid to align the fallback to.
+        """
         interval = self.fallback_interval(bpm)
         if count != self.last_count:
             self.last_count = count
             # A real event re-arms the fallback: the chart is driving again.
+            # Note this re-arms rather than quantising — a chart's keyframes ARE
+            # the rhythm and may be deliberately syncopated, so a chart-driven
+            # step must never be pulled onto the beat.
             if interval > 0.0:
-                self.next_fallback_time = now + interval
-        elif interval > 0.0 and now >= self.next_fallback_time:
-            self.fallback_steps += 1
-            # At most one fallback step per tick. If the deadline is more than
-            # an interval in the past — a pause, a host suspend, a long GC —
-            # snap forward rather than emitting a catch-up burst, the same
-            # reasoning as _TimePattern's free-run scheduler.
-            if now - self.next_fallback_time > interval:
-                self.next_fallback_time = now + interval
+                self._arm(now, bpm, beat_clock)
+        elif interval > 0.0:
+            if beat_clock is None:
+                # No beat has ever arrived, so there is no grid — step on the
+                # wall clock, which is what this always did.
+                if now >= self.next_fallback_time:
+                    self.fallback_steps += 1
+                    # At most one fallback step per tick. If the deadline is more
+                    # than an interval in the past — a pause, a host suspend, a
+                    # long GC — snap forward rather than emitting a catch-up
+                    # burst, the same reasoning as _TimePattern's free-run
+                    # scheduler.
+                    if now - self.next_fallback_time > interval:
+                        self.next_fallback_time = now + interval
+                    else:
+                        self.next_fallback_time += interval
             else:
-                self.next_fallback_time += interval
+                # Step on the beat grid. Absorbing the whole backlog into
+                # arm_steps is the same snap-forward rule as above: one step per
+                # tick, and a long gap does not become a burst.
+                due = self.grid_steps_due(beat_clock)
+                if due > self.arm_steps:
+                    self.fallback_steps += 1
+                    self.arm_steps = due
 
         delta = (count - self.base) + self.fallback_steps
         if delta < self.apply_delay:
@@ -921,10 +996,11 @@ class CueEngine:
         rebound atomically by _kill_primitives the same way _time_patterns is.
         """
         patterns = self._counter_patterns  # local ref — safe across threads
+        beat_clock = self._fallback_beat_clock(now)
         for p in patterns:
             count = (self._keyframe_count if p.source == 'keyframe'
                      else self._beat_count)
-            step = p.resolve(count, now, self.bpm)
+            step = p.resolve(count, now, self.bpm, beat_clock)
             if step is None:
                 continue   # apply_delay: the cue's opening zones still stand
             for zone, mask in p.steps[step]:
@@ -1576,6 +1652,18 @@ class CueEngine:
             now=now, init_bpm=self.bpm, beat_clock=self._launch_beat_clock(now),
         ))
 
+    def _fallback_beat_clock(self, now: float) -> float | None:
+        """Beat clock for the keyframe tempo fallback's grid, or None.
+
+        Deliberately a weaker test than `_launch_beat_clock`'s: any beat ever
+        seen is enough. `beat_clock` free-runs at tempo once beats stop, so a
+        stale clock still describes where the beats *would* be — which is
+        exactly what a fallback stepping on tempo wants. It is 0.0 and frozen
+        only when no beat has ever arrived, and that is the one case with no
+        grid, where the wall-clock timer has to carry the cue instead.
+        """
+        return self.beat_clock(now) if self._beat_at > 0.0 else None
+
     def _launch_beat_clock(self, now: float) -> float | None:
         """Beat clock to seed a launching pattern's phase with, or None.
 
@@ -1606,6 +1694,7 @@ class CueEngine:
                 apply_delay=apply_delay,
                 fallback_steps_per_beat=len(steps) * cycles_per_beat,
                 init_bpm=self.bpm,
+                beat_clock=self._fallback_beat_clock(now),
             )
         return _CounterPattern(
             steps, source='beat', base=self._beat_count, now=now,

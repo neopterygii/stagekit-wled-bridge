@@ -178,10 +178,18 @@ def test_strobe_frames_are_reproducible():
 #     of the stream, before any beat has arrived, so there is no phase to seed
 #     and a cold start is bit-identical. default_keyframes and keyframe_starved
 #     use only counter-stepped cues, which the seeding does not touch at all.
+#
+# Exactly one moved when the keyframe tempo fallback started stepping on a beat
+# grid instead of a timer seeded at cue launch (2026-07-29): keyframe_starved, the
+# fixture built for the starved path. default_keyframes holding still is the
+# invariant that matters — it sends keyframes on every packet, so its fallback
+# never runs, and a chart-driven step is still never quantised onto the beat. If
+# default_keyframes ever moves for this, the grid has leaked into the chart path
+# and a syncopated chart is being flattened.
 GOLDEN_DIGESTS = {
     "authored_venue": "049a1300fd60b72abd77854ddd928f7a3e4ccddca098a4977ba2baddb56e6ce4",
     "default_keyframes": "5f0ecd51e0e21a2d9920ae8d991a574ce411649e1bf5a4f5408936da70c1411f",
-    "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
+    "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "auto_generated_venue": "7b8694b58d408588e5546ff5383a126ccab25aff54555c420d79354ea743a926",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "9ebb75cbffba65926e5d0014a178b23698547b72430dc2c5f15f976da71617ec",
@@ -230,7 +238,7 @@ PRE_FADE_DIGESTS = {
     # No history — these two arrived with the counter-pattern change, for
     # rollback coverage of the cues it touches. Not pre-change captures.
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
-    "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
+    "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "8785effc58018a022b897f9f06ad37a9adba57f49f0d6fdd930075f9b46006d9",
     # No history — this fixture arrived with the fade change. It is what the
@@ -281,7 +289,7 @@ PRE_STRICTNESS_DIGESTS = {
     "authored_venue": "e464d3a89b46834a7fe8600e72c97a61d249494bfa349bea26869d9a30f0b83e",
     "auto_generated_venue": "d2103232221d74768137e8bdff697ea1a7b118cf47f84818215570904149b686",
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
-    "keyframe_starved": "3e37bf3735e9d87d00585f7f0df1228add88090fdda81b024d748bc90bbe519c",
+    "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
     "malformed_stream": "8785effc58018a022b897f9f06ad37a9adba57f49f0d6fdd930075f9b46006d9",
     "rapid_cue_changes": "af9891dad3b1d53ec33e97b99675f061c725ea9640c996256e6b90cf93ff82c0",
