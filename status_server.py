@@ -79,6 +79,12 @@ class StatusTracker:
         self.render_thread = None  # set after creation in main()
         self._last_packet_time = 0.0
 
+        # Whether the last rendered frame actually left for the strip. Written
+        # from the render thread (plain bool, GIL-safe) off the same
+        # wled_power.is_on gate that decides the DDP send, so it is ground
+        # truth about output rather than an inference from power state.
+        self._last_frame_sent = False
+
         # YARG game state surfaced for the dashboard
         self.scene = 0          # 0=Unknown 1=Menu 2=Gameplay 3=Score 4=Calibration
         self.auto_gen = False   # True when YARG is using auto-generated venue lighting
@@ -113,6 +119,31 @@ class StatusTracker:
             return False
         return (time.monotonic() - self._last_packet_time) < CONNECTED_TIMEOUT
 
+    @property
+    def cue_held(self) -> bool:
+        """True when the reported cue is a latched leftover, not a live one.
+
+        CueEngine.on_cue() only reacts to a *change* of cue byte, and nothing
+        off the packet path resets cue/zone state, so after a sender goes away
+        the render thread keeps producing a lit frame from the last cue it saw.
+        That is deliberate — YARG sends at ~88 Hz and blacking out on one
+        dropped datagram would be far worse than briefly holding a cue — but it
+        means the dashboard cannot present the cue as live once the sender is
+        gone.
+
+        Computed live, like `connected`, so it can never itself go stale.
+        """
+        if self.connected or self.test_active:
+            return False
+        return self.current_cue != CueByte.NO_CUE
+
+    @property
+    def output_live(self) -> bool:
+        """True when rendered frames are actually reaching the strip."""
+        if self.render_thread is not None and self.render_thread.failed:
+            return False
+        return self._last_frame_sent
+
     def on_packet(self):
         now = time.monotonic()
         self._pkt_count_window.append(now)
@@ -136,6 +167,7 @@ class StatusTracker:
             self.beat_phase = beat_phase
         if bar_beat is not None:
             self.bar_beat = bar_beat
+        self._last_frame_sent = ddp_sent
         if ddp_sent:
             self.ddp_frames_sent += 1
 
@@ -197,6 +229,8 @@ class StatusTracker:
             "beat_phase": round(self.beat_phase, 3),
             "bar_beat": self.bar_beat,
             "connected": self.connected,
+            "cue_held": self.cue_held,
+            "output_live": self.output_live,
             "test_active": self.test_active,
             "test_pattern": self.test_pattern,
             "scene": _SCENE_NAMES.get(self.scene, "Unknown"),
@@ -297,6 +331,13 @@ STATUS_HTML = """\
   .layer-row .layer-canvas { flex: 1; height: 14px; border-radius: 4px; border: 1px solid var(--border);
                              image-rendering: pixelated; image-rendering: crisp-edges; display: block;
                              background: var(--bg); }
+  /* The render thread keeps producing frames while WLED is powered off — they
+     are simply not sent. Grey the preview out so it cannot be read as output
+     that is reaching the strip. */
+  #strip-wrap.not-sending .strip-canvas,
+  #strip-wrap.not-sending .layer-rows { opacity: 0.25; filter: saturate(0.4); }
+  .strip-note { font-size: 0.7rem; color: var(--yellow); margin-top: 0.4rem;
+                text-transform: uppercase; letter-spacing: 0.05em; }
 
   /* Beat indicator */
   .beat-dot { display: inline-block; width: 14px; height: 14px; border-radius: 50%;
@@ -363,7 +404,13 @@ STATUS_HTML = """\
   .pill.auto { background: var(--dim); color: var(--bg); }
   .pill.paused { background: var(--yellow); color: var(--bg); }
   .pill.sp { background: var(--blue); color: var(--bg); }
+  /* HELD — the cue shown is the last one received, not a live one. Outlined
+     rather than filled, so it reads as "this value is not current" instead of
+     competing with the state pills next to it. */
+  .pill.held { background: transparent; color: var(--yellow);
+               border: 1px solid var(--yellow); }
   .pill.hidden { display: none; }
+  .hidden { display: none; }
   .scene-label { font-size: 0.7rem; color: var(--dim); margin-top: 0.25rem;
                  text-transform: uppercase; letter-spacing: 0.05em; }
 </style>
@@ -379,7 +426,8 @@ STATUS_HTML = """\
   </div>
   <div class="card">
     <div class="label">Current Cue</div>
-    <div class="value"><span id="cue">&mdash;</span> <span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span><span class="pill auto hidden" id="venue-pill"></span></div>
+    <div class="value"><span id="cue">&mdash;</span> <span class="pill held hidden" id="held-pill">HELD</span><span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span><span class="pill auto hidden" id="venue-pill"></span></div>
+    <div class="scene-label hidden" id="cue-held-note">last cue received &mdash; sender gone</div>
   </div>
   <div class="card">
     <div class="label">BPM</div>
@@ -493,8 +541,11 @@ STATUS_HTML = """\
 </div>
 
 <h3 style="margin-bottom:0.5rem">Live Strip</h3>
-<canvas id="strip-canvas" class="strip-canvas" width="60" height="1"></canvas>
-<div class="layer-rows" id="layer-rows"></div>
+<div id="strip-wrap">
+  <canvas id="strip-canvas" class="strip-canvas" width="60" height="1"></canvas>
+  <div class="strip-note hidden" id="strip-note">not being sent &mdash; WLED output is off</div>
+  <div class="layer-rows" id="layer-rows"></div>
+</div>
 
 <h3 style="margin:1rem 0 0.5rem">Zone Bitmasks</h3>
 <div id="zones"></div>
@@ -1071,6 +1122,19 @@ function update(d) {
     addLog('<span class="cue">CUE \\u2192 ' + d.cue + '</span>');
     lastCue = d.cue;
   }
+
+  // HELD pill — the cue above is the last one received, not a live one. A
+  // separate element from the cue text, so the `d.cue !== lastCue` guard above
+  // (which only rewrites the text on a change) cannot leave this out of date.
+  document.getElementById('held-pill').classList.toggle('hidden', !d.cue_held);
+  document.getElementById('cue-held-note').classList.toggle('hidden', !d.cue_held);
+
+  // "not being sent" — frames are still being rendered but the DDP send is
+  // gated off, so the strip is dark whatever the preview shows. Independent of
+  // cue_held: either can happen without the other.
+  const notSending = d.output_live === false;
+  document.getElementById('strip-wrap').classList.toggle('not-sending', notSending);
+  document.getElementById('strip-note').classList.toggle('hidden', !notSending);
 
   // AUTO badge — YARG auto-generated venue track
   document.getElementById('autogen-pill').classList.toggle('hidden', !d.auto_gen);

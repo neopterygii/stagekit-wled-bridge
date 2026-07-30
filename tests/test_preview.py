@@ -155,6 +155,8 @@ def test_snapshot_includes_preview_from_render_thread():
     t = StatusTracker()
 
     class FakeRT:
+        failed = False
+
         def render_stats(self):
             return {"fps": 40}
 
@@ -171,6 +173,8 @@ def test_snapshot_omits_preview_when_none():
     t = StatusTracker()
 
     class FakeRT:
+        failed = False
+
         def render_stats(self):
             return {"fps": 40}
 
