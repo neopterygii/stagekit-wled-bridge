@@ -1423,7 +1423,8 @@ class StatusServer:
             elif path in ('/', '/index.html') and method == 'GET':
                 await self._send_response(writer, 200, 'text/html', STATUS_HTML.encode())
             elif path == '/api/status' and method == 'GET':
-                snap = self.tracker.snapshot()
+                snap = self.tracker.snapshot(wled_power=self.wled_power,
+                                             settings=self.settings)
                 if self.capture is not None:
                     snap["capture"] = self.capture.snapshot()
                 body = json.dumps(snap).encode()
