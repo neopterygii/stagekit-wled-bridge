@@ -29,26 +29,31 @@ template" as a backlog step.
 
 In order:
 
-1. **The two state bugs** (`bugfix`) — both are cases of the bridge believing
-   something about the world that is not true, and both mislead the operator in
-   the room, which is the one thing the dashboard exists to prevent:
-   - [cached WLED power state never resyncs after a device reboot](#open-bugfix--the-bridges-cached-wled-power-state-never-resyncs-after-a-device-reboot)
-     — the periodic probe discards its own answer, so a device powered on by
-     anything but the bridge stays lit indefinitely at a measured ~1622 mA.
-   - [stale lit cue held after disconnect/power-off](#open-bugfix--bridge-keeps-a-stale-lit-cue-after-disconnectpower-off)
-     — the dashboard shows an active cue and a lit preview while the strip is
-     dark.
-
-   Small, adjacent, and both about state that is never reset — reasonable as
-   **one branch**, though they touch different code (`WLEDPower._wled_on` in the
-   watchdog vs. cue/zone state in `CueEngine`) and split cleanly if preferred.
-
-Then back to the reliability push: W3 alignment trim (`feature`), W4 read-only
-state/MQTT (`feature`), W5 firmware qualification (`ops`). The desync item is an
-argument *for* W5 but also a reason to gather evidence before it, since a
-firmware upgrade could mask the cause rather than fix it.
+1. **W3 — lighting alignment trim** (`feature`). A persisted,
+   dashboard-adjustable output delay in milliseconds plus a visible calibration
+   pattern. Default **0 ms**: YARG emits venue events against
+   `GameManager.SongTime`, which already models its own audio timing, so copying
+   the in-game audio latency setting would double-compensate. Treat this as an
+   additional trim for network, controller and display latency.
+2. **W4 — read-only state, optionally over MQTT** (`feature`).
+3. **W5 — WLED firmware qualification** (`ops`). The desync item is an argument
+   *for* W5 but also a reason to gather evidence before it, since a firmware
+   upgrade could mask the cause rather than fix it.
 
 ### Recently closed
+
+- ~~The two state bugs~~ — both built 2026-07-29 on one branch, as three
+  commits. Same failure shape: the bridge cached a belief about the world,
+  nothing refreshed it, and the dashboard reported the belief as fact.
+  - [cached WLED power state never resyncs](#done-2026-07-29-bugfix--the-bridges-cached-wled-power-state-never-resynced-after-a-device-reboot)
+    — the probe now feeds `_adopt_device_state()` in **both** directions; the
+    gate that hid the mirror case is gone.
+  - [stale lit cue after disconnect/power-off](#done-2026-07-29-bugfix--bridge-kept-a-stale-lit-cue-after-disconnectpower-off)
+    — labelled as held rather than reset, per the operator's ruling. No golden
+    digest moved.
+  - [/api/status omitted the power and settings blocks](#done-2026-07-29-bugfix--apistatus-omitted-the-power-and-settings-blocks)
+    — found while gathering the evidence the first item asks for; the documented
+    triage command could not work.
 
 - ~~Spotlights should pulse to the beat, not chase~~ — built 2026-07-29;
   [write-up](#done-2026-07-29-feature--spotlights-should-pulse-to-the-beat-not-chase).
@@ -537,7 +542,7 @@ it. Capture the evidence first.
 
 ---
 
-## OPEN `bugfix` — The bridge's cached WLED power state never resyncs after a device reboot
+## DONE 2026-07-29 `bugfix` — The bridge's cached WLED power state never resynced after a device reboot
 
 **Found:** 2026-07-28, immediately after the realtime-latch fix, when the
 rebooted controller came up `on: true` and stayed lit with the bridge idle.
@@ -593,11 +598,99 @@ not "assign the result inside the existing `if`". Dropping the gate also costs
 one extra `/json/state` request per 30 s, which is the same call
 `fetch_wifi_info` already makes unconditionally on that tick.
 
-**Evidence to get first** (this is what the rig is for, and it is cheap):
-compare the bridge's belief against the device's truth on the live container —
-`GET /api/status` (power block) versus `http://192.168.0.53/json/state`'s `on`.
-If they already disagree while the bridge is idle, that is the bug reproduced
-without having to stage anything.
+**Evidence attempted 2026-07-29, and it turned up a third bug.** The comparison
+this entry specifies — `GET /api/status` power block versus
+`http://192.168.0.53/json/state` — was **impossible to make**: `/api/status`
+omitted the power block entirely. See the `/api/status` entry below; it was
+fixed first, as its own commit, so this diagnostic works next time.
+
+Via the SSE stream instead: bridge `on: true` / device `on: true`, agreeing —
+but YARG was live at 91 pps, so the idle condition the bug needs was absent.
+Neither reproduced nor refuted. The fix does not depend on it, since the
+discarded-answer and missing-probe defects are both plain in the code.
+
+### What was built
+
+`_adopt_device_state(device_on)` on `WLEDPowerManager`, called at **all three**
+probe sites — startup, the enabled loop, and the `IDLE_TIMEOUT=0` loop — so
+startup and steady state cannot drift apart. The `not self._wled_on` gate is
+gone, which is what makes the mirror case visible at all.
+
+| | before | after |
+|---|---|---|
+| periodic probe | issued, answer discarded | adopted |
+| probe gate | `if not self._wled_on` | unconditional |
+| believed OFF / device ON | never corrected; strip stays lit | adopted, idle timer restarted |
+| believed ON / device OFF | never probed | adopted; `on_activity()` and `_check_dark_while_active()` both start working |
+| cost | — | +1 `/json/state` per 30 s |
+
+Adopting OFF repairs two downstream guards for free, without either being
+touched: `on_activity()` can now queue a power-on, so a song no longer starts
+against a dark strip, and `_check_dark_while_active()` stops returning early and
+can finally see the one case it was written for. That is worth noting as a
+pattern — the guard was not broken, it was starved of an accurate input.
+
+**Three ways this could have gone wrong, all guarded:**
+
+- `is_on()` returns `None` on a failed request. Unreachable is not an answer
+  about power; the last belief is kept rather than a value invented.
+- The probe blocks up to 3 s on HTTP, and `on_activity()` / `manual_power()` can
+  fire during that window. A result arriving while a command is pending is
+  discarded, or it would silently override the operator's (or YARG's) intent.
+- **The seeding trap.** Adopting ON seeds `_last_activity`, per the operator's
+  ruling, so the device gets a full idle timeout instead of being switched off
+  within one 5 s tick — turning the strip on deliberately from the WLED UI
+  should not be stomped. But the probe *repeats every 30 s*: seeding on every
+  adoption rather than only on the OFF→ON transition would push the deadline out
+  forever and the strip would never idle off at all — a worse version of the bug
+  being fixed. The seed sits after the `device_on == self._wled_on` early
+  return, so it runs once per divergence, not once per probe. There is a test
+  named for it.
+
+**Behaviour change to judge on the rig:** a bridge restart with the strip
+already on now leaves it lit for the full idle timeout (1800 s live), where
+before `_last_activity` was `0.0`, `elapsed` was enormous, and it went dark
+within ~5 s. That follows from the operator's chosen semantics applied
+consistently, but it is a change to a path that was not buggy.
+
+Every HTTP call stays on `asyncio.to_thread`; no task, thread or subprocess was
+added. This is the code path the PID-exhaustion bug lived in.
+
+**Tests:** `tests/test_status_truth.py` — adoption in both directions, the
+`None` case, the pending-command guard, the repeated-adoption seeding trap
+(asserts the strip still idles off rather than never), `_check_dark_while_active()`
+firing only once OFF is adopted, and both watchdog loops adopting.
+
+**Rollback:** restore the `if not self._wled_on:` gate around the probe and drop
+the `_adopt_device_state` calls; the initial one-shot probe is the pre-change
+behaviour.
+
+---
+
+## DONE 2026-07-29 `bugfix` — `/api/status` omitted the power and settings blocks
+
+**Found:** 2026-07-29, while trying to gather the evidence the WLED-power-resync
+entry above specifies. That entry names the diagnostic as "`GET /api/status`
+power block versus the device's `/json/state`" — and it could not be run,
+because the power block was not there.
+
+`/api/status` called `tracker.snapshot()` with **no arguments**, while
+`broadcast_loop()` passes `wled_power=` and `settings=`. So the `wled_power` and
+`settings` blocks existed only on the SSE stream at `/events`, and the REST
+endpoint — the scriptable one, the one a triage command or a monitoring check
+reaches for — was the single view that could not answer "what does the bridge
+believe about WLED power?".
+
+One dropped argument; `StatusServer` already held both objects. Fixed first and
+as its own commit so the diagnostic works next time.
+
+**The lesson is about the evidence step, not the line.** A documented triage
+command had never been run, so its being broken cost nothing until someone
+followed the instructions. Worth checking that the *evidence* path works before
+concluding anything from its silence — an empty answer from a broken probe looks
+exactly like an empty answer from a healthy system.
+
+**Test:** `test_api_status_includes_power_and_settings_blocks`.
 
 ---
 
@@ -1104,7 +1197,7 @@ code-level. Same shape as the spotlight rollback.
 
 ---
 
-## OPEN `bugfix` — Bridge keeps a stale lit cue after disconnect/power-off
+## DONE 2026-07-29 `bugfix` — Bridge kept a stale lit cue after disconnect/power-off
 
 **Found:** 2026-07-28 by the operator, watching the dashboard during the latency
 work: *"the bridge is still on a cue, even though the device is off and the
@@ -1161,6 +1254,62 @@ not sent — so nothing is reaching the strip either way.
 Not to be confused with the render thread continuing to tick: that is correct and
 should stay. The bug is only that the dashboard presents an unsent frame as
 output.
+
+### The operator ruled: label it
+
+Asked directly on 2026-07-29, and they chose **labelling**. So nothing about
+what the strip paints changed, and no golden digest moved — which was the
+check that this commit stayed in its lane. A reset remains available as its own
+decision if wanted; it is a lighting-behaviour change and should be judged as
+one.
+
+### What was built
+
+Two booleans on `StatusTracker`, deliberately **separate**, because they are
+different failures that occur independently — disconnected with WLED still on,
+and connected with WLED off, are both real states:
+
+| field | means | how it is derived | dashboard |
+|---|---|---|---|
+| `cue_held` | the cue shown is the last one *received* | computed live from `connected`/`test_active`, like `connected` itself | outlined `HELD` pill + "last cue received — sender gone" |
+| `output_live` | the last rendered frame actually left for the strip | the `ddp_sent` flag `on_render()` already received | strip preview greyed and captioned "not being sent" |
+
+Two details worth keeping:
+
+- `cue_held` is **computed, never cached**. Caching it would reproduce the exact
+  defect it describes. It mirrors the `connected` property, which the re-read of
+  this entry had already established was the one part of the status that was
+  correct — and correct *because* it is computed live.
+- `output_live` is ground truth, not an inference from power state: `ddp_sent` is
+  set on the very `wled_power.is_on` gate that decides the send
+  (`main.py:626`–`629`). It is additionally forced false when the render thread
+  has died, since a dead thread cannot update the flag and its last value would
+  otherwise be reported forever — the same staleness, one level up.
+
+`test_active` suppresses `cue_held`: a dashboard-driven test pattern is live
+output, not a leftover. `NO_CUE` is never reported as held, since there is
+nothing being held.
+
+The `HELD` pill is a separate element from the cue text, which matters: the
+existing JS only rewrites the cue text when `d.cue !== lastCue`, so folding the
+label into that string would have left it stale on exactly the transition it
+describes.
+
+A generic `.hidden { display: none }` rule was added — only `.pill.hidden`
+existed, so the new non-pill note element would not have hidden.
+
+**Verified** by rebuilding the operator's exact reported state
+(`connected=False cue=SCORE zones_raw=[136, 0, 0, 34]`): it now also carries
+`cue_held=True, output_live=False`.
+
+**Tests:** `tests/test_status_truth.py` — held true only when disconnected and
+not testing and a cue is latched, `output_live` following `ddp_sent`, the
+dead-render-thread case, and the two being independent. `tests/test_preview.py`'s
+two local `FakeRT` fakes gained `failed = False`, which the real `RenderThread`
+has always exposed.
+
+**Rollback:** drop the two properties from `snapshot()` and the pill/caption
+toggles; nothing else reads them.
 
 ---
 
