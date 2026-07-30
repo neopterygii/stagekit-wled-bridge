@@ -574,6 +574,31 @@ also seed `_last_activity` or the strip will be switched off within one watchdog
 tick of the bridge starting. Small, but it touches the code path the
 PID-exhaustion bug lived in, so it wants its own change and a look at the rig.
 
+**The mirror case, added 2026-07-29 while re-reading the code — do not fix only
+one direction.** The periodic probe is *gated* on `not self._wled_on`, so the
+opposite divergence is not merely uncorrected, it is never even looked for:
+
+- bridge believes **ON**, device actually **OFF** (someone used the WLED UI, or a
+  power blip) → no probe is ever issued, because the gate is false;
+- `on_activity()` (`main.py:223`) only sets `_power_on_pending` when
+  `not self._wled_on`, so **a song can start against a dark strip** and the
+  bridge will not try to power it on;
+- `_check_dark_while_active()` is the guard written for exactly that symptom, but
+  it returns early when `self._wled_on` is true (`main.py:203`) — so it cannot
+  see the one case it exists for. It catches a *failed* power-on, not a false
+  belief that power is already on.
+
+So the fix is "adopt the device's answer, both directions, unconditionally",
+not "assign the result inside the existing `if`". Dropping the gate also costs
+one extra `/json/state` request per 30 s, which is the same call
+`fetch_wifi_info` already makes unconditionally on that tick.
+
+**Evidence to get first** (this is what the rig is for, and it is cheap):
+compare the bridge's belief against the device's truth on the live container —
+`GET /api/status` (power block) versus `http://192.168.0.53/json/state`'s `on`.
+If they already disagree while the bridge is idle, that is the bug reproduced
+without having to stage anything.
+
 ---
 
 ## DONE 2026-07-29 `feature` — Spotlight cues light too narrow a slice of the strip
@@ -1104,6 +1129,38 @@ which is the one thing the dashboard exists to avoid.
 **The work:** reset cue/zone state (and the preview) when the connection drops
 or WLED is powered off, or mark the status explicitly as "holding last cue, not
 sending" so the dashboard cannot be read as live output.
+
+**Confirmed against the code 2026-07-29, and the two options are not equivalent —
+decide before building.**
+
+Mechanically: `_current_cue` is written only in `__init__` and `on_cue()`
+(`cue_engine.py:1365`), both on the packet path, so nothing off that path can
+reset it. `connected` is *not* part of the problem — it is computed live from
+`_last_packet_time` against `CONNECTED_TIMEOUT` (3.0 s, `status_server.py:110`)
+and is already correct. What is stale is `cue`/`zones`/preview, which
+`on_render()` (`status_server.py:130`) copies from the engine every frame.
+
+- **Reset the state.** Honest dashboard, and a later power-on starts clean rather
+  than resuming a stale frame. But holding the last cue through a brief gap is
+  *deliberate* — YARG sends at ~88 Hz and a blackout on one dropped datagram
+  would be much worse than a stale cue. So a reset needs its own timeout, which
+  means picking a second threshold distinct from `CONNECTED_TIMEOUT` and deciding
+  what "reset" paints (NO_CUE is a blackout; that is a visible behaviour change
+  on the strip, not just on the dashboard).
+- **Label it as held.** No change to rendered light at all — purely a status/UI
+  truth fix, so no golden digest can move and there is nothing to judge on the
+  rig. Strictly smaller, and it does not require inventing a threshold.
+
+**Recommendation: label it as held.** The reported complaint is that the
+dashboard contradicts the room, and labelling fixes exactly that without
+touching what the strip does. A reset is a lighting-behaviour change wearing a
+bug fix's clothes, and it should be its own decision if wanted. Note the
+render/DDP path is *already* gated correctly — the frame is produced and simply
+not sent — so nothing is reaching the strip either way.
+
+Not to be confused with the render thread continuing to tick: that is correct and
+should stay. The bug is only that the dashboard presents an unsent frame as
+output.
 
 ---
 
