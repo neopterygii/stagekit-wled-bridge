@@ -19,7 +19,7 @@ Item kind, which follows the status on each heading:
 Kind is about the work, not its importance: an `evidence` item can outrank a
 `bugfix`, and twice already has.
 
-## Next up (set 2026-07-29)
+## Next up (reset 2026-08-24 after the v5 break)
 
 **Deployment is not tracked here.** The operator updates the container template
 and judges changes on the rig on their own time; this backlog covers the work in
@@ -29,18 +29,31 @@ template" as a backlog step.
 
 In order:
 
-1. **W3 — lighting alignment trim** (`feature`). A persisted,
+1. **Version-proof the datagram parser** (`refactor`) — new, and first because
+   it is the only item here that has already taken the rig down mid-song, and
+   will do so again on the next YARG nightly that touches the layout.
+   [Write-up below](#open-refactor--the-datagram-parser-hardcodes-absolute-offsets-so-any-yarg-field-insertion-silently-renders-wrong-lighting).
+2. **W3 — lighting alignment trim** (`feature`). A persisted,
    dashboard-adjustable output delay in milliseconds plus a visible calibration
    pattern. Default **0 ms**: YARG emits venue events against
    `GameManager.SongTime`, which already models its own audio timing, so copying
    the in-game audio latency setting would double-compensate. Treat this as an
    additional trim for network, controller and display latency.
-2. **W4 — read-only state, optionally over MQTT** (`feature`).
-3. **W5 — WLED firmware qualification** (`ops`). The desync item is an argument
+3. **W4 — read-only state, optionally over MQTT** (`feature`).
+4. **W5 — WLED firmware qualification** (`ops`). The desync item is an argument
    *for* W5 but also a reason to gather evidence before it, since a firmware
    upgrade could mask the cause rather than fix it.
 
 ### Recently closed
+
+- ~~YARG v5 rendered the strip solid white~~ — found and fixed on the rig
+  2026-08-23/24. YARG PR #1605 inserted a `ushort` fog timer at offset 37, so
+  every field after it shifted two bytes and YARG's Beat byte landed under the
+  bridge's `bonus_effect` read. Its dequeue fallback is a non-zero `3`, so the
+  white bonus overlay re-armed at ~88 Hz and never decayed. `lighting_cue` sits
+  *before* the insertion, so the dashboard showed correct cues the whole time.
+  Parser now branches on the version byte. The structural follow-up is item 1
+  above — this fix makes v5 work, it does not make v6 safe.
 
 - ~~The two state bugs~~ — both built 2026-07-29 on one branch, as three
   commits. Same failure shape: the bridge cached a belief about the world,
@@ -88,6 +101,123 @@ In order:
 Blocking none of the above: the replay harness is **merged to `main`
 (2026-07-29)**, so anything here can lean on it — a recorded passage replayed
 before/after beats remembering last night's show.
+
+---
+
+## OPEN `refactor` — The datagram parser hardcodes absolute offsets, so any YARG field insertion silently renders wrong lighting
+
+**Found:** 2026-08-23, mid-session, by the operator — *"bridge appears to show
+correct cues, but the strip is just white solid."* Fixed for v5 the same night
+(`fix-yarg-datagram-v5`); this item is the structural follow-up.
+
+### Why the point fix is not enough
+
+v5 was the first non-append change YARG has ever made to the datagram, and it
+cost a live session. The shape of the failure is what matters here, not the two
+bytes:
+
+- The parser reads **absolute offsets**. One insertion upstream shifts every
+  field after it, and each shifted field lands under a *different, plausible*
+  meaning rather than becoming obviously garbage.
+- The mis-read field was `bonus_effect`, whose new occupant (YARG's `Beat`) has
+  a **non-zero dequeue fallback**, so it read `true` on every packet. A latched
+  boolean drove a white overlay that could never decay.
+- `lighting_cue` is at offset 34, **before** the insertion. So `/api/status`
+  reported correct cues, correct BPM, correct scene, and a healthy render thread
+  for the entire song. Every dashboard the operator had said "fine".
+
+That last point is the real lesson: **the dashboard cannot detect this class of
+bug, because the fields the dashboard is built from are the early ones.** The
+guard we already had — warn-once on an unknown version byte — did fire, in a
+container log nobody reads mid-song. It was correct and useless.
+
+### On "read by name instead of by byte"
+
+Worth stating plainly, because it shapes every option below: **names are not
+available on the wire.** YARG serialises with a bare C# `BinaryWriter` —
+`SerializeAndSend()` is a flat sequence of `_writer.Write(...)` calls with no
+tags, no field ids, no per-field lengths, and no trailing schema. A datagram is
+a version byte followed by positional bytes. There is nothing to look a name up
+by.
+
+So the names have to come from a schema **we** own, and the win is that offsets
+stop being written by hand and start being *derived*. That is achievable and is
+what option 1 does. What it cannot do is make us independent of upstream: if
+YARG inserts a field and we do not know, a name-driven parser reads the wrong
+bytes just as confidently as an offset-driven one. Naming fixes maintainability
+and reviewability. **Only option 2 fixes detection.** Both are worth doing, and
+it is worth not confusing one for the other.
+
+Note also that YALCY, YARG's own reference receiver, is no help as an oracle: it
+hardcodes the same offsets (`UdpIntake.Enums.cs`, `ByteIndexName.StrobeState =
+37`) and its newest known version is still `DatagramVersionByte.PlayerStarPower
+= 4`. It is broken by v5 in exactly the way we were. It does, however, read
+**sequentially** through a `BinaryReader` with named members and version gates
+(`if (DatagramVersion.Value >= …)`), which is a reasonable model for option 1.
+
+### Options
+
+1. **Declarative per-version field schema** (`refactor`, the core of the item).
+   One table of `(name, struct format, since=, until=)`; offsets computed by
+   walking it for a given version. `parse_packet` becomes a loop over the
+   schema, and adding v6 is a one-line data change instead of surgery across
+   `parse_packet`, `test_sender.build_packet`, and the offset comments on the
+   four camera/performer enum classes — all of which had to be edited by hand
+   for v5, and any of which could have been missed. Should also emit the layout for a version so a
+   test can assert the full offset map rather than a handful of spot checks.
+
+2. **Diff our schema against YARG's source in CI** (`refactor`, highest value
+   per effort — this is the one that changes *when* we find out).
+   `SerializeAndSend()` is a linear, machine-parseable sequence of
+   `_writer.Write(...)` calls. A CI job fetches `DataStreamController.cs` from
+   `dev`, extracts the write order and `DATAGRAM_VERSION`, and fails the build
+   when it disagrees with our schema. This turns "the operator finds it mid-song
+   and the strip is white" into "the build goes red the morning after upstream
+   merges". Cheap, because the vendored `YARG/` clone already tracks `dev`.
+   Needs a real answer for CI reaching GitHub, and for upstream reformatting the
+   method in a way the extractor cannot read — it should fail loudly rather than
+   silently pass.
+
+3. **Blast-radius guard: edge-gate the held-boolean inputs** (`bugfix`, small,
+   independent of the rest). `main.py` still does
+   `if pkt.bonus_effect: self.engine.on_bonus()` with no rising-edge check, so a
+   stuck-true input re-arms the burst every packet. YARG's current fallback for
+   `BonusEffect` is `false`, so this is harmless *today* — it was harmless before
+   v5 too. Gate it, and audit the other one-shot inputs for the same shape. This
+   does not prevent a misparse; it bounds one to "lighting looks wrong" instead
+   of "strip is a flashlight". Worth doing on its own merits regardless of 1/2.
+
+4. **Runtime plausibility auto-detect** (`feature`, **parked, do not start
+   here**). Validate a parsed packet against known-value sets (`scene` 0-4,
+   `paused` 0-2, `strobe` ∈ {0, 20-24}, `cue` ≤ 32); on an unknown version, try
+   each known layout and pick whichever validates. Self-heals against both
+   appends and shifts. Parked because its failure mode is a *silent wrong
+   guess* — several layouts can validate at once on a quiet packet, exactly the
+   menu/score-screen case where most bytes are zero. If built, it must log which
+   layout it chose, loudly and once, and never be the only signal.
+
+**Recommended:** 3 first (an afternoon, bounds the damage), then 1, then 2.
+Doing 1 without 2 leaves us reading the wrong bytes confidently; doing 2 without
+1 means CI tells us to go do the hand-surgery again.
+
+### Acceptance
+
+- Adding a hypothetical v6 field is a data change, with a test that asserts the
+  full v6 offset map, and no edits to parsing logic.
+- CI fails when the vendored `YARG/dev` clone's `SerializeAndSend()` field order
+  or `DATAGRAM_VERSION` no longer matches our schema.
+- A stuck-true one-shot input cannot pin a mapper layer on.
+- The v1/v3/v4/v5 golden digests are unchanged by the refactor — this is a
+  behaviour-preserving change, and the digests are how we prove it.
+
+### Evidence kept
+
+`/data/captures/20260823-235332-v5-layout-diagnosis.jsonl` on Tower — 364 real
+v5 datagrams from the session that broke. Taken with the bridge's own capture
+endpoint (`POST /api/capture` on 36180, `{"action":"start"}` then
+`{"action":"stop"}`, written to the appdata bind mount). Decoding real bytes
+settled the layout in one step and is the fastest way to answer the next one —
+faster than reading upstream source, and it cannot be wrong about what arrived.
 
 ---
 
