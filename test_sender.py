@@ -35,23 +35,36 @@ def build_packet(
     camera_subject: int = 0,
     camera_priority: int = 0,
     star_power: list | None = None,
+    fog_remaining_cs: int | None = None,
 ) -> bytes:
     """Build a valid YARG UDP packet.
 
     Emits a v3 (47-byte) packet by default. When *star_power* is given (a list
     of (amount_byte 0-255, is_active bool) per player) a v4 packet is built:
     the base 49 bytes plus 2 bytes per player.
+
+    When *fog_remaining_cs* is given a v5 packet is built instead: YARG PR
+    #1605 inserts that ushort fog countdown at offset 37, shifting StrobeState
+    and everything after it 2 bytes later. v5 always carries the star-power
+    tail, so passing it without *star_power* yields a 51-byte, zero-player
+    packet — the shape YARG actually sends with no players in overdrive.
     """
-    v4 = star_power is not None
+    v5 = fog_remaining_cs is not None
+    v4 = star_power is not None or v5
     players = star_power or []
-    size = 49 + 2 * len(players) if v4 else 47
+    if v5:
+        size = 51 + 2 * len(players)
+    elif v4:
+        size = 49 + 2 * len(players)
+    else:
+        size = 47
     buf = bytearray(size)
 
     # Header (little-endian, matching C# BinaryWriter)
     struct.pack_into("<I", buf, 0, YARG_HEADER)
 
     # Version, platform
-    buf[4] = 4 if v4 else 3   # datagram version
+    buf[4] = 5 if v5 else (4 if v4 else 3)   # datagram version
     buf[5] = 1   # platform (Windows)
 
     # Scene, pause, venue
@@ -79,23 +92,33 @@ def build_packet(
     buf[34] = cue
     buf[35] = 0  # post processing
     buf[36] = 0  # fog
-    buf[37] = strobe
-    buf[38] = beat
-    buf[39] = keyframe
-    buf[40] = 0  # bonus
-    buf[41] = 0  # autogen
-    buf[42] = 0  # spotlight
-    buf[43] = 0  # singalong
+    # v5+ inserts the ushort fog countdown at 37; everything below is placed
+    # relative to `tail` so one code path emits both layouts.
+    if v5:
+        struct.pack_into("<H", buf, 37, fog_remaining_cs)
+        tail = 39
+    else:
+        tail = 37
 
-    # Camera (v3, offsets 44-46)
-    buf[44] = 0                 # camera constraint
-    buf[45] = camera_priority   # camera priority
-    buf[46] = camera_subject    # camera subject
+    buf[tail] = strobe
+    buf[tail + 1] = beat
+    buf[tail + 2] = keyframe
+    buf[tail + 3] = 0  # bonus
+    buf[tail + 4] = 0  # autogen
+    buf[tail + 5] = 0  # spotlight
+    buf[tail + 6] = 0  # singalong
 
-    # Star power (v4, offset 47+): uint16 count then <amount, is_active> pairs
+    # Camera (v3; offsets 44-46 on v3/v4, 46-48 on v5)
+    cam = tail + 7
+    buf[cam] = 0                 # camera constraint
+    buf[cam + 1] = camera_priority
+    buf[cam + 2] = camera_subject
+
+    # Star power (v4+): uint16 count then <amount, is_active> pairs
     if v4:
-        struct.pack_into("<H", buf, 47, len(players))
-        off = 49
+        sp_count_off = cam + 3
+        struct.pack_into("<H", buf, sp_count_off, len(players))
+        off = sp_count_off + 2
         for amount, is_active in players:
             buf[off] = amount & 0xFF
             buf[off + 1] = 1 if is_active else 0

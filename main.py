@@ -73,18 +73,21 @@ class YARGProtocol(asyncio.DatagramProtocol):
 
         self.tracker.on_packet()
 
-        # Datagram-version guard. parse_packet reads a fixed offset layout;
-        # that layout has been stable across every YARG version (append-only),
-        # so an unknown version still parses but *might* have shifted a field
-        # we read. Warn once per unseen version — this runs ~88x/s, so the set
-        # keeps it to a single line — and keep rendering rather than going dark.
+        # Datagram-version guard. parse_packet knows one layout per version
+        # range; an unknown version parses at the newest known offsets, but
+        # *might* have shifted a field we read — as v5 did, inserting a fog
+        # timer at offset 37 and silently turning the beat byte into a
+        # permanently-true bonus flag (solid white strip). Warn once per unseen
+        # version — this runs ~88x/s, so the set keeps it to a single line —
+        # and keep rendering rather than going dark.
         ver = pkt.datagram_version
         if ver not in KNOWN_DATAGRAM_VERSIONS and ver not in self._warned_versions:
             self._warned_versions.add(ver)
             log.warning(
                 "YARG datagram version %d is unrecognised (known: %s) — parsing "
-                "lighting fields at their v1-v4 offsets, which may be wrong if "
-                "the layout changed; re-check DataStreamController.cs",
+                "lighting fields at the newest known layout's offsets, which may "
+                "be wrong if the layout changed again; re-check "
+                "DataStreamController.cs",
                 ver, sorted(KNOWN_DATAGRAM_VERSIONS),
             )
         self.wled_power.on_activity()

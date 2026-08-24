@@ -1,8 +1,8 @@
-"""Parser tests for the YARG datagram — v1/v3/v4 layouts + malformed guards.
+"""Parser tests for the YARG datagram — v1/v3/v4/v5 layouts + malformed guards.
 
 Parsing offsets are the one thing that silently renders wrong lighting, so
 these assert the exact byte layout confirmed against YARG's
-DataStreamController.cs (v4 builder) and lock in the length-guarded v3/v4 reads.
+DataStreamController.cs and lock in the length-guarded v3/v4/v5 reads.
 
 Run: python -m pytest tests/ -v   (or: python -m pytest tests/test_yarg_packet.py)
 """
@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from protocol.yarg_packet import (  # noqa: E402
     parse_packet, YARGPacket, PACKET_HEADER, MIN_PACKET_SIZE,
-    CameraCutSubject,
+    CameraCutSubject, KNOWN_DATAGRAM_VERSIONS, FOG_TIMER_VERSION,
+    CueByte, BeatByte, StrobeSpeed,
 )
 
 
@@ -164,6 +165,134 @@ def test_truncated_between_camera_and_starpower():
     assert pkt is not None
     assert pkt.camera_cut_subject == 7
     assert pkt.sp_player_count == 0          # count needs offset 47-48
+
+
+
+# ── v5: FogRemainingCentiseconds inserted at offset 37 ─────────────
+#
+# YARG PR #1605 ("Added fog timer and changed all bytes to a queue") is the
+# first datagram change that is not append-only. Reading a v5 packet at v4
+# offsets is not a subtle degradation: YARG's Beat byte falls under the
+# bridge's `bonus_effect` read, and its dequeue fallback is a *non-zero* 3
+# (DataStreamController: `DequeueByteValue(_beatQueue, (byte) 3)`), so
+# bonus_effect latches true on every frame and the mapper's white bonus
+# overlay pins the whole strip to solid white. These tests pin the offsets.
+
+def _v5_packet(**kw) -> bytes:
+    from test_sender import build_packet
+    kw.setdefault("fog_remaining_cs", 0)
+    return build_packet(**kw)
+
+
+def test_v5_is_a_known_version():
+    assert FOG_TIMER_VERSION == 5
+    assert 5 in KNOWN_DATAGRAM_VERSIONS
+
+
+def test_v5_shifts_every_field_after_fog_by_two():
+    raw = _v5_packet(cue=CueByte.SEARCHLIGHTS, strobe=StrobeSpeed.MEDIUM,
+                     beat=BeatByte.STRONG, keyframe=28, fog_remaining_cs=1234,
+                     camera_subject=11, camera_priority=1)
+    pkt = parse_packet(raw)
+    assert pkt is not None
+    assert pkt.datagram_version == 5
+    # Unmoved: everything up to and including FogState at 36.
+    assert pkt.lighting_cue == CueByte.SEARCHLIGHTS
+    assert pkt.fog_state is False
+    # New field, then the shifted tail.
+    assert pkt.fog_remaining_cs == 1234
+    assert pkt.strobe_state == StrobeSpeed.MEDIUM
+    assert pkt.beat == BeatByte.STRONG
+    assert pkt.keyframe == 28
+    assert pkt.bonus_effect is False
+    assert pkt.camera_cut_subject == 11
+    assert pkt.camera_cut_priority == 1
+
+
+def test_v5_beat_byte_does_not_leak_into_bonus_effect():
+    """The exact regression: a held Beat=3 must not read as a bonus burst."""
+    pkt = parse_packet(_v5_packet(cue=CueByte.SCORE, beat=BeatByte.WEAK))
+    assert pkt is not None
+    assert pkt.beat == BeatByte.WEAK
+    assert pkt.bonus_effect is False
+
+
+def test_v5_star_power_tail_is_two_bytes_later():
+    raw = _v5_packet(fog_remaining_cs=50, star_power=[(255, True), (128, False)])
+    pkt = parse_packet(raw)
+    assert pkt is not None
+    assert pkt.sp_player_count == 2
+    assert pkt.star_power == [(255, True), (128, False)]
+    assert pkt.sp_active_count == 1
+    assert pkt.sp_active is True
+
+
+def test_v5_and_v4_are_told_apart_by_version_not_length():
+    """A v4 packet with one player and a v5 packet with none are both 51 bytes."""
+    from test_sender import build_packet
+    v4_raw = build_packet(strobe=StrobeSpeed.FAST, star_power=[(10, False)])
+    v5_raw = build_packet(strobe=StrobeSpeed.FAST, fog_remaining_cs=0)
+    assert len(v4_raw) == len(v5_raw) == 51
+    assert parse_packet(v4_raw).strobe_state == StrobeSpeed.FAST
+    assert parse_packet(v5_raw).strobe_state == StrobeSpeed.FAST
+
+
+def test_v4_layout_is_unchanged_by_the_v5_branch():
+    from test_sender import build_packet
+    pkt = parse_packet(build_packet(cue=CueByte.FRENZY, strobe=StrobeSpeed.SLOW,
+                                    beat=BeatByte.MEASURE, camera_subject=20,
+                                    star_power=[(64, True)]))
+    assert pkt is not None
+    assert pkt.datagram_version == 4
+    assert pkt.fog_remaining_cs == 0          # field absent on v4
+    assert pkt.strobe_state == StrobeSpeed.SLOW
+    assert pkt.beat == BeatByte.MEASURE
+    assert pkt.camera_cut_subject == 20
+    assert pkt.star_power == [(64, True)]
+
+
+def test_unknown_future_version_parses_at_v5_offsets():
+    """Versions past the newest known fall back to the newest known layout."""
+    raw = bytearray(_v5_packet(strobe=StrobeSpeed.FASTEST, fog_remaining_cs=7))
+    raw[4] = 99
+    pkt = parse_packet(bytes(raw))
+    assert pkt is not None
+    assert pkt.strobe_state == StrobeSpeed.FASTEST
+    assert pkt.fog_remaining_cs == 7
+
+
+def test_truncated_v5_degrades_instead_of_raising():
+    for size in range(MIN_PACKET_SIZE, 51):
+        raw = bytearray(_v5_packet(cue=CueByte.STOMP, fog_remaining_cs=999))[:size]
+        pkt = parse_packet(bytes(raw))
+        assert pkt is not None, f"{size}-byte v5 packet returned None"
+        assert pkt.lighting_cue == CueByte.STOMP   # valid below the cut
+        assert pkt.sp_player_count == 0
+
+
+def test_live_capture_packet_from_yarg_nightly():
+    """Byte-for-byte v5 datagram captured off the wire on 2026-08-23.
+
+    Score screen: cue=SCORE(31), StrobeOff(24) at offset 39, Beat fallback 3
+    at 40, camera subject AllFar(3) at 48, zero star-power players.
+    """
+    raw = bytes([
+        0x47, 0x52, 0x41, 0x59, 5, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        31, 0, 0, 0, 0, 24, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0,
+    ])
+    assert len(raw) == 51
+    pkt = parse_packet(raw)
+    assert pkt is not None
+    assert pkt.datagram_version == 5
+    assert pkt.lighting_cue == CueByte.SCORE
+    assert pkt.fog_state is False
+    assert pkt.fog_remaining_cs == 0
+    assert pkt.strobe_state == StrobeSpeed.OFF     # 24, not 0
+    assert pkt.beat == 3
+    assert pkt.bonus_effect is False               # the solid-white regression
+    assert pkt.camera_cut_subject == 3
+    assert pkt.sp_player_count == 0
 
 
 if __name__ == "__main__":

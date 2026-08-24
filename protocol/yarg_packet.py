@@ -11,18 +11,28 @@ from dataclasses import dataclass, field
 PACKET_HEADER = 0x59415247  # "YARG"
 MIN_PACKET_SIZE = 44
 
-# Datagram versions whose first-44-byte layout this parser has been verified
-# against in YARG's DataStreamController.cs. The bridge only reads offsets
-# 0-43, and every version YARG has shipped keeps those identical and appends
-# newer fields beyond them:
+# Datagram versions whose layout this parser has been verified against in
+# YARG's DataStreamController.cs:
 #   1 = v0.14.0
 #   3 = v0.15.0            (+3 camera-cut bytes)
 #   4 = nightly (dev)      (+ushort count, then variable-length star-power)
-# A version outside this set means the layout *may* have shifted under the
-# fields we read. parse_packet still parses at these offsets (best effort);
-# the caller warns so it gets re-verified against upstream rather than
-# silently rendering wrong lighting. See memory: yarg-datagram-version.
-KNOWN_DATAGRAM_VERSIONS = frozenset({1, 3, 4})
+#   5 = nightly (dev)      (+ushort FogRemainingCentiseconds INSERTED at 37)
+#
+# v1-v4 were purely append-only, so offsets 0-43 were identical across them.
+# v5 (YARG PR #1605, "Added fog timer and changed all bytes to a queue") is
+# the first version to insert a field mid-packet: a ushort fog countdown
+# between FogState and StrobeState, shifting every later field by 2. So
+# parse_packet branches on the version byte for everything past offset 36.
+#
+# A version outside this set means the layout *may* have shifted again under
+# the fields we read. parse_packet still parses at the newest known offsets
+# (best effort); the caller warns so it gets re-verified against upstream
+# rather than silently rendering wrong lighting.
+# See memory: yarg-datagram-version.
+KNOWN_DATAGRAM_VERSIONS = frozenset({1, 3, 4, 5})
+
+# First datagram version carrying FogRemainingCentiseconds at offset 37.
+FOG_TIMER_VERSION = 5
 
 
 @dataclass
@@ -51,6 +61,10 @@ class YARGPacket:
     lighting_cue: int = 0
     post_processing: int = 0
     fog_state: bool = False
+    # v5+ only (offset 37, ushort): centiseconds left on YARG's fog timer, so
+    # a receiver can size fogger on/off times to the room. Parsed but not yet
+    # used for lighting; stays 0 on v1-v4, which have no such field.
+    fog_remaining_cs: int = 0
     strobe_state: int = 0
     beat: int = 0
     keyframe: int = 0
@@ -58,12 +72,14 @@ class YARGPacket:
     auto_gen: bool = False
     spotlight: int = 0
     singalong: int = 0
-    # Camera cut (v3, offsets 44-46). Parsed but not yet used for lighting —
+    # Camera cut (v3; offsets 44-46 on v1-v4, 46-48 on v5+). Parsed but not
+    # yet used for lighting —
     # surfaced on the status page.
     camera_cut_constraint: int = 0
     camera_cut_priority: int = 0
     camera_cut_subject: int = 0
-    # Star power (v4, offset 47+). Per-player on the wire; the single strip has
+    # Star power (v4; count at offset 47 on v1-v4, 49 on v5+). Per-player on
+    # the wire; the single strip has
     # no per-player geometry, so we keep aggregates for the surge overlay plus
     # the raw list for the status page / tests.
     sp_player_count: int = 0
@@ -143,7 +159,7 @@ class StrobeSpeed:
 
 
 class Performer:
-    """Spotlight/Singalong performer bitmask (offsets 42, 43)."""
+    """Spotlight/Singalong performer bitmask (42/43 on v1-v4, 44/45 on v5+)."""
     NONE = 0
     GUITAR = 1
     BASS = 2
@@ -235,13 +251,13 @@ class SongSectionByte:
 
 
 class CameraCutPriority:
-    """Camera-cut priority (offset 45)."""
+    """Camera-cut priority (offset 45 on v1-v4, 47 on v5+)."""
     NORMAL = 0
     DIRECTED = 1
 
 
 class CameraCutConstraint:
-    """Camera-cut constraint flags (offset 44)."""
+    """Camera-cut constraint flags (offset 44 on v1-v4, 46 on v5+)."""
     NONE = 0
     ONLY_CLOSE = 1
     ONLY_FAR = 2
@@ -250,7 +266,7 @@ class CameraCutConstraint:
 
 
 class CameraCutSubject:
-    """Camera-cut subject (offset 46). Values match YARG.Core / YALCY.
+    """Camera-cut subject (offset 46 on v1-v4, 48 on v5+). Matches YARG.Core / YALCY.
 
     NAMES gives a display label for the status page; unknown values fall back
     to the numeric id via NAMES.get(v, str(v)).
@@ -308,38 +324,53 @@ def parse_packet(data: bytes) -> YARGPacket | None:
     pkt.lighting_cue = data[34]
     pkt.post_processing = data[35]
     pkt.fog_state = bool(data[36])
-    pkt.strobe_state = data[37]
-    pkt.beat = data[38]
-    pkt.keyframe = data[39]
-    pkt.bonus_effect = bool(data[40])
-    pkt.auto_gen = bool(data[41])
-    pkt.spotlight = data[42]
-    pkt.singalong = data[43]
 
-    # ── v3+: camera cut (offsets 44-46) ─────────────────────────
-    # Parsed by length, not version. YARG's datagram is append-only, so these
-    # live at fixed offsets whenever the packet is long enough to hold them —
-    # more robust than branching on the version byte (which we only warn on).
-    if len(data) >= 47:
-        pkt.camera_cut_constraint = data[44]
-        pkt.camera_cut_priority = data[45]
-        pkt.camera_cut_subject = data[46]
+    # ── v5+: fog timer inserted at offset 37 ─────────────────────
+    # Branch on the version byte, NOT on length: a v4 packet carrying one
+    # star-power player is 51 bytes, exactly like a v5 packet carrying none,
+    # so length cannot tell the two layouts apart. Everything from StrobeState
+    # on is addressed relative to `tail`, so both layouts share one code path.
+    if pkt.datagram_version >= FOG_TIMER_VERSION:
+        if len(data) < 46:
+            return pkt  # truncated v5; cue/post/fog above are still valid
+        pkt.fog_remaining_cs = struct.unpack_from("<H", data, 37)[0]
+        tail = 39
+    else:
+        tail = 37
+
+    pkt.strobe_state = data[tail]
+    pkt.beat = data[tail + 1]
+    pkt.keyframe = data[tail + 2]
+    pkt.bonus_effect = bool(data[tail + 3])
+    pkt.auto_gen = bool(data[tail + 4])
+    pkt.spotlight = data[tail + 5]
+    pkt.singalong = data[tail + 6]
+
+    # ── v3+: camera cut (tail+7..tail+9 — 44-46 on v1-v4) ───────
+    # Still length-guarded so a short packet degrades instead of raising.
+    cam = tail + 7
+    if len(data) >= cam + 3:
+        pkt.camera_cut_constraint = data[cam]
+        pkt.camera_cut_priority = data[cam + 1]
+        pkt.camera_cut_subject = data[cam + 2]
 
     # ── v4+: per-player star power ──────────────────────────────
-    # uint16 count at offset 47, then <Amount:byte, IsActive:byte> pairs at 49.
-    # Length-guarded: a truncated or garbage count never reads past the buffer
-    # (clamp to the pairs actually present) so a malformed packet degrades to
-    # "no star power" instead of crashing the UDP handler.
-    if len(data) >= 49:
-        count = struct.unpack_from("<H", data, 47)[0]
-        avail = (len(data) - 49) // 2
+    # uint16 count at cam+3 (47 on v1-v4), then <Amount:byte, IsActive:byte>
+    # pairs after it. Length-guarded: a truncated or garbage count never reads
+    # past the buffer (clamp to the pairs actually present) so a malformed
+    # packet degrades to "no star power" instead of crashing the UDP handler.
+    sp_count_off = cam + 3
+    if len(data) >= sp_count_off + 2:
+        count = struct.unpack_from("<H", data, sp_count_off)[0]
+        first = sp_count_off + 2
+        avail = (len(data) - first) // 2
         n = count if count <= avail else avail
         pkt.sp_player_count = n
         players = []
         max_all = 0
         max_active = 0
         active_count = 0
-        off = 49
+        off = first
         for _ in range(n):
             amount = data[off]
             is_active = data[off + 1] != 0

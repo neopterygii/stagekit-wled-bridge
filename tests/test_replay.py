@@ -192,7 +192,11 @@ GOLDEN_DIGESTS = {
     "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "auto_generated_venue": "7b8694b58d408588e5546ff5383a126ccab25aff54555c420d79354ea743a926",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "9ebb75cbffba65926e5d0014a178b23698547b72430dc2c5f15f976da71617ec",
+    # Moved 2026-08-23 when the parser learned YARG's v5 layout: this fixture's
+    # "future/unknown version" packet (version byte 99) now parses at the v5
+    # offsets rather than v4's, so its tail bytes land differently. The only
+    # fixture that moved — the other layouts are byte-identical to before.
+    "malformed_stream": "430da77faab9069b409f7bb2706a5bb6069250fe00c8805f0d29b83ca0966364",
     "rapid_cue_changes": "13ae859d67fe02b0cf2f0578bccc5e64dac7a4a986c4fb13fc65a42d36d9afca",
     "repeated_beats": "fe551d135dccdf5a8450f85923020b6a33f7b25f19fe0872b44d30387482b86f",
     "song_lifecycle": "8c1defed9da772e4bb5c3a65320f113f68049d2cca308ec981ee58c0319238b3",
@@ -240,7 +244,7 @@ PRE_FADE_DIGESTS = {
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
     "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "8785effc58018a022b897f9f06ad37a9adba57f49f0d6fdd930075f9b46006d9",
+    "malformed_stream": "01ae1e7dbb2024cb39dbf4faef0085ad0c6f15e09206940f3d66d250de401cea",
     # No history — this fixture arrived with the fade change. It is what the
     # rollback renders today, kept for coverage, not as a pre-change capture.
     "rapid_cue_changes": "d05280b1f20322ffb45a485ea9b6958b5202af64221855da7d0caad3e4e6a184",
@@ -291,7 +295,7 @@ PRE_STRICTNESS_DIGESTS = {
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
     "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "8785effc58018a022b897f9f06ad37a9adba57f49f0d6fdd930075f9b46006d9",
+    "malformed_stream": "01ae1e7dbb2024cb39dbf4faef0085ad0c6f15e09206940f3d66d250de401cea",
     "rapid_cue_changes": "af9891dad3b1d53ec33e97b99675f061c725ea9640c996256e6b90cf93ff82c0",
     "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
     "song_lifecycle": "e9e757da80439ab659f573ce7b25a90f9feb7dbb5957e8d8bf2b7a06a97c5c76",
