@@ -311,6 +311,36 @@ EFFECT_TOGGLES = {
     },
 }
 
+# ── Idle look ──────────────────────────────────────────────────────
+# What an owned strip shows once YARG stops feeding the bridge. The bridge
+# stops sending DDP and hands WLED a look to run standalone, so "no DDP" is a
+# defined state on the strip instead of whatever it was last left on.
+#
+# Three modes, all of them defined:
+#   "preset"  WLED renders the effect/palette/colour below on its own;
+#   "black"   same push with the look forced to an unlit solid — the strip
+#             stays powered and owned, it just shows nothing;
+#   "off"     skip the idle stage and power down at the grace period instead
+#             of waiting out the full idle timeout.
+#
+# `grace_seconds` is how long a gap in the YARG stream is tolerated before the
+# held cue gives way to the idle look. It exists because YARG sends at ~88 Hz
+# and a couple of dropped datagrams must not drop the stage look mid-song; it
+# is not the idle *timeout*, which powers the strip off much later.
+IDLE_MODES = ("preset", "black", "off")
+IDLE_GRACE_MAX = 300
+
+DEFAULT_IDLE = {
+    "mode": "preset",
+    "grace_seconds": 15,
+    "effect": 2,            # Breathe — slow, unobtrusive, present on every build
+    "palette": 0,           # Default (uses the segment colour below)
+    "color": [255, 160, 0],
+    "brightness": 40,       # dim: this runs unattended between songs
+    "speed": 40,            # slow
+    "intensity": 128,
+}
+
 DEFAULT_SETTINGS = {
     "brightness": GLOBAL_BRIGHTNESS,
     "palette": "default",
@@ -339,7 +369,37 @@ DEFAULT_SETTINGS = {
     "cue_fade_ms": 120,
     # Each toggle defaults on unless its registry row opts out with default:False.
     "effects": {tid: meta.get("default", True) for tid, meta in EFFECT_TOGGLES.items()},
+    # What the strip shows when the bridge owns it but is not sending frames.
+    "idle": dict(DEFAULT_IDLE),
 }
+
+
+def _clean_idle(raw: dict, base: dict) -> dict:
+    """Validate an idle-look document field by field, against `base`.
+
+    Every field is bounds-checked independently and a bad one falls back to the
+    current value rather than rejecting the whole document: this block is
+    edited by the dashboard a field at a time, and one out-of-range effect id
+    should not silently revert the operator's colour too.
+
+    Effect and palette ids are only range-checked, not checked against the
+    device's actual lists — the firmware can be reflashed under a stored
+    settings file, and WLED itself clamps an id it does not have.
+    """
+    out = dict(base)
+    if raw.get("mode") in IDLE_MODES:
+        out["mode"] = raw["mode"]
+    if isinstance(raw.get("grace_seconds"), (int, float)):
+        out["grace_seconds"] = max(0, min(IDLE_GRACE_MAX, int(raw["grace_seconds"])))
+    for key, hi in (("effect", 255), ("palette", 255),
+                    ("brightness", 255), ("speed", 255), ("intensity", 255)):
+        if isinstance(raw.get(key), (int, float)):
+            out[key] = max(0, min(hi, int(raw[key])))
+    colour = raw.get("color")
+    if (isinstance(colour, (list, tuple)) and len(colour) == 3
+            and all(isinstance(c, (int, float)) for c in colour)):
+        out["color"] = [max(0, min(255, int(c))) for c in colour]
+    return out
 
 
 class BridgeSettings:
@@ -360,6 +420,7 @@ class BridgeSettings:
         # Deep-copy the nested effects dict so instances (and the module-level
         # DEFAULT_SETTINGS) don't share one mutable object.
         self._data["effects"] = dict(DEFAULT_SETTINGS["effects"])
+        self._data["idle"] = dict(DEFAULT_SETTINGS["idle"])
         self._writable = self._probe_writable()
         # Replay and tests deliberately point at an unwritable path to get
         # in-code defaults; there the warning is noise telling them to mount a
@@ -407,6 +468,9 @@ class BridgeSettings:
             self._data["palette_strictness"] = max(0.0, min(1.0, float(stored["palette_strictness"])))
         if isinstance(stored.get("cue_fade_ms"), (int, float)):
             self._data["cue_fade_ms"] = max(0, min(CUE_FADE_MS_MAX, int(stored["cue_fade_ms"])))
+        stored_idle = stored.get("idle")
+        if isinstance(stored_idle, dict):
+            self._data["idle"] = _clean_idle(stored_idle, self._data["idle"])
         stored_effects = stored.get("effects")
         if isinstance(stored_effects, dict):
             for tid in EFFECT_TOGGLES:
@@ -607,6 +671,24 @@ class BridgeSettings:
                 effects[meta["key"]] = meta["off"]
         return effects
 
+    @property
+    def idle(self) -> dict:
+        """The idle-look spec, as a copy the caller may hold across frames."""
+        with self._lock:
+            return dict(self._data["idle"])
+
+    @property
+    def idle_grace_seconds(self) -> int:
+        with self._lock:
+            return int(self._data["idle"]["grace_seconds"])
+
+    def update_idle(self, raw: dict) -> dict:
+        """Merge a partial idle-look document in. Returns the result."""
+        with self._lock:
+            self._data["idle"] = _clean_idle(raw, self._data["idle"])
+            self._save()
+            return dict(self._data["idle"])
+
     def snapshot(self) -> dict:
         """Return current settings for the status page."""
         with self._lock:
@@ -626,6 +708,8 @@ class BridgeSettings:
                 "cue_fade_ms": self._data["cue_fade_ms"],
                 "cue_fade_ms_max": CUE_FADE_MS_MAX,
                 "effects": dict(self._data["effects"]),
+                "idle": dict(self._data["idle"]),
+                "idle_modes": list(IDLE_MODES),
                 "effect_toggles": {
                     tid: {"label": m["label"], "description": m["description"]}
                     for tid, m in EFFECT_TOGGLES.items()
