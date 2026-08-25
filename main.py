@@ -32,7 +32,7 @@ from effects.cue_engine import CueEngine
 from effects.mapper import LEDMapper, MAPPED_REGION, PREVIEW_CELLS
 from effects.palette_map import build_ring
 from status_server import StatusTracker, StatusServer
-from settings import BridgeSettings
+from settings import BridgeSettings, DEFAULT_IDLE
 from replay.controller import CaptureController
 
 log = logging.getLogger(__name__)
@@ -180,38 +180,134 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.tracker.on_star_power(pkt.sp_active, pkt.sp_charge, pkt.sp_active_count)
 
 
-class WLEDPowerManager:
-    """Manages WLED power state based on YARG activity."""
+class DeviceMode:
+    """How the bridge is currently driving the strip it owns.
 
-    def __init__(self, wled_api: WLEDApi, idle_timeout: int):
+    Plain strings rather than an Enum: this value is read from the render
+    thread and serialised straight into the status JSON, and both want a string.
+    """
+
+    OFF = "off"     # powered down — nothing rendered, nothing sent
+    IDLE = "idle"   # powered and owned, running the WLED-native idle look
+    LIVE = "live"   # baseline asserted, DDP frames flowing
+
+
+class WLEDPowerManager:
+    """Owns the strip: its power, its mode, and the state it is left in.
+
+    The bridge treats every strip it drives as owned, which means there is no
+    moment when the strip's appearance is undefined. Three modes cover the
+    whole lifetime, and every one of them is a *defined* state:
+
+      LIVE   YARG (or a test pattern) is feeding us. The device baseline is
+             asserted and the render thread's DDP frames own every pixel.
+      IDLE   The stream has been quiet for longer than the operator's grace
+             period. DDP stops and WLED runs the idle look on its own, so
+             "the bridge is not sending" has a defined appearance instead of
+             leaving whatever the last cue painted frozen on the strip for the
+             next half hour.
+      OFF    Quiet past the idle timeout. Powered down.
+
+    The mode is stored as two booleans rather than one string because they
+    answer different questions and can disagree: `_wled_on` is a belief about
+    the *device's* power, which the world can change behind our back (a reboot,
+    the WLED app, a wall switch), while `_output_live` is a fact about *our own*
+    behaviour that nothing else can touch. `mode` composes them.
+
+    Ownership is asserted on transitions, not continuously — the WLED app stays
+    usable between songs, and only a mode change stomps what it did.
+    """
+
+    def __init__(self, wled_api: WLEDApi, idle_timeout: int,
+                 settings=None, led_count: int = LED_COUNT):
         self._api = wled_api
         self._idle_timeout = idle_timeout  # seconds, 0 = disabled
+        self._settings = settings
+        self._led_count = led_count
         self._last_activity = 0.0
         self._wled_on = False
+        self._output_live = False
         self._enabled = idle_timeout > 0
         self._power_on_pending = False
         self._power_off_pending = False
+        # Set when a mode transition owes the device an assertion the watchdog
+        # must make on a worker thread. _adopt_device_state() runs on the event
+        # loop and must not block on a 3 s HTTP call, so it queues instead.
+        self._idle_push_pending = False
+        # A manual power-on from the dashboard. Distinct from _power_on_pending,
+        # which means "go live": pressing Turn On with no song playing should
+        # give the strip its defined idle look, not resurrect whichever cue the
+        # last song happened to end on.
+        self._claim_pending = False
         self._dark_since = 0.0
         self._dark_warned = False
+        # Lets on_activity() cut the watchdog's tick short. Without it a song
+        # starting one second after a tick waits out the remaining four before
+        # the strip powers on, which reads on the rig as the bridge being slow
+        # to notice YARG.
+        self._wake = asyncio.Event()
+
+    # ── mode ────────────────────────────────────────────────────────────
+
+    @property
+    def mode(self) -> str:
+        if not self._wled_on:
+            return DeviceMode.OFF
+        return DeviceMode.LIVE if self._output_live else DeviceMode.IDLE
+
+    @property
+    def output_enabled(self) -> bool:
+        """True when the render thread should be sending DDP.
+
+        The render thread's gate. Distinct from `is_on`: an idle strip is
+        powered and owned, but its pixels belong to WLED, not to us — sending
+        frames at it would fight the idle look.
+        """
+        return self._output_live
+
+    def _idle_spec(self) -> dict:
+        return self._settings.idle if self._settings is not None else dict(DEFAULT_IDLE)
+
+    def _grace_seconds(self) -> int:
+        if self._settings is not None:
+            return self._settings.idle_grace_seconds
+        return int(DEFAULT_IDLE["grace_seconds"])
+
+    def _quiet_for(self) -> float:
+        """Seconds since the last activity, or inf if there has never been any.
+
+        An owned strip that has never seen a packet still gets a defined look;
+        treating "never" as zero elapsed would leave it holding NO_CUE forever.
+        """
+        if self._last_activity == 0.0:
+            return float("inf")
+        return time.monotonic() - self._last_activity
 
     def _adopt_device_state(self, device_on: bool | None):
         """Reconcile _wled_on with what the device actually reports.
 
         The bridge is not the only thing that can power this strip — a reboot,
         the WLED UI, a button press or a power blip all change the device
-        without telling us. Every probe result is therefore adopted, in *both*
-        directions; believing a stale value has a distinct failure mode either
-        way:
+        without telling us. (This firmware boots with `def.on: true`, so a power
+        blip alone is enough.) Every probe result is therefore adopted, in
+        *both* directions; believing a stale value has a distinct failure mode
+        either way:
 
-          - believed OFF, device ON  → the idle timer never runs (the `continue`
-            below skips it), so the strip stays lit indefinitely at ~1.6 A;
+          - believed OFF, device ON  → the idle timer never runs, so the strip
+            stays lit indefinitely at ~1.6 A;
           - believed ON, device OFF  → on_activity() never queues a power-on, so
             a song plays to a dark strip, and _check_dark_while_active() cannot
-            see it because it returns early while _wled_on is true.
+            see it because it returns early while we believe we are driving it.
 
-        Adopting ON grants the device a full idle timeout rather than switching
-        it off on the next tick, so turning the strip on deliberately from the
-        WLED UI is not stomped within 5 seconds.
+        Adopting ON claims the strip: it enters IDLE, which queues the idle look
+        over whatever it was showing, and grants it a full idle timeout rather
+        than switching it off on the next tick. Powering the strip on from the
+        WLED app therefore hands it to the bridge rather than to the app — that
+        is what ownership means here, and it is the only place the bridge
+        overrides a deliberate action taken elsewhere.
+
+        Sync and non-blocking: it runs on the event loop, so the HTTP push it
+        implies is queued for the watchdog rather than made here.
         """
         # is_on() returns None when the request failed. Unreachable is not an
         # answer about power — keep the last belief rather than inventing one.
@@ -222,7 +318,7 @@ class WLEDPowerManager:
         # to 3 s on HTTP, and on_activity()/manual_power() can fire during that
         # window, so adopting here would silently discard the operator's (or
         # YARG's) intent. _process_pending_power() settles it on the next tick.
-        if self._power_on_pending or self._power_off_pending:
+        if self._power_on_pending or self._power_off_pending or self._claim_pending:
             return
 
         if device_on == self._wled_on:
@@ -237,22 +333,26 @@ class WLEDPowerManager:
             # divergence, not once per probe.
             self._last_activity = time.monotonic()
             self._wled_on = True
+            self._output_live = False
+            self._idle_push_pending = True
             log.info("WLED: adopted device state ON (powered on externally) — "
-                     "idle timer restarted")
+                     "claiming it, idle look queued, idle timer restarted")
         else:
             self._wled_on = False
+            self._output_live = False
+            self._idle_push_pending = False
             log.info("WLED: adopted device state OFF (powered off externally)")
 
     def _check_dark_while_active(self):
-        """Warn when YARG is feeding us but the strip is still dark.
+        """Warn when YARG is feeding us but our frames are not reaching the strip.
 
-        This state means power-on is failing silently — the render thread
-        gates DDP on _wled_on, so nothing reaches the strip while the
-        status page happily reports YARG as connected.
+        This state means a transition into LIVE is failing silently — the render
+        thread gates DDP on `output_enabled`, so nothing reaches the strip while
+        the status page happily reports YARG as connected.
         """
         now = time.monotonic()
         recent_activity = self._last_activity > 0 and (now - self._last_activity) < 10.0
-        if not recent_activity or self._wled_on:
+        if not recent_activity or self._output_live:
             self._dark_since = 0.0
             self._dark_warned = False
             return
@@ -261,79 +361,204 @@ class WLEDPowerManager:
         elif not self._dark_warned and (now - self._dark_since) >= 30.0:
             self._dark_warned = True
             log.warning(
-                "Receiving YARG packets but WLED has stayed off for %ds — "
-                "power-on is failing, no DDP is being sent (WLED reachable: %s)",
-                round(now - self._dark_since), self._api.reachable,
+                "Receiving YARG packets but the bridge has not been sending for "
+                "%ds — the transition to live output is failing, so the strip is "
+                "showing its idle look or nothing at all (mode: %s, WLED "
+                "reachable: %s)",
+                round(now - self._dark_since), self.mode, self._api.reachable,
             )
 
     def on_activity(self):
         """Called when a YARG packet is received."""
         # Hot path — this runs ~88x/second per YARG packet. Update timestamp
-        # unconditionally (cheap), but only mark a power transition when the
-        # WLED is actually off.
+        # unconditionally (cheap), but only mark a transition when we are not
+        # already driving the strip.
         self._last_activity = time.monotonic()
-        if not self._wled_on and not self._power_on_pending:
+        if not self._output_live and not self._power_on_pending:
             self._power_on_pending = True
+            # Cheap when already set, and only reached on the transition edge.
+            self._wake.set()
 
     def on_test_activity(self):
-        """Called when a test pattern is triggered from the web UI."""
+        """Called on each beat of a dashboard test pattern.
+
+        A test pattern is activity in exactly the sense the grace period means:
+        it is a live stream of frames the operator is watching. Ticking it per
+        beat rather than once at start is what stops the grace period from
+        pulling the strip into the idle look 15 s into a test.
+        """
         self.on_activity()
 
-    def _power_on(self):
-        if self._api.set_power(True):
+    # ── transitions ─────────────────────────────────────────────────────
+
+    def _enter_live(self):
+        """Power up if needed and assert the baseline, then open the DDP gate.
+
+        Ordered so frames never precede the baseline: `_output_live` is set last,
+        and the render thread reads it as its gate. A strip that is already on
+        still gets the baseline — it may have been powered on externally, or
+        left in a state the WLED app changed while we were idle.
+        """
+        if not self._wled_on:
+            if not self._api.set_power(True):
+                log.warning("WLED: failed to power on via API")
+                return
             self._wled_on = True
             log.info("WLED: powered ON")
+        if not self._api.assert_live_baseline(self._led_count):
+            # Sending anyway would put frames on a device whose master
+            # brightness and segment geometry are unknown — the look would be
+            # wrong in a way that is very hard to read off the strip. Leave the
+            # gate shut; _check_dark_while_active() reports it if it persists.
+            log.warning("WLED: failed to assert the live baseline — not sending")
+            return
+        self._idle_push_pending = False
+        self._output_live = True
+        log.info("WLED: live (baseline asserted, DDP flowing)")
+
+    def _enter_idle(self):
+        """Close the DDP gate and hand the strip a look to run on its own.
+
+        The gate closes first: the idle look must not be pushed while we are
+        still sending, or the two fight until the device's realtime timeout
+        lapses. Even so the look does not *appear* until that timeout
+        (~2.5 s here) — WLED holds the last DDP frame until then.
+        """
+        self._output_live = False
+        self._idle_push_pending = False
+        spec = self._idle_spec()
+        if spec.get("mode") == "off":
+            # The operator chose to skip the idle stage entirely.
+            self._power_off()
+            return
+        if self._api.apply_idle_look(spec, self._led_count):
+            log.info("WLED: idle (%s look handed to the device)", spec.get("mode"))
         else:
-            log.warning("WLED: failed to power on via API")
+            log.warning("WLED: failed to push the idle look — the strip keeps "
+                        "the last frame until its realtime timeout lapses")
 
     def _power_off(self):
-        if self._api.set_power(False):
+        self._output_live = False
+        self._idle_push_pending = False
+        if self._api.set_power(False, transition_ms=700):
             self._wled_on = False
             log.info("WLED: powered OFF (idle)")
         else:
             log.warning("WLED: failed to power off via API")
 
+    def _claim(self):
+        """Power the strip up and hand it the idle look — a manual Turn On."""
+        self._claim_pending = False
+        if not self._wled_on:
+            if not self._api.set_power(True):
+                log.warning("WLED: failed to power on via API")
+                return
+            self._wled_on = True
+            log.info("WLED: powered ON (manual)")
+        self._push_idle_look()
+
+    def _push_idle_look(self):
+        """Apply a queued idle-look assertion (from an external or manual
+        power-on)."""
+        self._idle_push_pending = False
+        spec = self._idle_spec()
+        if spec.get("mode") == "off":
+            return
+        if not self._api.apply_idle_look(spec, self._led_count):
+            log.warning("WLED: failed to push the idle look onto an adopted strip")
+
     @property
     def is_on(self) -> bool:
         return self._wled_on
 
+    def capabilities(self) -> dict:
+        """The firmware's own effect and palette names, for the idle-look editor.
+
+        Served from its own endpoint rather than folded into the status
+        snapshot: ~220 effects and ~72 palettes is a few KB that would
+        otherwise ride along on every SSE frame, and neither list changes
+        without a reflash.
+        """
+        return {
+            "effects": list(self._api.effects),
+            "palettes": list(self._api.palettes),
+            "realtime_timeout_ms": self._api.realtime_timeout_ms,
+            "reachable": self._api.reachable,
+        }
+
     def power_snapshot(self) -> dict:
         """Return current power state for the status page."""
         wifi = self._api.wifi_info
+        spec = self._idle_spec()
+        base = {
+            "on": self._wled_on,
+            "mode": self.mode,
+            "output_live": self._output_live,
+            "reachable": self._api.reachable,
+            "grace": self._grace_seconds(),
+            "idle_mode": spec.get("mode"),
+            "realtime_timeout_ms": self._api.realtime_timeout_ms,
+            "wifi": wifi,
+        }
         if not self._enabled:
-            return {"enabled": False, "on": self._wled_on, "reachable": self._api.reachable, "idle_seconds": 0, "timeout": 0, "remaining": 0, "wifi": wifi}
+            return {**base, "enabled": False, "idle_seconds": 0,
+                    "timeout": 0, "remaining": 0}
         elapsed = time.monotonic() - self._last_activity if self._last_activity > 0 else 0.0
         remaining = max(0.0, self._idle_timeout - elapsed) if self._wled_on else 0.0
         return {
+            **base,
             "enabled": True,
-            "on": self._wled_on,
-            "reachable": self._api.reachable,
             "idle_seconds": round(elapsed),
             "timeout": self._idle_timeout,
             "remaining": round(remaining),
-            "wifi": wifi,
         }
 
     def manual_power(self, on: bool):
-        """Manual power toggle from the web UI (deferred to watchdog thread)."""
+        """Manual power toggle from the web UI (deferred to watchdog thread).
+
+        Turning on *claims* the strip rather than driving it: it powers up and
+        takes the idle look. If YARG is in fact streaming, on_activity() fires
+        ~88 times a second and pulls it to LIVE within a frame or two, so the
+        operator never has to think about which of the two they wanted.
+
+        The idle timer is seeded either way, so a strip switched on by hand
+        still gets a full timeout before it powers itself back off.
+        """
         if on:
             self._power_off_pending = False
             self._last_activity = time.monotonic()
             if not self._wled_on:
-                self._power_on_pending = True
+                self._claim_pending = True
+                self._wake.set()
         else:
             self._power_on_pending = False
+            self._claim_pending = False
             if self._wled_on:
                 self._power_off_pending = True
+                self._wake.set()
+
+    # ── watchdog ────────────────────────────────────────────────────────
+
+    async def _wait_tick(self, seconds: float):
+        """Sleep until the next watchdog tick, or until something wakes us.
+
+        A separate method so tests can shorten the loop without patching
+        asyncio.sleep globally.
+        """
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+        self._wake.clear()
 
     async def watchdog_loop(self):
-        """Background task that turns WLED off after idle timeout and checks reachability.
+        """Background task that owns every transition of the strip's mode.
 
         Never allowed to die. This task owns the only path that sets
-        _wled_on, and the render thread gates all DDP output on it — so if
-        this task raises, the strip goes dark permanently while YARG still
-        reads as connected, with nothing in the log to say why. Any
-        exception is logged and the loop resumes.
+        `_wled_on` and `_output_live`, and the render thread gates all DDP
+        output on the latter — so if this task raises, the strip goes dark
+        permanently while YARG still reads as connected, with nothing in the
+        log to say why. Any exception is logged and the loop resumes.
         """
         while True:
             try:
@@ -345,39 +570,32 @@ class WLEDPowerManager:
                 await asyncio.sleep(5)
 
     async def _watchdog_run(self):
+        # Capability lists first: the dashboard's idle-look editor offers the
+        # firmware's own effects and palettes, and the realtime timeout it
+        # reports is what decides how long an idle look takes to appear.
+        await asyncio.to_thread(self._api.fetch_capabilities)
+
         # Initial reachability check (non-blocking)
         self._adopt_device_state(await asyncio.to_thread(self._api.is_on))
         await asyncio.to_thread(self._api.fetch_wifi_info)
 
-        # Do not make a live sender wait for the first watchdog sleep. Activity
+        # Do not make a live sender wait for the first watchdog tick. Activity
         # may have arrived while the initial HTTP probes were in flight.
         await self._process_pending_power()
 
-        if not self._enabled:
-            log.info("WLED power management: disabled (IDLE_TIMEOUT=0)")
-            # Still check reachability and handle manual power periodically
-            wifi_counter = 0
-            while True:
-                await asyncio.sleep(5)
-                await self._process_pending_power()
-                self._check_dark_while_active()
-                wifi_counter += 1
-                if wifi_counter >= 6:
-                    wifi_counter = 0
-                    # No idle timeout here, so nothing powers the strip off —
-                    # but the render thread still gates all DDP on _wled_on, so
-                    # an accurate belief is what keeps output honest.
-                    self._adopt_device_state(await asyncio.to_thread(self._api.is_on))
-                    await asyncio.to_thread(self._api.fetch_wifi_info)
-            return
-
-        log.info("WLED power management: enabled (%ds idle timeout)", self._idle_timeout)
+        if self._enabled:
+            log.info("WLED power management: enabled (%ds idle timeout, %ds grace)",
+                     self._idle_timeout, self._grace_seconds())
+        else:
+            log.info("WLED power management: disabled (IDLE_TIMEOUT=0) — the "
+                     "strip is still owned and still falls back to its idle "
+                     "look, it just never powers off")
 
         check_counter = 0
         while True:
-            await asyncio.sleep(5)
+            await self._wait_tick(5)
 
-            # Handle deferred power-on from on_activity() or manual_power()
+            # Handle deferred commands from on_activity() or manual_power().
             await self._process_pending_power()
 
             self._check_dark_while_active()
@@ -386,30 +604,46 @@ class WLEDPowerManager:
 
             # Reachability + WiFi check every ~30s (6 × 5s). The probe is
             # unconditional: gating it on `not self._wled_on` meant the
-            # believed-ON/device-OFF divergence was never even looked for. The
-            # extra request costs the same as the fetch_wifi_info below it,
-            # which has always run on this tick regardless of power state.
+            # believed-ON/device-OFF divergence was never even looked for.
             if check_counter >= 6:
                 check_counter = 0
                 self._adopt_device_state(await asyncio.to_thread(self._api.is_on))
                 await asyncio.to_thread(self._api.fetch_wifi_info)
+                # Adoption may have queued a look for a strip someone else
+                # powered on. Apply it here rather than on the next tick.
+                await self._process_pending_power()
 
             if not self._wled_on:
                 continue
 
-            elapsed = time.monotonic() - self._last_activity
-            if elapsed >= self._idle_timeout:
+            quiet = self._quiet_for()
+
+            # LIVE → IDLE. Runs whether or not power management is enabled:
+            # handing the strip a defined look is ownership, not power saving.
+            if self._output_live and quiet >= self._grace_seconds():
+                log.info("WLED: no activity for %ds — falling back to the idle look",
+                         round(quiet) if quiet != float("inf") else -1)
+                await asyncio.to_thread(self._enter_idle)
+
+            # → OFF, on the operator's idle timeout.
+            if self._enabled and quiet >= self._idle_timeout:
                 await asyncio.to_thread(self._power_off)
 
     async def _process_pending_power(self):
-        """Apply deferred power commands, with the most recent command winning."""
+        """Apply deferred commands, with the most recent command winning."""
         if self._power_off_pending:
             self._power_off_pending = False
             self._power_on_pending = False
+            self._claim_pending = False
             await asyncio.to_thread(self._power_off)
         elif self._power_on_pending:
             self._power_on_pending = False
-            await asyncio.to_thread(self._power_on)
+            self._claim_pending = False
+            await asyncio.to_thread(self._enter_live)
+        elif self._claim_pending:
+            await asyncio.to_thread(self._claim)
+        elif self._idle_push_pending:
+            await asyncio.to_thread(self._push_idle_look)
 
 
 class RenderThread(threading.Thread):
@@ -447,6 +681,13 @@ class RenderThread(threading.Thread):
         # Frame-skip tracking
         self._frames_rendered = 0
         self._frames_skipped = 0
+        # Frames the loop deliberately did not compose because the bridge was
+        # not driving the strip. Counted separately from `_frames_skipped`,
+        # which means a *missed* frame — a stall. These are not misses.
+        self._frames_idle = 0
+        # Edge detector for the transition into live output, so the first live
+        # frame does not cross-fade from a stage look left over from last song.
+        self._was_live = False
 
         # Rolling stats (last N frames)
         self._STATS_WINDOW = 200
@@ -490,6 +731,10 @@ class RenderThread(threading.Thread):
         self._last_preview_at = 0.0
         self._preview_strip: list = []
         self._preview_layers: dict | None = None
+        # What the preview last described. The dashboard draws the strip from
+        # this, so it has to say which of the three it is: our own frames, the
+        # device's idle look, or nothing at all.
+        self._preview_source = DeviceMode.OFF
         self._fatal_error: str | None = None
 
     def run(self):
@@ -591,8 +836,42 @@ class RenderThread(threading.Thread):
             self._cached_palette = palette_name
 
         # Advance time-based patterns (zone bitmasks computed from the injected
-        # clock — immune to asyncio event-loop congestion)
+        # clock — immune to asyncio event-loop congestion). This runs whether or
+        # not we are sending: it is what keeps beat phase, cue counters and
+        # strobe coherent, so resuming output picks up mid-song rather than
+        # restarting every pattern from zero.
         self._engine.tick(now)
+
+        # Are we driving the strip at all? While the bridge is idle the strip
+        # is running WLED's own idle look and our frames would go nowhere, so
+        # composing them is pure waste — and, until 2026-08-25, it was also the
+        # source of a dashboard that showed a moving wash while the strip sat
+        # dark. Everything below the gate is skipped, and the preview says why.
+        live = self._wled_power.output_enabled
+        if live and not self._was_live:
+            # Entering live output. Zero the cross-fade source: the last frame
+            # we sent may be an hour old, and fading the first cue of a new
+            # song up from the last cue of the previous one is not a
+            # transition anyone asked for.
+            self._last_sent[:] = bytes(len(self._last_sent))
+            self._fade_until = 0.0
+            self._fade_duration = 0.0
+        self._was_live = live
+        if not live:
+            self._frames_idle += 1
+            self._preview_source = self._wled_power.mode
+            self._preview_strip = []
+            self._preview_layers = None
+            self._tracker.on_render(self._engine.zones,
+                                    self._engine.strobe_hz(),
+                                    self._engine.bpm,
+                                    ddp_sent=False)
+            return self._black
+        # Stamped on every live frame, not only on the ones that capture a
+        # preview: capture is gated on someone watching the dashboard, and
+        # leaving the source at its last value meant a live strip reported
+        # itself as off whenever nobody had the page open.
+        self._preview_source = DeviceMode.LIVE
 
         # Operator blur strength (dashboard slider) — fog stacks on top of
         # this in the engine. Synced each frame so a drag lands live.
@@ -678,12 +957,11 @@ class RenderThread(threading.Thread):
             n = len(pixel_data)
             self._last_sent[:n] = pixel_data
 
-        # Send DDP every frame when WLED is on (no dedup — WiFi
-        # can drop UDP packets, so always resend like LedFx does)
-        ddp_sent = False
-        if self._wled_power.is_on:
-            self._sender.send_pixels(pixel_data)
-            ddp_sent = True
+        # Send DDP every frame while we are driving the strip (no dedup —
+        # WiFi can drop UDP packets, so always resend like LedFx does). The
+        # gate was checked above; reaching here means it was open.
+        self._sender.send_pixels(pixel_data)
+        ddp_sent = True
 
         self._tracker.on_render(self._engine.zones,
                                 self._engine.strobe_hz(),
@@ -711,14 +989,43 @@ class RenderThread(threading.Thread):
         return self._fatal_error is not None
 
     def preview_snapshot(self) -> dict | None:
-        """Latest live strip + per-layer preview for the dashboard, or None if
-        nothing has been captured yet (no one watching)."""
-        if not self._preview_strip:
-            return None
+        """What the strip is showing, for the dashboard.
+
+        A picture of the *strip*, not of the render buffer. Those are the same
+        thing only while the bridge is driving the strip; the rest of the time
+        the honest answer is "we are not painting this". Returning the last
+        composed frame then — which is what this did until 2026-08-25 — put a
+        moving wash on the dashboard while the strip sat dark, and no amount of
+        greying it out in CSS made that a true statement.
+
+        `source` names which of the three it is, so an SSE consumer that is not
+        the dashboard gets the same answer:
+
+          "live"  these pixels went out over DDP;
+          "idle"  the strip is running WLED's own idle look, which the bridge
+                  does not render and therefore cannot preview;
+          "off"   the strip is powered down.
+
+        Returns None only before the first capture, when there is nothing to
+        say at all.
+        """
+        if self._preview_source == DeviceMode.LIVE:
+            if not self._preview_strip:
+                return None
+            return {
+                "cells": PREVIEW_CELLS,
+                "source": DeviceMode.LIVE,
+                "strip": self._preview_strip,
+                "layers": self._preview_layers["layers"] if self._preview_layers else [],
+            }
+        # Empty pixel lists rather than an omitted key: every consumer already
+        # renders "no data" as black, so the strip goes dark on its own without
+        # each of them needing to learn about `source` first.
         return {
             "cells": PREVIEW_CELLS,
-            "strip": self._preview_strip,
-            "layers": self._preview_layers["layers"] if self._preview_layers else [],
+            "source": self._preview_source,
+            "strip": [],
+            "layers": [],
         }
 
     def render_stats(self) -> dict:
@@ -729,7 +1036,7 @@ class RenderThread(threading.Thread):
         if not work:
             return {"fps": fps, "alive": self.is_alive(),
                     "fatal_error": self._fatal_error,
-                    "rendered": 0, "skipped": 0, "stalls": 0,
+                    "rendered": 0, "skipped": 0, "stalls": 0, "idle": self._frames_idle,
                     "work_ms_avg": 0.0, "work_ms_max": 0.0,
                     "gap_ms_avg": 0.0, "gap_ms_max": 0.0,
                     "target_ms": round(1000.0 / fps, 1),
@@ -741,6 +1048,10 @@ class RenderThread(threading.Thread):
             "rendered": self._frames_rendered,
             "skipped": self._frames_skipped,
             "stalls": self._stall_count,
+            # Frames deliberately not composed because the bridge was not
+            # driving the strip. A climbing `rendered` while the strip is dark
+            # is the symptom this number replaces.
+            "idle": self._frames_idle,
             "work_ms_avg": round(sum(work) / len(work), 2),
             "work_ms_max": round(max(work), 2),
             "gap_ms_avg": round(sum(gaps) / len(gaps), 2),
@@ -766,9 +1077,12 @@ async def main():
     mapper = LEDMapper(LED_COUNT)
     sender = DDPSender(WLED_HOST, WLED_DDP_PORT)
     wled_api = WLEDApi(WLED_HOST)
-    wled_power = WLEDPowerManager(wled_api, IDLE_TIMEOUT)
     tracker = StatusTracker()
     settings = BridgeSettings()
+    # The power manager reads the operator's idle look and grace period, so it
+    # is built after settings rather than before.
+    wled_power = WLEDPowerManager(wled_api, IDLE_TIMEOUT,
+                                  settings=settings, led_count=LED_COUNT)
     capture = CaptureController(CAPTURE_DIR)
     status_server = StatusServer(tracker, STATUS_HOST, STATUS_PORT, engine=engine,
                                  wled_power=wled_power, settings=settings,

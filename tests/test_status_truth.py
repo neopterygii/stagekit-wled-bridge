@@ -29,7 +29,12 @@ class _Api:
         self._answers = list(answers)
         self.reachable = True
         self.wifi_info = {}
+        self.effects = ["Solid", "Blink", "Breathe"]
+        self.palettes = ["Default", "Party"]
+        self.realtime_timeout_ms = 2500
         self.power_calls = []
+        self.baseline_calls = 0
+        self.idle_calls = []
         self.is_on_calls = 0
 
     def is_on(self):
@@ -41,8 +46,19 @@ class _Api:
     def fetch_wifi_info(self):
         return {}
 
-    def set_power(self, on):
+    def set_power(self, on, transition_ms=None):
         self.power_calls.append(on)
+        return True
+
+    def assert_live_baseline(self, led_count):
+        self.baseline_calls += 1
+        return True
+
+    def apply_idle_look(self, spec, led_count, transition_ms=700):
+        self.idle_calls.append(dict(spec))
+        return True
+
+    def fetch_capabilities(self):
         return True
 
 
@@ -104,8 +120,12 @@ def test_adopting_off_lets_activity_queue_a_power_on():
     """The believed-ON/device-OFF case: a song must not play to a dark strip."""
     manager = WLEDPowerManager(_Api(), idle_timeout=1800)
     manager._wled_on = True
+    manager._output_live = True
 
-    # Before adoption, on_activity() sees _wled_on and queues nothing.
+    # Before adoption, on_activity() sees that we are already driving the strip
+    # and queues nothing. Note the gate is `_output_live`, not `_wled_on`: a
+    # strip that is powered but showing its idle look still needs a transition
+    # into live output when a song starts.
     manager.on_activity()
     assert not manager._power_on_pending
 
@@ -115,10 +135,12 @@ def test_adopting_off_lets_activity_queue_a_power_on():
 
 
 def test_adopting_off_lets_the_dark_while_active_warning_fire():
-    """_check_dark_while_active() returns early while _wled_on is true, so it
-    could not see the very case it was written for until OFF is adopted."""
+    """_check_dark_while_active() returns early while the bridge believes it is
+    driving the strip, so it could not see the very case it was written for
+    until OFF is adopted."""
     manager = WLEDPowerManager(_Api(), idle_timeout=1800)
     manager._wled_on = True
+    manager._output_live = True
     manager._last_activity = time.monotonic()
 
     manager._check_dark_while_active()
@@ -164,24 +186,24 @@ def test_watchdog_adopts_device_state_at_startup():
 
 
 def _run_fast_watchdog(manager, predicate, timeout=2.0):
-    """Drive _watchdog_run() until predicate() holds, with sleeps stubbed out.
+    """Drive _watchdog_run() until predicate() holds, with its tick shortened.
 
-    The watchdog sleeps 5 s per tick and probes every 6th, so the sleep has to
-    go for the test to be quick. `real_sleep` is captured before the patch so
-    this helper's own polling still yields to the loop, and the predicate is
-    the *outcome* rather than the probe count — the probe runs on a worker
-    thread, so counting calls would race the adoption that follows.
+    The watchdog waits 5 s per tick and probes every 6th, so the wait has to go
+    for the test to be quick. It patches `manager._wait_tick` rather than
+    `asyncio.sleep` globally — the wait is an `asyncio.wait_for` on the wake
+    event now, which a patched sleep would not shorten, and stubbing one
+    instance beats reaching into the stdlib. The predicate is the *outcome*
+    rather than the probe count: the probe runs on a worker thread, so counting
+    calls would race the adoption that follows.
     """
-    real_sleep = asyncio.sleep
-
-    async def no_sleep(_seconds):
-        await real_sleep(0)
+    async def no_wait(_seconds):
+        await asyncio.sleep(0)
 
     async def exercise():
         task = asyncio.create_task(manager._watchdog_run())
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
-            await real_sleep(0)
+            await asyncio.sleep(0)
         result = predicate()
         task.cancel()
         try:
@@ -190,11 +212,8 @@ def _run_fast_watchdog(manager, predicate, timeout=2.0):
             pass
         return result
 
-    asyncio.sleep = no_sleep
-    try:
-        return asyncio.run(exercise())
-    finally:
-        asyncio.sleep = real_sleep
+    manager._wait_tick = no_wait
+    return asyncio.run(exercise())
 
 
 def test_watchdog_probe_is_no_longer_gated_on_the_cached_belief():

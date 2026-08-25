@@ -331,11 +331,27 @@ STATUS_HTML = """\
   .layer-row .layer-canvas { flex: 1; height: 14px; border-radius: 4px; border: 1px solid var(--border);
                              image-rendering: pixelated; image-rendering: crisp-edges; display: block;
                              background: var(--bg); }
-  /* The render thread keeps producing frames while WLED is powered off — they
-     are simply not sent. Grey the preview out so it cannot be read as output
-     that is reaching the strip. */
-  #strip-wrap.not-sending .strip-canvas,
-  #strip-wrap.not-sending .layer-rows { opacity: 0.25; filter: saturate(0.4); }
+  /* While the bridge is not driving the strip it composes no frames at all,
+     so the canvases below draw black on their own. The dimming here is for the
+     labels and chrome around them, which would otherwise still read as a live
+     panel wrapped around a dark strip. */
+  #strip-wrap.not-sending .layer-rows { opacity: 0.3; }
+  #strip-wrap.not-sending .strip-canvas { border-style: dashed; }
+
+  /* Idle look editor */
+  .idle-grid { display: grid; gap: 0.7rem; margin-top: 0.5rem;
+               grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .idle-field { display: flex; flex-direction: column; gap: 0.3rem; }
+  .idle-field > span { font-size: 0.7rem; color: var(--dim); text-transform: uppercase;
+                       letter-spacing: 0.04em; }
+  .idle-field select, .idle-field input[type=number] {
+      padding: 0.35rem; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text); font-size: 0.8rem;
+      font-family: inherit; cursor: pointer; width: 100%; }
+  .idle-field input[type=range] { width: 100%; accent-color: var(--accent); }
+  .idle-field input[type=color] { width: 100%; height: 30px; padding: 0; cursor: pointer;
+      border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+  #idle-panel.mode-off .idle-look-only { opacity: 0.35; pointer-events: none; }
   .strip-note { font-size: 0.7rem; color: var(--yellow); margin-top: 0.4rem;
                 text-transform: uppercase; letter-spacing: 0.05em; }
 
@@ -556,6 +572,34 @@ STATUS_HTML = """\
   <div class="toggle-grid" id="effect-toggles"></div>
 </div>
 
+<h3 style="margin:1rem 0 0.5rem">Idle Look</h3>
+<div class="test-panel" id="idle-panel">
+  <div class="section-label">What this strip shows when the bridge owns it but is not sending</div>
+  <div class="idle-grid">
+    <label class="idle-field"><span>Mode</span>
+      <select id="idle-mode">
+        <option value="preset">WLED effect</option>
+        <option value="black">Black (stay on)</option>
+        <option value="off">Power off at grace</option>
+      </select></label>
+    <label class="idle-field"><span>Grace</span>
+      <input type="number" id="idle-grace" min="0" max="300" step="1"></label>
+    <label class="idle-field idle-look-only"><span>Effect</span>
+      <select id="idle-effect"></select></label>
+    <label class="idle-field idle-look-only"><span>Palette</span>
+      <select id="idle-palette"></select></label>
+    <label class="idle-field idle-look-only"><span>Colour</span>
+      <input type="color" id="idle-color"></label>
+    <label class="idle-field idle-look-only"><span>Brightness <b id="idle-brightness-val"></b></span>
+      <input type="range" id="idle-brightness" min="0" max="255" step="1"></label>
+    <label class="idle-field idle-look-only"><span>Speed <b id="idle-speed-val"></b></span>
+      <input type="range" id="idle-speed" min="0" max="255" step="1"></label>
+    <label class="idle-field idle-look-only"><span>Intensity <b id="idle-intensity-val"></b></span>
+      <input type="range" id="idle-intensity" min="0" max="255" step="1"></label>
+  </div>
+  <div class="strip-note" id="idle-note"></div>
+</div>
+
 <h3 style="margin:1rem 0 0.5rem">Test Patterns</h3>
 <div class="test-panel">
   <div class="section-label">Cues</div>
@@ -761,6 +805,120 @@ const paletteStrictness = wireIntensitySlider(
 const cueFade = wireIntensitySlider(
   'cue-fade-slider', 'cue-fade-ms', 'cue_fade_ms', 1, ' ms');
 
+// ── Idle look editor ─────────────────────────────────────────────
+// The effect and palette lists come from the device itself (/api/wled), not
+// from a table baked in here: this firmware carries 220 effects and 72
+// palettes, and both lists move with the WLED version.
+const IDLE_FIELDS = ['mode', 'grace', 'effect', 'palette', 'color',
+                     'brightness', 'speed', 'intensity'];
+const idleEls = {};
+for (const f of IDLE_FIELDS) idleEls[f] = document.getElementById('idle-' + f);
+let idleCapsLoaded = false;
+let idleTouchedAt = 0;
+let idleSendTimer = null;
+
+function idleHex(rgb) {
+  if (!rgb || rgb.length !== 3) return '#000000';
+  return '#' + rgb.map(c => Math.max(0, Math.min(255, c)).toString(16).padStart(2, '0')).join('');
+}
+
+function idleRgb(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return [0, 0, 0];
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function sendIdle() {
+  const body = {
+    mode: idleEls.mode.value,
+    grace_seconds: parseInt(idleEls.grace.value) || 0,
+    effect: parseInt(idleEls.effect.value) || 0,
+    palette: parseInt(idleEls.palette.value) || 0,
+    color: idleRgb(idleEls.color.value),
+    brightness: parseInt(idleEls.brightness.value) || 0,
+    speed: parseInt(idleEls.speed.value) || 0,
+    intensity: parseInt(idleEls.intensity.value) || 0,
+  };
+  fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ idle: body }) });
+}
+
+for (const f of IDLE_FIELDS) {
+  const el = idleEls[f];
+  const handler = () => {
+    // Hold off the status poll's sync for a moment so a half-finished edit is
+    // not overwritten by the value the server still has.
+    idleTouchedAt = Date.now();
+    if (f === 'mode') syncIdleMode(idleEls.mode.value);
+    if (f === 'brightness' || f === 'speed' || f === 'intensity') {
+      document.getElementById('idle-' + f + '-val').textContent = el.value;
+    }
+    clearTimeout(idleSendTimer);
+    idleSendTimer = setTimeout(sendIdle, 120);
+  };
+  el.addEventListener('input', handler);
+  el.addEventListener('change', handler);
+}
+
+function syncIdleMode(mode) {
+  document.getElementById('idle-panel').classList.toggle('mode-off', mode === 'off');
+  const note = document.getElementById('idle-note');
+  if (mode === 'off') {
+    note.textContent = 'The strip powers down when the grace period expires, '
+      + 'rather than waiting out the idle timeout.';
+  } else if (mode === 'black') {
+    note.textContent = 'The strip stays powered and owned but shows nothing.';
+  } else {
+    note.textContent = 'WLED renders this itself while the bridge is quiet. '
+      + 'It appears a couple of seconds after the last frame — the device holds '
+      + 'the final DDP frame until its own realtime timeout lapses.';
+  }
+}
+
+function fillIdleSelect(el, names, selected) {
+  el.innerHTML = '';
+  names.forEach((name, i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = i + '  ' + name;
+    el.appendChild(opt);
+  });
+  el.value = selected;
+}
+
+function loadWledCaps(idle) {
+  if (idleCapsLoaded) return;
+  idleCapsLoaded = true;
+  fetch('/api/wled').then(r => r.json()).then(caps => {
+    if (!caps.effects || !caps.effects.length) {
+      // Device unreachable at startup: leave the selects empty rather than
+      // inventing ids, and let the next page load try again.
+      idleCapsLoaded = false;
+      return;
+    }
+    fillIdleSelect(idleEls.effect, caps.effects, idle.effect);
+    fillIdleSelect(idleEls.palette, caps.palettes, idle.palette);
+  }).catch(() => { idleCapsLoaded = false; });
+}
+
+function updateIdle(idle) {
+  if (!idle) return;
+  loadWledCaps(idle);
+  // Do not fight an operator mid-edit.
+  if (Date.now() - idleTouchedAt < 2000) return;
+  idleEls.mode.value = idle.mode;
+  idleEls.grace.value = idle.grace_seconds;
+  if (idleEls.effect.options.length) idleEls.effect.value = idle.effect;
+  if (idleEls.palette.options.length) idleEls.palette.value = idle.palette;
+  idleEls.color.value = idleHex(idle.color);
+  for (const f of ['brightness', 'speed', 'intensity']) {
+    idleEls[f].value = idle[f];
+    document.getElementById('idle-' + f + '-val').textContent = idle[f];
+  }
+  syncIdleMode(idle.mode);
+}
+
 // Palette select
 const paletteSelect = document.getElementById('palette-select');
 let palettesPopulated = false;
@@ -856,6 +1014,7 @@ function updateSettings(s) {
       knob.pctEl.textContent = pct + knob.unit;
     }
   }
+  updateIdle(s.idle);
   // Populate palette dropdown once
   if (!palettesPopulated && s.palettes) {
     paletteSelect.innerHTML = '';
@@ -983,7 +1142,12 @@ function updatePower(p) {
   }
   if (p.on) {
     dot.className = 'status-dot on';
-    state.textContent = 'On';
+    // Powered is not the same as driven. "Live" means our DDP frames own the
+    // pixels; "Idle" means the strip is powered and owned but WLED is
+    // rendering the idle look itself.
+    // `mode` is absent only if the page outlives a bridge upgrade mid-session;
+    // "On" is the honest answer when we cannot tell live from idle.
+    state.textContent = p.mode ? (p.mode === 'live' ? 'Live' : 'Idle') : 'On';
     btn.textContent = 'Turn Off';
     if (p.enabled && p.remaining > 0) {
       timer.textContent = 'Auto-off in ' + fmtTime(p.remaining);
@@ -1073,11 +1237,26 @@ function buildLayerRows(layers, cells) {
   layerRowsBuilt = true;
 }
 
+// The preview is a picture of the strip, not of the render buffer. When the
+// bridge is not sending, the server sends empty pixel lists and a `source` of
+// "idle" or "off" — the canvases below then draw black, which is what the
+// strip is actually doing. The layer rows are kept (dimmed and blanked) rather
+// than removed so the panel does not collapse and reflow every time a song
+// ends.
 function updatePreview(p) {
   if (!p) return;
   const cells = p.cells;
-  drawStripCanvas(document.getElementById('strip-canvas'), cells, p.strip);
-  if (!layerRowsBuilt && p.layers) buildLayerRows(p.layers, cells);
+  const live = p.source === undefined || p.source === 'live';
+  drawStripCanvas(document.getElementById('strip-canvas'), cells, live ? p.strip : null);
+  if (!layerRowsBuilt && p.layers && p.layers.length) buildLayerRows(p.layers, cells);
+  const rows = document.querySelectorAll('.layer-row');
+  if (!live) {
+    rows.forEach(row => {
+      row.classList.add('idle');
+      drawStripCanvas(row.querySelector('.layer-canvas'), cells, null);
+    });
+    return;
+  }
   if (p.layers) {
     for (const L of p.layers) {
       const row = document.getElementById('layer-row-' + L.name);
@@ -1129,12 +1308,21 @@ function update(d) {
   document.getElementById('held-pill').classList.toggle('hidden', !d.cue_held);
   document.getElementById('cue-held-note').classList.toggle('hidden', !d.cue_held);
 
-  // "not being sent" — frames are still being rendered but the DDP send is
-  // gated off, so the strip is dark whatever the preview shows. Independent of
-  // cue_held: either can happen without the other.
+  // "not being sent" — the bridge is not driving the strip, so it composes no
+  // frames and the preview above is blank. Say which of the two reasons it is,
+  // because they need different things from the operator: an idle look is
+  // working as designed, a powered-off strip will not light until YARG starts.
+  // Independent of cue_held: either can happen without the other.
   const notSending = d.output_live === false;
+  const source = (d.preview && d.preview.source) || (d.wled_power && d.wled_power.mode);
+  const note = document.getElementById('strip-note');
   document.getElementById('strip-wrap').classList.toggle('not-sending', notSending);
-  document.getElementById('strip-note').classList.toggle('hidden', !notSending);
+  note.classList.toggle('hidden', !notSending);
+  if (notSending) {
+    note.innerHTML = source === 'idle'
+      ? 'bridge not sending &mdash; the strip is running its idle look'
+      : 'bridge not sending &mdash; the strip is powered off';
+  }
 
   // AUTO badge — YARG auto-generated venue track
   document.getElementById('autogen-pill').classList.toggle('hidden', !d.auto_gen);
@@ -1272,6 +1460,13 @@ class StatusServer:
                 if self.engine:
                     self.engine.on_beat(beat_type)
                     self.tracker.on_beat(beat_type)
+                # A running test pattern is activity in exactly the sense the
+                # idle grace period means — a live stream of frames someone is
+                # watching. Ticking it here rather than once when the pattern
+                # starts is what stops the strip dropping to its idle look
+                # partway through a test.
+                if self.wled_power:
+                    self.wled_power.on_test_activity()
                     # Fire keyframe every other beat for cues that listen for keyframes
                     if beat_count % 2 == 0:
                         self.engine.on_keyframe(KeyframeByte.NEXT)
@@ -1440,6 +1635,17 @@ class StatusServer:
                 if not self.settings.set_effect(tid, on):
                     return 400, f"Unknown effect: {tid}"
                 changed.append(f"{tid}={'on' if on else 'off'}")
+        if "idle" in body:
+            updates = body["idle"]
+            if not isinstance(updates, dict):
+                return 400, "Invalid idle payload"
+            before = self.settings.idle
+            after = self.settings.update_idle(updates)
+            diff = [f"idle.{k}={after[k]}" for k in after if after[k] != before.get(k)]
+            # Every field is bounds-checked in settings, so an out-of-range
+            # value lands clamped rather than erroring — report what took
+            # effect, which is what the operator needs to see.
+            changed.extend(diff)
         if not changed:
             return 200, "No change"
         return 200, "Updated: " + ", ".join(changed)
@@ -1532,6 +1738,10 @@ class StatusServer:
             elif path == '/api/settings' and method == 'GET':
                 body = json.dumps(self.settings.snapshot() if self.settings else {}).encode()
                 await self._send_response(writer, 200, 'application/json', body)
+            elif path == '/api/wled' and method == 'GET':
+                caps = self.wled_power.capabilities() if self.wled_power else {}
+                await self._send_response(writer, 200, 'application/json',
+                                          json.dumps(caps).encode())
             elif path == '/api/capture' and method == 'POST':
                 raw = b''
                 if content_length > 0:

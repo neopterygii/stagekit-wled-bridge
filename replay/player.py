@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from config import LED_COUNT
 from effects.cue_engine import CueEngine
 from effects.mapper import LEDMapper
-from main import RenderThread, YARGProtocol
+from main import DeviceMode, RenderThread, YARGProtocol
 from protocol.yarg_packet import CameraCutSubject, SongSectionByte, VenueSizeByte
 from replay.capture import CaptureHeader, read_capture
 from settings import BridgeSettings
@@ -112,8 +112,9 @@ class PowerStub:
     """Minimal `WLEDPowerManager` stand-in.
 
     Replay has no controller to power on, but the render path gates DDP on
-    `is_on`, so it defaults to True — otherwise a replay would render frames and
-    send none.
+    `output_enabled`, so it defaults to True — otherwise a replay would render
+    frames and send none. A replay is live output by definition: there is no
+    idle look and no grace period, so both flags track the one `on` value.
     """
 
     def __init__(self, on: bool = True):
@@ -123,6 +124,19 @@ class PowerStub:
     @property
     def is_on(self) -> bool:
         return self.on
+
+    @property
+    def output_enabled(self) -> bool:
+        return self.on
+
+    @property
+    def mode(self) -> str:
+        """What the render thread labels its preview with.
+
+        A replay that is sending is LIVE by definition; one that is not has no
+        device to be idle on, so OFF is the honest answer.
+        """
+        return DeviceMode.LIVE if self.on else DeviceMode.OFF
 
     def on_activity(self) -> None:
         self.activity_count += 1

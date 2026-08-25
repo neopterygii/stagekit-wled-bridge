@@ -28,8 +28,17 @@ class _Api:
     def fetch_wifi_info(self):
         return {}
 
-    def set_power(self, on):
+    def fetch_capabilities(self):
+        return True
+
+    def set_power(self, on, transition_ms=None):
         self.power_calls.append(on)
+        return True
+
+    def assert_live_baseline(self, led_count):
+        return True
+
+    def apply_idle_look(self, spec, led_count, transition_ms=700):
         return True
 
 
