@@ -90,19 +90,62 @@ All settings are controlled via environment variables:
 
 ### Persistent Settings
 
-Brightness, palette, FPS, and direction are stored in `SETTINGS_FILE`
+Brightness, palette, FPS, direction and the idle look are stored in `SETTINGS_FILE`
 (`/data/settings.json` by default) so they survive container restarts.
 The compose example above mounts a named volume at `/data` for this. If
 `/data` isn't writable the bridge logs a warning and runs read-only —
 runtime changes will work but won't survive a recreate.
 
-### WLED Power Management
+### Strip Ownership
 
-The bridge automatically manages your WLED controller's power state:
+The bridge treats every strip it drives as **owned**: while it is running, there
+is no moment when the strip's appearance is undefined. Three modes cover the
+whole lifetime, and the dashboard names which one you are in.
 
-- **Auto-on**: WLED is turned on as soon as a YARG packet (or web UI test pattern) is received.
-- **Auto-off**: After `IDLE_TIMEOUT` seconds with no activity, WLED is powered off via the JSON API.
-- Set `IDLE_TIMEOUT=0` to disable automatic power management entirely.
+| Mode | The strip is | Entered when |
+|---|---|---|
+| **Live** | showing the bridge's DDP frames | a YARG packet or a web UI test pattern arrives |
+| **Idle** | powered, running a look WLED renders itself | no activity for the grace period (default 15 s) |
+| **Off** | powered down | no activity for `IDLE_TIMEOUT` |
+
+**The device baseline.** Before frames start flowing — at startup, at each
+power-on, and when adopting a strip powered up outside the bridge — the bridge
+asserts a known state: master brightness 255, `transition: 0`, nightlight off,
+live-override cleared, sync-receive off, and segment 0 spanning the strip with a
+black solid as its fallback effect.
+
+Master brightness matters more than it looks. WLED multiplies incoming realtime
+pixels by it unless `if.live.maxbri` is set, so a device left at the factory
+default of 128 silently halves everything the bridge sends. The bridge already
+bakes its own brightness setting into every pixel, so the baseline makes that
+the **only** dimmer. If the strip looks brighter than it used to after upgrading,
+this is why — re-tune the dashboard brightness slider, not the device.
+
+Enforcement is on **transitions only**, so the WLED app stays usable between
+songs; a mode change is what stomps whatever it did.
+
+**The idle look** is what the strip shows when the bridge is not sending. WLED
+renders it standalone, so "no DDP" has a defined appearance instead of leaving
+the last cue frozen on the strip for half an hour. Configure it in the
+dashboard's **Idle Look** panel — mode, effect, palette, colour, brightness,
+speed, intensity, and the grace period. The effect and palette lists come from
+your device (`GET /api/wled`), not from a table baked into the bridge.
+
+Three idle modes: `preset` (WLED renders the chosen effect), `black` (powered
+and owned, showing nothing), and `off` (skip the idle stage and power down at
+the grace period).
+
+Note the idle look appears a couple of seconds *after* the last frame: WLED
+holds the final DDP frame until its own realtime timeout lapses (`if.live.timeout`,
+2.5 s by default).
+
+**Adoption.** A strip powered on by anything else — a reboot, the WLED app, a
+button press — is claimed by the bridge on its next 30 s probe and given the
+idle look, then granted a full idle timeout. That is what ownership means here,
+and it is the one place the bridge overrides an action taken elsewhere.
+
+- Set `IDLE_TIMEOUT=0` to stop the strip ever powering off. It is still owned,
+  and still falls back to its idle look.
 
 ## Architecture
 
@@ -175,10 +218,15 @@ The built-in web dashboard at port 8080 shows:
 - **Connection status** — whether YARG packets are being received
 - **Current cue** — active Stage Kit lighting cue name
 - **BPM / Strobe / Packets/sec / DDP frames** — real-time metrics
-- **WLED power** — on/off state with idle countdown timer and manual toggle
+- **WLED power** — Live / Idle / Off mode with idle countdown timer and manual toggle
 - **Brightness** — 5 step controls (10%, 25%, 50%, 75%, 100%)
 - **Color palette** — dropdown to switch between 12 palettes with live preview swatches
 - **Palette strictness** — slider for how tightly the reactivity layers follow the selected palette (0% = their original fixed colours)
+- **Live strip preview** — what the strip is actually showing. While the bridge
+  is not driving the strip the canvases go black and a caption names why; they
+  are a picture of the strip, not of the bridge's render buffer
+- **Idle look** — the effect, palette, colour and grace period for what the
+  strip shows between songs
 - **Zone bitmask visualization** — 4×8 LED grid with colors matching the active palette
 - **Event log** — scrolling log of cue changes, beats, and strobe events (capped at 200 entries)
 

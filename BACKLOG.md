@@ -46,6 +46,19 @@ In order:
 
 ### Recently closed
 
+- ~~The two ownership items~~ — reported and built 2026-08-25, one cleanup pass.
+  Both are the same missing idea, pointing in two directions: the bridge owns
+  the strips it drives, so every state it can be in has to be one the bridge
+  chose, and the dashboard has to show that state rather than an internal
+  buffer.
+  - [the dashboard showed strip activity while the strip was dark](#done-2026-08-25-bugfix--the-dashboard-showed-strip-activity-while-the-strip-was-dark)
+    — the preview was a picture of the render buffer; it is now a picture of the
+    strip, and the render loop stops composing frames that go nowhere.
+  - [WLED state was undefined whenever the bridge stopped sending](#done-2026-08-25-feature--wled-state-was-undefined-whenever-the-bridge-stopped-sending)
+    — a three-mode ownership machine, an asserted device baseline, and an
+    operator-configurable idle look. Found that master `bri:128` had been
+    halving every DDP pixel.
+
 - ~~YARG v5 rendered the strip solid white~~ — found and fixed on the rig
   2026-08-23/24. YARG PR #1605 inserted a `ushort` fog timer at offset 37, so
   every field after it shifted two bytes and YARG's Beat byte landed under the
@@ -101,6 +114,165 @@ In order:
 Blocking none of the above: the replay harness is **merged to `main`
 (2026-07-29)**, so anything here can lean on it — a recorded passage replayed
 before/after beats remembering last night's show.
+
+---
+
+## DONE 2026-08-25 `bugfix` — The dashboard showed strip activity while the strip was dark
+
+**Reported:** 2026-08-25 by the operator — "web dashboard shows active strip
+activity even while showing no YARG input and WLED off."
+
+Confirmed off the running container before touching any code. With
+`connected: false`, `packets_per_sec: 0.0` and `wled_power.on: false`, the
+status payload still carried a lit blue wash and `layers.wash.active: true`,
+and `render.rendered` climbed 8,078,939 → 8,079,182 across three samples two
+seconds apart. `ddp_frames_sent` was frozen at 420,924 the whole time.
+
+So two separate things were true, and the dashboard conflated them:
+
+- the **DDP gate worked**. Nothing was reaching the strip, exactly as designed.
+- the **render loop never stopped**. It composed a frame from the held cue at
+  60 fps forever, and `preview_snapshot()` published that buffer as if it were
+  the strip.
+
+The 2026-07-29 `output_live` work labelled this correctly but did not fix it:
+`#strip-wrap.not-sending` greyed the canvas to 25 % opacity and captioned it.
+A greyed *animation* still reads as activity, and no amount of CSS makes a
+picture of the render buffer into a true statement about the strip.
+
+### What was built
+
+The preview is now a picture of the **strip**, decided at the source rather than
+in CSS:
+
+- `RenderThread.render_frame()` gained a gate on `wled_power.output_enabled`.
+  When the bridge is not driving the strip it ticks the engine — beat phase, cue
+  counters and strobe stay coherent, so resuming picks up mid-song — and returns
+  black without running the mapper, the strobe, the cross-fade or the send.
+- `preview_snapshot()` gained a `source` field (`live` / `idle` / `off`) and
+  sends empty pixel lists when it is not `live`. SSE consumers that never learn
+  about `source` still render black, because they already render "no data" that
+  way.
+- `render_stats()` gained `idle`, counted separately from `skipped` — the latter
+  means a *missed* frame, and these are not misses. A climbing `rendered` while
+  the strip is dark is the symptom the new counter replaces.
+- The live edge zeroes `_last_sent` and the cross-fade window, so the first cue
+  of a new song cannot fade up from the last cue of the previous one an hour
+  earlier.
+- The dashboard draws black canvases on a non-live source and captions which of
+  the two reasons it is. The two need different things from the operator: an
+  idle look is working as designed, a powered-off strip will not light until
+  YARG starts.
+
+**One bug was introduced and caught during verification.** Stamping
+`_preview_source = LIVE` inside the `want_preview` branch meant a live strip
+reported itself as *off* whenever nobody had the dashboard open, since preview
+capture is gated on `tracker.has_subscribers`. The source is now stamped on
+every live frame; capture stays gated. Pinned by
+`test_a_live_strip_is_never_reported_as_off_just_because_nobody_is_watching`.
+
+Measured on a local bridge against a stand-in WLED: idle at 40 fps reports
+`rendered: 0, idle: 641` with `preview.source: "off"`, against a continuously
+climbing `rendered` before the change.
+
+---
+
+## DONE 2026-08-25 `feature` — WLED state was undefined whenever the bridge stopped sending
+
+**Reported:** 2026-08-25 by the operator — "wled state when ddp not being sent
+feels inconsistent. any wled strip controlled by this dashboard should be
+considered owned, so default patterns, etc can be enforced."
+
+`protocol/wled_api.py` could do exactly three things: `set_power`, `is_on`,
+`fetch_wifi_info`. Nothing else about the device was ever asserted, so between
+songs the strip showed whatever the WLED app, a preset, a sync packet or a
+reboot had last left on it. Read off `192.168.0.53` before the change:
+
+| Field | Value | Consequence |
+|---|---|---|
+| `def` | `{"ps":0,"on":true,"bri":128}` | a power blip brings the strip up lit at half brightness, unowned |
+| `bri` | `128` | with `if.live.maxbri:false`, **every DDP pixel was silently halved** |
+| `seg[0].fx` / `col` | `0` / `[255,160,0]` | realtime lapses back to solid amber |
+| `udpn.recv` | `true` | any other WLED node on the LAN could repaint this strip |
+| `transition` | `7` | 700 ms fades fighting cue timing on every state change |
+| `if.live.timeout` | `25` | the strip holds the final DDP frame for 2.5 s after we stop |
+
+The brightness row is the one with a visible consequence on stage: the operator's
+brightness slider was being multiplied by a second, invisible dimmer.
+
+### The decisions
+
+Both were the operator's, taken before implementation:
+
+- **Idle behaviour: WLED-native preset.** The bridge stops sending and hands the
+  device a look to run standalone, rather than rendering an idle pattern over
+  DDP. Cheapest on network and CPU, and it gives "no DDP" a defined meaning.
+- **Enforcement: on transitions only.** The baseline is asserted at bridge
+  start, at each power-on, and when adopting a strip powered up externally —
+  not continuously. The WLED app stays usable between songs; only a mode change
+  stomps what it did.
+
+### What was built
+
+A three-mode machine on `WLEDPowerManager`, where every mode is a state the
+bridge chose:
+
+| Mode | Means | Entered when |
+|---|---|---|
+| `LIVE` | baseline asserted, DDP frames own every pixel | YARG or a test pattern is feeding us |
+| `IDLE` | powered and owned, WLED renders the idle look itself | quiet longer than the grace period |
+| `OFF` | powered down | quiet past the idle timeout |
+
+`mode` is derived from two stored booleans rather than stored itself, because
+they answer different questions and can disagree: `_wled_on` is a *belief* about
+the device that the world can change behind our back, `_output_live` is a *fact*
+about our own behaviour that nothing else can touch.
+
+- `assert_live_baseline()` — `bri:255` (the bridge's own brightness becomes the
+  only dimmer), `transition:0`, `lor:0`, nightlight off, `udpn.recv:false`,
+  segment 0 spanning the strip unfrozen and ungrouped, `fx:0` on black so a
+  lapsed realtime falls back to dark rather than amber. Asserted *before* the
+  DDP gate opens; a failed assertion leaves the gate shut rather than painting
+  a look nobody can debug off the strip.
+- `apply_idle_look()` — operator-configurable effect, palette, colour,
+  brightness, speed and intensity, pushed with a 700 ms transition. Three idle
+  modes: `preset`, `black` (owned but unlit), `off` (skip the idle stage and
+  power down at the grace period).
+- **Adoption now claims the strip.** A device someone else powered on gets the
+  idle look, not whatever preset was on it. This is the one place the bridge
+  overrides a deliberate action taken elsewhere, and it is the direct meaning of
+  the operator's "should be considered owned". It replaces the 2026-07-29
+  behaviour of leaving an externally-lit strip alone for a full idle timeout.
+- **Manual Turn On claims rather than drives**, so pressing it with no song
+  playing gives the defined idle look instead of resurrecting whichever cue the
+  last song ended on. If YARG *is* streaming, `on_activity()` fires ~88 times a
+  second and pulls it to `LIVE` within a frame or two.
+- **A test pattern is activity.** `_run_test_beats()` ticks `on_test_activity()`
+  per beat instead of once at start, so the grace period cannot pull the strip
+  into its idle look partway through a test.
+- **The watchdog is woken, not polled.** `on_activity()` sets an event that cuts
+  the 5 s tick short. Deferred power-on used to wait for the next tick;
+  measured idle → live in **0.04 s** of the first packet, against up to 5 s.
+- The grace fallback runs even with `IDLE_TIMEOUT=0`. Handing the strip a
+  defined look is ownership, not power saving.
+
+### Verified end to end
+
+Against a stand-in WLED (JSON API + DDP sink) rather than the operator's rig,
+driving the full lifecycle: power-on → baseline POST → 2,800 DDP frames →
+grace expiry → idle-look POST carrying the operator's chosen colour and effect
+→ idle timeout → `{"on": false, "tt": 7}`. The dashboard's JS was exercised
+against a DOM stub across live / idle / off / recovery / pre-upgrade payloads.
+
+654 tests pass; no golden digest moved.
+
+### Not done, deliberately
+
+The device's boot default (`def.ps:0, on:true, bri:128`) is a `/json/cfg` write,
+not a state write. Leaving it alone means a rebooted strip comes up lit and
+unowned for up to one 30 s probe cycle, after which adoption claims it. Writing
+cfg is a heavier, riskier operation than this item needs — worth raising with
+the operator separately.
 
 ---
 
