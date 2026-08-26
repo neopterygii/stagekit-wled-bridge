@@ -70,12 +70,28 @@ jobs:
             type=sha,prefix=
             type=raw,value=latest,enable={{is_default_branch}}
 
+      # The dashboard reports this back so the operator can tell which image a
+      # container is running. Generated here rather than in the Dockerfile: a
+      # RUN date would be served from the layer cache and report the build it
+      # was cached from, which is precisely the lie the version line exists to
+      # catch.
+      - name: Build timestamp
+        id: build_time
+        run: echo "value=$(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
+          # BUILD_VERSION only on a v* tag. On a branch build meta.outputs.version
+          # is the branch name, and passing that would have the dashboard report
+          # "vmain" instead of falling back to version.py's __version__.
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.build_time.outputs.value }}
+            BUILD_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && steps.meta.outputs.version || '' }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

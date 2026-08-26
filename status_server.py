@@ -16,6 +16,7 @@ from protocol.yarg_packet import (
     CueByte, BeatByte, SceneIndexByte, StrobeSpeed, CameraCutSubject,
     VenueSizeByte, SongSectionByte,
 )
+from version import BUILD_INFO
 
 log = logging.getLogger(__name__)
 
@@ -247,6 +248,11 @@ class StatusTracker:
             "sp_active": self.sp_active,
             "sp_charge": round(self.sp_charge, 2),
             "sp_active_count": self.sp_active_count,
+            # Static for the process's lifetime, but carried on the same
+            # snapshot as everything else so "which image is this?" is
+            # answerable from the one endpoint the operator already curls, and
+            # so the dashboard needs no second request to fill its version line.
+            "version": BUILD_INFO,
         }
         if wled_power:
             d["wled_power"] = wled_power.power_snapshot()
@@ -429,10 +435,18 @@ STATUS_HTML = """\
   .hidden { display: none; }
   .scene-label { font-size: 0.7rem; color: var(--dim); margin-top: 0.25rem;
                  text-transform: uppercase; letter-spacing: 0.05em; }
+  /* Build identity. Deliberately quiet: it is something to go looking for when
+     a deploy is in doubt, not something to read during a show. Hover gives the
+     full commit and build time. */
+  .build { font-size: 0.7rem; color: var(--dim); font-weight: 400;
+           letter-spacing: 0.02em; margin-left: 0.6rem; white-space: nowrap; }
+  /* A checkout build is a developer running from source, not the image CI
+     pushed — worth flagging, because it is never what the rig should be on. */
+  .build.checkout { color: var(--yellow); }
 </style>
 </head>
 <body>
-<h1><img src="data:image/png;base64,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" alt="YARG" style="width:24px;height:24px;vertical-align:middle;margin-right:6px"> Stage Kit Bridge <span class="test-indicator off" id="test-badge">TEST MODE</span></h1>
+<h1><img src="data:image/png;base64,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" alt="YARG" style="width:24px;height:24px;vertical-align:middle;margin-right:6px"> Stage Kit Bridge <span class="test-indicator off" id="test-badge">TEST MODE</span><span class="build" id="build-label"></span></h1>
 
 <div class="grid">
   <div class="card">
@@ -655,6 +669,10 @@ const ZONE_NAMES = ['red','green','blue','yellow'];
 let ZONE_COLORS = { red: '#f85149', green: '#3fb950', blue: '#58a6ff', yellow: '#d29922' };
 const ZONE_OFF = '#21262d';
 let lastCue = '', lastStrobe = -1, lastBeat = -1, activePattern = '';
+// Written once, on the first snapshot. The build cannot change under a
+// running process, and rewriting it at 10 Hz would defeat text selection
+// for anyone trying to copy the commit out of the page.
+let buildShown = false;
 
 function rgbToHex(r, g, b) {
   return '#' + ((1<<24)+(r<<16)+(g<<8)+b).toString(16).slice(1);
@@ -1300,6 +1318,19 @@ function update(d) {
     document.getElementById('cue').textContent = d.cue;
     addLog('<span class="cue">CUE \\u2192 ' + d.cue + '</span>');
     lastCue = d.cue;
+  }
+
+  // Build identity — see `buildShown`. `version` is absent from a snapshot
+  // produced by an older bridge, so the line stays empty rather than reading
+  // "undefined" at the operator during exactly the deploy they are checking.
+  if (!buildShown && d.version && d.version.label) {
+    const b = document.getElementById('build-label');
+    b.textContent = d.version.label;
+    b.title = 'commit ' + (d.version.commit || 'unknown')
+            + (d.version.built ? '\\nbuilt ' + d.version.built : '')
+            + '\\nsource: ' + d.version.source;
+    b.classList.toggle('checkout', d.version.source !== 'image');
+    buildShown = true;
   }
 
   // HELD pill — the cue above is the last one received, not a live one. A

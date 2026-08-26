@@ -46,6 +46,15 @@ In order:
 
 ### Recently closed
 
+- ~~The held cue outlived its sender~~ — reported and built 2026-08-25;
+  [write-up](#done-2026-08-25-bugfix--the-held-cue-was-never-released-so-it-outlived-the-sender-by-hours).
+  The 2026-07-29 ruling to *label* a held cue was right; leaving it unbounded
+  was not. The watchdog now releases it at the same moment it stops driving the
+  strip. Shipped with
+  [build identity on the dashboard](#done-2026-08-25-feature--the-dashboard-could-not-say-which-image-it-was-running),
+  so a deploy can be confirmed from the status page and `docker logs`. No golden
+  digest moved.
+
 - ~~The two ownership items~~ — reported and built 2026-08-25, one cleanup pass.
   Both are the same missing idea, pointing in two directions: the bridge owns
   the strips it drives, so every state it can be in has to be one the bridge
@@ -114,6 +123,149 @@ In order:
 Blocking none of the above: the replay harness is **merged to `main`
 (2026-07-29)**, so anything here can lean on it — a recorded passage replayed
 before/after beats remembering last night's show.
+
+---
+
+## DONE 2026-08-25 `bugfix` — The held cue was never released, so it outlived the sender by hours
+
+**Reported:** 2026-08-25 by the operator — "seems like it's still holding a cue
+after yarg and wled are off."
+
+Confirmed off the running container before touching any code. The rig was
+genuinely dark — WLED itself reported `on:false`, `live:false`, `lip:""`, so no
+realtime latch — and the bridge agreed: `output_live:false`,
+`wled_power.mode:"off"`. What was still lit was the bridge's own state, ninety
+minutes after the last packet:
+
+```json
+"cue": "DEFAULT", "cue_id": 0, "connected": false, "cue_held": true,
+"zones": {"blue": "11111111", ...}
+```
+
+This is the 2026-07-29 `cue_held` work behaving exactly as specified. The
+operator was asked then whether to label or reset, and chose **label**. What
+that decision did not settle is how *long* the label should be allowed to stand.
+
+### The hold was unbounded, and that is a different question from whether to hold
+
+The justification for latching is real and unchanged: YARG streams at ~88 Hz,
+and blacking out on one dropped datagram would be far worse than briefly showing
+a stale cue. That is a two-second concern. It says nothing about ninety minutes.
+
+And past the point where the bridge has stopped driving the strip, the hold had
+a **functional** cost, not only a cosmetic one. `CueEngine.on_cue()` returns
+early when the byte has not changed, so the engine kept a full set of pattern
+primitives anchored to a `_clock()` reading from the previous session — and the
+strip's *defined* appearance had already moved on to the idle look, which is the
+very thing `_enter_idle()` exists to guarantee. Its docstring says so: an idle
+strip must not be "whatever the last cue painted frozen on the strip for the
+next half hour." The internal state was contradicting the device state.
+
+### The release point: the watchdog, not a new timer
+
+Chosen because the bridge already has a considered answer to "is the sender
+gone?" — the grace period that pulls the strip from LIVE to IDLE (15 s by
+default). Reusing it means there is one such judgement in the system rather than
+two that can disagree, and the release lands exactly when the strip stops being
+driven. Sub-second dropped-packet resilience is untouched: the `HELD` pill still
+appears the moment `connected` goes false, and still stands for the whole grace
+period. It is now bounded rather than removed.
+
+`WLEDPowerManager` gained a `_close_output_gate()` — the single falling edge of
+`_output_live`, shared by both exits (`_enter_idle` and `_power_off`) so the
+release fires exactly **once** however the strip is left, including the
+"skip the idle stage" spec where the first delegates to the second. It is
+guarded on `was_live`, so the idle→off hop half an hour later does not
+re-release already-released state, and wrapped in a try/except: the callback is
+a courtesy to the cue path and must never be able to abandon a `to_thread` mode
+transition half-done and leave the strip powered on at full draw.
+
+### The trap: three layers change-gate the cue, and releasing some is worse than releasing none
+
+`YARGProtocol` keeps its own `_last_cue`, separate from the engine's
+`_current_cue` and from the tracker's. Releasing the engine while leaving
+`_last_cue` holding `DEFAULT` would have been a **worse bug than the one being
+fixed**: `DEFAULT` is the most common opening cue there is, so the next song
+would compare equal, never reach `engine.on_cue()`, and play to a dark strip
+until some *other* cue happened along.
+
+So `release_latched_state()` resets all five detectors to the `-1` they were
+constructed with — a value no real byte can equal — and the first packet of the
+next stream re-sends the whole set. The engine is rebuilt from the stream rather
+than from what survived it. `test_the_same_cue_re_arms_after_a_release` is the
+test that holds this shut, and it is the one that fails first under mutation.
+
+### Verified end to end
+
+Nine tests in `tests/test_cue_release.py`, mutation-checked three ways (drop the
+detector reset → the re-arm test fails; drop the `was_live` guard → the
+double-fire tests fail; drop the release → the three that assert it fire,
+including the end-to-end `cue_held` one). Full suite 666 passed; **no golden
+digest moved**, as expected — the engine change is inert until a release fires,
+and replay never reaches the watchdog.
+
+Then against the real `main.py` with a fake WLED and a synthetic sender:
+
+```
+t+00s  sender stops
+t+01s  cue=CHORUS  held=True   conn=False  out_live=True   wled=live   ← resilience window
+t+15s  WLED: no activity for 15s — falling back to the idle look
+       cue=NO_CUE  held=False  conn=False  out_live=False  wled=idle   ← released
+t+25s  WLED: powered OFF (idle)                                        ← no second release
+```
+
+and the sender returning on the **same** cue byte it was released from came back
+as `cue=CHORUS, held=False, wled=live`.
+
+---
+
+## DONE 2026-08-25 `feature` — The dashboard could not say which image it was running
+
+**Requested:** 2026-08-25 by the operator, alongside the cue-release fix — "let's
+start versioning as well so I can confirm I'm on the right image from the
+dashboard easily."
+
+Worth stating what this can and cannot be. A version constant in the source
+reports what the *source tree* says; it cannot tell you what the registry handed
+Docker, which is precisely the gap the operator is trying to close when a deploy
+looks like it did not take. So the identifying fields are injected at **image
+build time** and nothing else is trusted:
+
+| field | where it comes from | lies if |
+|---|---|---|
+| `commit` | `BUILD_SHA` build arg ← `github.sha` | never — it is the commit CI built |
+| `built` | `BUILD_TIME` build arg, generated in a CI step | never |
+| `version` | `BUILD_VERSION` on a `v*` tag, else `version.py`'s `__version__` | the tree's `__version__` was not bumped |
+| `source` | `image` when a SHA was injected, else `checkout` | never |
+
+The timestamp is generated in a workflow step rather than by a `RUN date` in the
+Dockerfile: a `RUN` layer is served from the build cache and would report the
+build it was cached from — the exact lie the version line exists to catch. The
+build args are declared **after** `COPY`, since they change every commit and an
+earlier `ARG` would invalidate the cache for everything below.
+
+`BUILD_VERSION` is passed only on a `v*` tag. On a branch build
+`meta.outputs.version` is the branch name, and passing it unconditionally would
+have the dashboard report `vmain`.
+
+Surfaced in three places, deliberately: the `/api/status` payload (scriptable,
+and the endpoint triage already curls), a quiet line beside the dashboard title
+(hover for commit, build time and source), and the **startup banner** — `docker
+logs` is the one place the operator can read it when the status port is
+unreachable, which is the case whenever a bad deploy is the thing in doubt. A
+`checkout` build renders in yellow, because that is a developer running from
+source and never what the rig should be on.
+
+The dashboard writes the line once, on the first snapshot, rather than at 10 Hz:
+rewriting it would defeat text selection for anyone trying to copy the commit
+out of the page. It also guards on `d.version` being present, so an older bridge
+does not read `undefined` at the operator during exactly the deploy they are
+checking.
+
+`__version__` is set to **1.1.0**; the repo is tagged `v1.0.0`. Tag the release
+commit `v1.1.0` to make the two agree — until then a built image reports
+`v1.1.0 · <sha>` from the source constant, with the SHA as the field that
+actually identifies it.
 
 ---
 
@@ -1564,6 +1716,14 @@ what the strip paints changed, and no golden digest moved — which was the
 check that this commit stayed in its lane. A reset remains available as its own
 decision if wanted; it is a lighting-behaviour change and should be judged as
 one.
+
+**Followed up 2026-08-25**: the label was right, but it was allowed to stand
+indefinitely, and the operator reported a cue still held ninety minutes after
+the strip powered off. The hold is now *bounded* rather than removed — see
+[the held cue was never released](#done-2026-08-25-bugfix--the-held-cue-was-never-released-so-it-outlived-the-sender-by-hours).
+The pill still appears the moment `connected` goes false and still stands for
+the whole grace period; the watchdog releases at the same moment it stops
+driving the strip.
 
 ### What was built
 

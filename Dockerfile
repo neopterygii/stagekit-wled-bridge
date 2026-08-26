@@ -12,6 +12,22 @@ COPY . .
 # across container recreates.
 VOLUME ["/data"]
 
+# Build identity, surfaced on the dashboard and in the startup banner so the
+# operator can confirm which image a container is actually running. Declared
+# after COPY on purpose: these change on every commit, and an earlier ARG would
+# invalidate the layer cache for everything below it.
+ARG BUILD_SHA=""
+ARG BUILD_TIME=""
+ARG BUILD_VERSION=""
+# Quoted: BUILD_TIME carries spaces, and an unquoted value is easy to misread
+# as safe here even though Docker does preserve it.
+ENV BUILD_SHA="$BUILD_SHA" \
+    BUILD_TIME="$BUILD_TIME" \
+    BUILD_VERSION="$BUILD_VERSION"
+LABEL org.opencontainers.image.revision="$BUILD_SHA"
+LABEL org.opencontainers.image.version="$BUILD_VERSION"
+LABEL org.opencontainers.image.created="$BUILD_TIME"
+
 EXPOSE 36107/udp
 EXPOSE 8080/tcp
 

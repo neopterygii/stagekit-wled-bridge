@@ -229,6 +229,9 @@ The built-in web dashboard at port 8080 shows:
   strip shows between songs
 - **Zone bitmask visualization** — 4×8 LED grid with colors matching the active palette
 - **Event log** — scrolling log of cue changes, beats, and strobe events (capped at 200 entries)
+- **Build identity** — a quiet line beside the title naming the version and the
+  commit the image was built from; hover for the build time and source. See
+  [Versioning](#versioning)
 
 ### Test Controls
 
@@ -315,6 +318,33 @@ See [WLED_SETUP.md](WLED_SETUP.md) for detailed WLED configuration instructions.
 | Score | Trails, Sparkle | Timed dual chase with continuous confetti |
 | Blackout | — | All LEDs off |
 
+## Versioning
+
+The bridge reports which image it is running, so a deploy can be confirmed
+rather than assumed. It appears in three places:
+
+- the dashboard, beside the title (hover for commit, build time and source);
+- `GET /api/status` under `version`, for scripting;
+- the startup banner — `docker logs` is the only one of the three that works
+  when the status port is unreachable, which is usually when it matters.
+
+```bash
+curl -s http://<host>:<STATUS_PORT>/api/status | jq .version
+docker logs stagekit-wled-bridge 2>&1 | head -1
+```
+
+`commit` and `built` are injected at **image build time** by CI, so they
+identify the image rather than the source tree — that distinction is the whole
+point when a deploy looks like it did not take. `source` is `image` for a CI
+build and `checkout` when running from source, where `git describe` fills in
+instead; a `checkout` build renders in yellow on the dashboard, because it is
+never what the rig should be on.
+
+`version` comes from `__version__` in `version.py`, except on a `v*` tag build,
+where the tag wins. **Bump `__version__` and tag the release commit to match** —
+a forgotten bump shows up as a mismatch between the reported version and the
+commit rather than shipping silently.
+
 ## Development
 
 ### Tests
@@ -388,12 +418,22 @@ docker build -t stagekit-wled-bridge .
 docker run --network host -e WLED_HOST=192.168.0.53 stagekit-wled-bridge
 ```
 
+A locally built image carries no build args, so it reports itself as an unknown
+build. Pass them to match what CI produces:
+
+```bash
+docker build -t stagekit-wled-bridge \
+  --build-arg BUILD_SHA="$(git rev-parse HEAD)" \
+  --build-arg BUILD_TIME="$(date -u +'%Y-%m-%d %H:%M UTC')" .
+```
+
 ### Project Structure
 
 ```
 ├── main.py                  # Entry point — render thread + asyncio event loop
 ├── config.py                # Environment variable configuration
 ├── settings.py              # Persistent settings (brightness, palette)
+├── version.py               # Build identity (CI-injected commit + build time)
 ├── status_server.py         # Web dashboard + SSE + test controls
 ├── test_sender.py           # Standalone fake YARG packet generator
 ├── protocol/
