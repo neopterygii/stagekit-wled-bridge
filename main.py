@@ -15,6 +15,7 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 
 from config import (
     YARG_LISTEN_HOST, YARG_LISTEN_PORT,
@@ -25,7 +26,9 @@ from config import (
     CAPTURE_DIR,
     LOG_LEVEL,
 )
-from protocol.yarg_packet import parse_packet, CueByte, KNOWN_DATAGRAM_VERSIONS
+from protocol.yarg_packet import (
+    parse_packet, CueByte, StrobeSpeed, KNOWN_DATAGRAM_VERSIONS,
+)
 from protocol.ddp_sender import DDPSender
 from protocol.wled_api import WLEDApi
 from effects.cue_engine import CueEngine
@@ -34,6 +37,7 @@ from effects.palette_map import build_ring
 from status_server import StatusTracker, StatusServer
 from settings import BridgeSettings, DEFAULT_IDLE
 from replay.controller import CaptureController
+from version import VERSION_LABEL
 
 log = logging.getLogger(__name__)
 
@@ -179,6 +183,44 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.tracker.on_paused(pkt.paused == 2)
         self.tracker.on_star_power(pkt.sp_active, pkt.sp_charge, pkt.sp_active_count)
 
+    def release_latched_state(self):
+        """Forget the cue latched from a sender that has gone away.
+
+        Everything above is change-gated — the engine is told about a cue only
+        when the byte differs from the last one — so nothing off the packet path
+        ever clears it. That is right on the timescale the gating exists for:
+        YARG streams at ~88 Hz, and blacking out on a dropped datagram would be
+        far worse than briefly holding the last cue. It is wrong once the sender
+        has been gone long enough that the bridge has stopped driving the strip
+        altogether, which is when the watchdog calls this: past that point the
+        held cue is not resilience, it is a stale frame the dashboard has to
+        apologise for and an engine full of patterns anchored to a `_clock()`
+        reading from the previous session.
+
+        **Both halves matter.** Resetting the engine without resetting the
+        change detectors below is worse than doing nothing: with `_last_cue`
+        still holding DEFAULT and the engine released to NO_CUE, the next song
+        opening on DEFAULT — the most common opening cue there is — compares
+        equal, never reaches `engine.on_cue()`, and plays to a dark strip until
+        some *other* cue happens along. So every detector goes back to the -1 it
+        was constructed with, which no real byte can equal, and the first packet
+        of the next stream re-sends the whole set.
+
+        Called from the watchdog's worker thread, not the event loop. That is
+        the same concurrency the render thread already sees from
+        `datagram_received` — `on_cue()` rebinds its pattern lists rather than
+        mutating them, so a reader sees the old set or the new one, never a
+        half-cleared one.
+        """
+        self._last_cue = -1
+        self._last_strobe = -1
+        self._last_camera_subject = -1
+        self._last_venue_size = -1
+        self._last_song_section = -1
+        self.engine.on_cue(CueByte.NO_CUE)
+        self.engine.on_strobe(StrobeSpeed.OFF)
+        self.tracker.on_cue(CueByte.NO_CUE)
+
 
 class DeviceMode:
     """How the bridge is currently driving the strip it owns.
@@ -246,6 +288,12 @@ class WLEDPowerManager:
         # the strip powers on, which reads on the rig as the bridge being slow
         # to notice YARG.
         self._wake = asyncio.Event()
+        # Called once each time the manager stops driving the strip, to let the
+        # cue path drop what it latched from the departed sender. Set after
+        # construction because the protocol that owns that state takes this
+        # manager as a constructor argument — the dependency only runs one way
+        # at build time, and back the other way at runtime.
+        self.on_release: Callable[[], None] | None = None
 
     # ── mode ────────────────────────────────────────────────────────────
 
@@ -416,6 +464,36 @@ class WLEDPowerManager:
         self._output_live = True
         log.info("WLED: live (baseline asserted, DDP flowing)")
 
+    def _close_output_gate(self):
+        """Stop driving the strip, and release what the cue path latched.
+
+        The single falling edge of `_output_live`, shared by both exits (idle
+        and power-off) so the release fires exactly once however the strip is
+        left. `_enter_idle()` delegating to `_power_off()` for the "skip the
+        idle stage" spec therefore does not double-fire: the first call already
+        cleared the flag, so the second sees `was_live` False.
+
+        Guarded rather than unconditional because a release is only meaningful
+        if there was something to release. `_power_off()` also runs on a strip
+        that has been sitting idle for half an hour, and firing there would mean
+        re-releasing already-released state on every such transition.
+
+        The callback is a courtesy to the cue path, not part of owning the
+        device: it must never be able to leave the strip powered on because the
+        cue engine raised. Hence the try/except — this runs on the watchdog's
+        worker thread, where an escape would surface as the whole `to_thread`
+        call failing and the mode transition being abandoned half-done.
+        """
+        was_live = self._output_live
+        self._output_live = False
+        self._idle_push_pending = False
+        if was_live and self.on_release is not None:
+            try:
+                self.on_release()
+            except Exception:
+                log.exception("cue release failed — the strip is still being "
+                              "left correctly, but the last cue stays latched")
+
     def _enter_idle(self):
         """Close the DDP gate and hand the strip a look to run on its own.
 
@@ -424,8 +502,7 @@ class WLEDPowerManager:
         lapses. Even so the look does not *appear* until that timeout
         (~2.5 s here) — WLED holds the last DDP frame until then.
         """
-        self._output_live = False
-        self._idle_push_pending = False
+        self._close_output_gate()
         spec = self._idle_spec()
         if spec.get("mode") == "off":
             # The operator chose to skip the idle stage entirely.
@@ -438,8 +515,7 @@ class WLEDPowerManager:
                         "the last frame until its realtime timeout lapses")
 
     def _power_off(self):
-        self._output_live = False
-        self._idle_push_pending = False
+        self._close_output_gate()
         if self._api.set_power(False, transition_ms=700):
             self._wled_on = False
             log.info("WLED: powered OFF (idle)")
@@ -1063,7 +1139,10 @@ class RenderThread(threading.Thread):
 
 async def main():
     idle_mins = IDLE_TIMEOUT // 60 if IDLE_TIMEOUT else 0
-    log.info("YARG → WLED Stage Kit Bridge")
+    # Version first, and in the log as well as on the dashboard: `docker logs`
+    # is the one place the operator can read it without the status port being
+    # reachable, which is the case whenever a bad deploy is the thing in doubt.
+    log.info("YARG → WLED Stage Kit Bridge %s", VERSION_LABEL)
     log.info("  Listening on %s:%d", YARG_LISTEN_HOST, YARG_LISTEN_PORT)
     log.info("  Sending DDP to %s:%d", WLED_HOST, WLED_DDP_PORT)
     log.info("  LED count: %d", LED_COUNT)
@@ -1098,6 +1177,11 @@ async def main():
         lambda: YARGProtocol(engine, tracker, wled_power, capture=capture),
         local_addr=(YARG_LISTEN_HOST, YARG_LISTEN_PORT),
     )
+
+    # Close the loop between the two: the manager decides when the sender is
+    # gone, the protocol owns the state latched from it. Wired here because the
+    # protocol does not exist until create_datagram_endpoint has run.
+    wled_power.on_release = protocol.release_latched_state
 
     # Start status broadcast task
     broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power, settings=settings))
