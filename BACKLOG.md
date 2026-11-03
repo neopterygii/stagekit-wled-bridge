@@ -43,6 +43,8 @@ In order:
 4. **W5 — WLED firmware qualification** (`ops`). The desync item is an argument
    *for* W5 but also a reason to gather evidence before it, since a firmware
    upgrade could mask the cause rather than fix it.
+5. **Review: should the smooth cues show the beat?** (`review`) — new
+   2026-11-02. [Write-up below](#open-review--the-smooth-cues-are-tempo-locked-but-nothing-on-the-strip-marks-the-beat).
 
 ### Recently closed
 
@@ -130,6 +132,37 @@ Blocking none of the above: the replay harness is **merged to `main`
 before/after beats remembering last night's show.
 
 ---
+
+## OPEN `review` — The smooth cues are tempo-locked, but nothing on the strip marks the beat
+
+**Requested:** 2026-11-02 by the operator — "review if our smooth effects like
+the auto ones and sweep should have a beat/bpm indicator."
+
+The cues in question glide rather than step: `WARM_AUTOMATIC` and
+`COOL_AUTOMATIC` (an opposing-pair chase at `cycles_per_beat=0.25` over 4
+steps, plus a counter-rotating accent at `0.125` over 8) and `SWEEP` (`0.25`
+over 4, trails 10). All three are already beat-locked: each advances exactly
+one step per beat and launches in phase with the beat clock. But the motion is
+continuous, so the tempo shows only as speed — nothing on the strip lands *on*
+the beat. Cues like `BIG_ROCK_ENDING` already pump brightness on the beat
+through the beat oscillator, so the machinery exists.
+
+Decide, with the operator watching the rig:
+
+- **Whether** these cues should mark the beat at all. Their job in YARG's
+  vocabulary is ambient motion for calmer sections; an accent could make them
+  busier than the chart intends. Check what YALCY and a real Stage Kit show for
+  them (Stage Kit steps the masks, so its beat is visible as the step) and what
+  photonics-dmx does.
+- **Where**: on the strip (a gentle on-beat brightness swell, a downbeat-only
+  accent, or easing the glide so it dwells on each step), or only as an
+  indicator on the dashboard's Stage Kit card.
+- **Scope**: whether it extends to the other glide cues (`HARMONY`,
+  `SEARCHLIGHTS`, the scanners) for consistency.
+
+Confirm what the operator means by "beat/bpm indicator" before building — see
+the memory note on confirming rig reports. Any strip change moves the golden
+replay digests; which fixtures move is the evidence.
 
 ## DONE 2026-11-02 `feature` — The dashboard showed zone bitmasks, not the pattern
 
