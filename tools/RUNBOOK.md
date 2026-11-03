@@ -7,6 +7,19 @@ the reasoning.
 Background: `evidence/desync-latency-investigation-2026-07-28.md` and
 `evidence/wled-realtime-latch-2026-07-28.md`.
 
+**The controller runs WLED 16.0.1 since ~2026-11**, which has no `/json/live`.
+The tools now read the device through `tools/wled_peek.py` — the websocket
+live peek, falling back to `/json/live` on firmware that still has it — and
+print which one they used. Numbers below dated 2026-07-28 were taken through
+`/json/live` on 0.14.4 and carry a different systematic offset: compare
+16.x readings with 16.x readings.
+
+**Check for a second sender first.** `curl -s http://192.168.0.53/json/info`
+→ `live`/`lm`/`lip`: `lip` is whoever last wrote the realtime buffer. On
+2026-11-02 it was the YARG PC (`192.168.0.15`) — YALCY's WLED output, sending a
+10 Hz keep-alive alongside the bridge. Two senders interleave frames on the
+strip, and that looks exactly like a desync.
+
 ## If it is happening right now — do this first, before anything else
 
 **Do not power cycle yet.** The bad state is the evidence. Capture it:
@@ -19,7 +32,8 @@ curl -s http://192.168.0.53/json/info | .venv/bin/python -m json.tool | grep -E 
 curl -s http://192.168.0.53/json/cfg  | .venv/bin/python -c \
   'import sys,json; t=json.load(sys.stdin)["if"]["live"]["timeout"]; print("realtime timeout:", t*100, "ms", "<-- NEVER TIMES OUT" if t*100==65000 else "(ok)")'
 
-# 2. Is the strip showing what the bridge sent?  (works even on a static strip)
+# 2. Is the strip showing what the bridge sent?  (works even on a static strip;
+#    refuses if the bridge isn't rendering, and names a second sender if any)
 .venv/bin/python tools/frame_match.py
 
 # 3. How far behind is it?  Needs the song *playing* — aperiodic motion.
@@ -56,11 +70,18 @@ Answers "is it the bridge, the network, or the device". Healthy values measured
 .venv/bin/python -m tools.wled_lag step --cycles 12                 # [145-164 ms]
 
 # Bridge removed. Stop the bridge's DDP output first, or both fight for the
-# same realtime buffer and the last writer wins.
+# same realtime buffer and the last writer wins. The probe refuses to start
+# while WLED is still in realtime mode and names the sender (`lip`); it also
+# switches WLED on for the run if it is off (the peek reads black while off)
+# and restores it afterwards.
 curl -s -X POST http://192.168.0.230:36180/api/power -d '{"action":"off"}'
-.venv/bin/python -m tools.wled_lag step --direct --cycles 12        # [22.8 ms]
+.venv/bin/python -m tools.wled_lag step --direct --cycles 12        # [22.8 ms on 0.14.4]
 curl -s -X POST http://192.168.0.230:36180/api/power -d '{"action":"on"}'
 ```
+
+Through the websocket peek every step latency includes up to one push interval
+(~44 ms measured, so ~22 ms on average) of waiting for the next frame. The
+summary prints the observed interval.
 
 The gap between those two is the bridge's own contribution — ~120 ms of it was
 the cue crossfade, which was a flat 250 ms until 2026-07-29.
@@ -93,16 +114,21 @@ FPS, about 220,000 frames an hour.
 |---|---|---|
 | `wled_lag probe` | aperiodic motion on the strip | the cue is repetitive — flags `[AMBIGUOUS]`, retry for a clean window |
 | `wled_lag step` | to own the cue | another sender is feeding the bridge — every step reads "not seen" |
-| `wled_lag step --direct` | bridge DDP stopped | the bridge is still sending |
-| `frame_match.py` | nothing; works on a static strip | — (content check, not timing) |
+| `wled_lag step --direct` | no other DDP sender | — (refuses, naming `lip`) |
+| `frame_match.py` | the bridge rendering; works on a static strip | — (refuses on an empty preview) |
+| any of them, via the peek | WLED on, nobody else using its live view | — (refuses: WLED off reads black; WLED's UI live preview takes the single live-view slot) |
+
+If no device read ever succeeds, the step summary now prints the read error
+(off, stale peek, 501) instead of "never visibly reacted".
 | `wled_soak` | nothing | — |
 
 Absolute lag values carry a systematic offset and can come back negative, which
 is physically impossible. **Only compare deltas.**
 
 Polling the ESP32 perturbs it: `/json/live` at ~20 Hz measurably loads the
-device. Keep probes short and occasional, and prefer a probe-free window when
-asking "does it look bad to you".
+device. The websocket peek is a ≤25 Hz push with no HTTP handling, which should
+be lighter, but that is unmeasured. Keep probes short and occasional, and
+prefer a probe-free window when asking "does it look bad to you".
 
 ## Known-good reference values (2026-07-28, after the realtime-timeout fix)
 
@@ -110,7 +136,7 @@ asking "does it look bad to you".
 |---|---|
 | lag, via bridge, song playing | −40 to −60 ms, corr > 0.9 |
 | step latency, via bridge | 145–164 ms median at the old flat 250 ms crossfade; expect ~55–80 ms on a base-fade cue once `cue_fade_ms=120` is deployed, and ~25–35 ms on a snapping cue |
-| step latency, direct DDP | ~23 ms median |
+| step latency, direct DDP | ~23 ms median (0.14.4, `/json/live`); **29 ms** median, n=12, via the peek on 16.0.1 (2026-11-02; may have overlapped YALCY starting — retake in a clean window) |
 | frame match | mean per-channel diff ~0.1, worst ~1 |
 | device RSSI | −34 fresh; drifts ~−1.4 dB/h, benign to at least −40 |
 | device heap | ~181,000, flat |
