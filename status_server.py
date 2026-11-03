@@ -531,130 +531,145 @@ STATUS_HTML = """\
   /* A checkout build is a developer running from source, not the image CI
      pushed — worth flagging, because it is never what the rig should be on. */
   .build.checkout { color: var(--yellow); }
+
+  /* ── Layout: status first, controls below ────────────────────────────── */
+  .band { font-size: 1rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em;
+          margin: 1.75rem 0 0.75rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+  .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+                 gap: 0.75rem; margin-bottom: 1rem; }
+  .stat-val { font-size: 1.2rem; font-weight: 600; margin-top: 0.2rem;
+              font-variant-numeric: tabular-nums; }
+  .stat-sub { font-size: 0.72rem; color: var(--dim); margin-top: 0.2rem;
+              font-variant-numeric: tabular-nums; }
+
+  /* Now: connection and cue keep the full-size value; the musical context sits under them. */
+  .now-main { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 0.75rem 1.5rem; margin-top: 1rem;
+              padding-top: 0.75rem; border-top: 1px solid var(--border); }
+
+  /* Output chain: one stage per hop, so a break shows where it is. Stages carry their own
+     border because the render/DDP checks colour it red. */
+  .chain { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+           gap: 0.5rem; margin-top: 0.6rem; }
+  .stage { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem; background: var(--bg); }
+
+  /* Health: the anomaly feed. Quiet when all is well, loud when it isn't. */
+  .health-card { margin-bottom: 0.75rem; }
+  .health-card.alert { border-color: var(--red); box-shadow: 0 0 0 1px var(--red) inset; }
+  .health-card.warn { border-color: var(--yellow); }
+  .health-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+  .health-today { font-size: 0.75rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .health-state { font-size: 1.1rem; font-weight: 600; margin-top: 0.3rem; }
+  .health-item { display: flex; gap: 0.5rem; align-items: baseline; margin-top: 0.4rem;
+                 font-size: 0.85rem; flex-wrap: wrap; }
+  .health-item .kind { font-weight: 600; }
+  .health-item .msg { color: var(--dim); }
+  .pill.lvl-ALERT { background: var(--red); color: #fff; margin-left: 0; }
+  .pill.lvl-WARN { background: var(--yellow); color: var(--bg); margin-left: 0; }
+  .pill.lvl-NOTE, .pill.lvl-SONG, .pill.lvl-CLEAR, .pill.lvl-END { background: var(--border);
+      color: var(--text); margin-left: 0; }
+  .health-more { margin-top: 0.6rem; font-size: 0.8rem; }
+  .health-more summary, .sk-raw summary { cursor: pointer; color: var(--dim); }
+  .health-recent { margin-top: 0.4rem; max-height: 260px; overflow-y: auto; }
+  .health-recent .health-item { font-size: 0.78rem; }
+  .health-recent .ts { color: var(--blue); font-variant-numeric: tabular-nums; }
+  .health-recent .ev { color: var(--dim); font-size: 0.7rem; word-break: break-all; }
+  .health-note { color: var(--dim); font-size: 0.7rem; margin-top: 0.5rem; }
+  .sk-raw { flex: 1 1 100%; margin-top: 0.25rem; font-size: 0.8rem; }
+  .sk-raw #zones { margin-top: 0.5rem; }
+
+  /* Controls: grouped cards of compact rows. */
+  .control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+                  gap: 0.75rem; margin-bottom: 1rem; }
+  .group-title { font-size: 0.85rem; font-weight: 600; margin-bottom: 0.25rem; }
+  .ctl { padding: 0.6rem 0; border-top: 1px solid var(--border); }
+  .ctl:first-of-type { border-top: none; }
+  .ctl-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.35rem; }
+  .ctl-head .label { font-size: 0.72rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; }
+  .ctl-val { font-size: 1rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .ctl input[type=range] { width: 100%; accent-color: var(--accent); }
+  .ctl-select { width: 100%; padding: 0.4rem; border-radius: 6px; border: 1px solid var(--border);
+                background: var(--bg); color: var(--text); font-size: 0.85rem; font-family: inherit;
+                cursor: pointer; }
+  @media (max-width: 420px) {
+    body { padding: 0.75rem; }
+    .status-grid, .control-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
 <h1><img src="data:image/png;base64,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" alt="YARG" style="width:24px;height:24px;vertical-align:middle;margin-right:6px"> Stage Kit Bridge <span class="test-indicator off" id="test-badge">TEST MODE</span><span class="build" id="build-label"></span></h1>
 
-<div class="grid">
-  <div class="card">
-    <div class="label">YARG Connection</div>
-    <div class="value"><span class="status-dot off" id="dot"></span><span id="conn">Disconnected</span></div>
-    <div class="scene-label" id="scene-label"></div>
+<!-- ═══ STATUS: what is happening now ═══ -->
+<div class="card health-card" id="anomaly-card">
+  <div class="health-head">
+    <div class="label">Health</div>
+    <div class="health-today" id="anomaly-today"></div>
   </div>
-  <div class="card">
-    <div class="label">Current Cue</div>
-    <div class="value"><span id="cue">&mdash;</span> <span class="pill held hidden" id="held-pill">HELD</span><span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span><span class="pill auto hidden" id="venue-pill"></span></div>
-    <div class="scene-label hidden" id="cue-held-note">last cue received &mdash; sender gone</div>
-  </div>
-  <div class="card">
-    <div class="label">BPM</div>
-    <div class="value" id="bpm">&mdash;</div>
-  </div>
-  <div class="card" id="beat-card">
-    <div class="label">Beat</div>
-    <div class="value"><span class="beat-dot" id="beat-dot"></span> <span id="beat-num">&mdash;</span></div>
-    <div style="font-size:0.7rem;color:var(--dim);margin-top:0.35rem">beat in bar</div>
-  </div>
-  <div class="card" id="section-card">
-    <div class="label">Song Section</div>
-    <div class="value" id="section">&mdash;</div>
-  </div>
-  <div class="card">
-    <div class="label">Strobe</div>
-    <div class="value" id="strobe">Off</div>
-  </div>
-  <div class="card" id="starpower-card">
-    <div class="label">Star Power</div>
-    <div class="value"><span id="sp-state">&mdash;</span> <span class="pill sp hidden" id="sp-pill">ACTIVE</span></div>
-    <div style="font-size:0.7rem;color:var(--dim);margin-top:0.35rem">
-      <span id="camera-label"></span>
+  <div class="health-state" id="anomaly-state"><span class="status-dot off"></span>waiting for the bridge&hellip;</div>
+  <div id="anomaly-open"></div>
+  <details class="health-more" id="anomaly-details">
+    <summary>Tonight&rsquo;s log</summary>
+    <div class="health-recent" id="anomaly-recent"></div>
+    <div class="health-note">Each new problem saves the 30&nbsp;s of YARG datagrams before it as a
+      replayable capture under <code>captures/anomalies/</code>. WARN items are heuristics: they mean
+      &ldquo;this looked unintended&rdquo;, not &ldquo;this is a bug&rdquo;.</div>
+  </details>
+</div>
+
+<div class="status-grid">
+  <div class="card now-card" id="now-card">
+    <div class="now-main">
+      <div>
+        <div class="label">YARG Connection</div>
+        <div class="value"><span class="status-dot off" id="dot"></span><span id="conn">Disconnected</span></div>
+        <div class="scene-label" id="scene-label"></div>
+      </div>
+      <div>
+        <div class="label">Current Cue</div>
+        <div class="value"><span id="cue">&mdash;</span> <span class="pill held hidden" id="held-pill">HELD</span><span class="pill auto hidden" id="autogen-pill">AUTO</span><span class="pill paused hidden" id="paused-pill">PAUSED</span><span class="pill auto hidden" id="venue-pill"></span></div>
+        <div class="scene-label hidden" id="cue-held-note">last cue received &mdash; sender gone</div>
+      </div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="label">BPM</div><div class="stat-val" id="bpm">&mdash;</div></div>
+      <div class="stat" id="beat-card"><div class="label">Beat in bar</div>
+        <div class="stat-val"><span class="beat-dot" id="beat-dot"></span> <span id="beat-num">&mdash;</span></div></div>
+      <div class="stat" id="section-card"><div class="label">Section</div><div class="stat-val" id="section">&mdash;</div></div>
+      <div class="stat"><div class="label">Strobe</div><div class="stat-val" id="strobe">Off</div></div>
+      <div class="stat" id="starpower-card"><div class="label">Star Power</div>
+        <div class="stat-val"><span id="sp-state">&mdash;</span> <span class="pill sp hidden" id="sp-pill">ACTIVE</span></div>
+        <div class="stat-sub"><span id="camera-label"></span></div></div>
     </div>
   </div>
-  <div class="card">
-    <div class="label">Packets/sec</div>
-    <div class="value" id="pps">0</div>
-  </div>
-  <div class="card" id="ddp-card">
-    <div class="label">DDP Frames</div>
-    <div class="value" id="ddp">0</div>
-    <div style="font-size:0.75rem;color:var(--dim);margin-top:0.25rem;font-variant-numeric:tabular-nums">
-      <span id="ddp-send-time"></span>
-      <span id="ddp-errors" style="color:var(--dim)"></span>
+
+  <div class="card chain-card">
+    <div class="label">Output chain &mdash; YARG &rarr; bridge &rarr; strip</div>
+    <div class="chain">
+      <div class="stage">
+        <div class="label">Packets/sec</div>
+        <div class="stat-val" id="pps">0</div>
+        <div class="stat-sub">from YARG</div>
+      </div>
+      <div class="stage" id="render-card">
+        <div class="label">Render</div>
+        <div class="stat-val" id="render-fps">&mdash;</div>
+        <div class="stat-sub"><span id="render-gap"></span> &middot; <span id="render-work"></span>
+          <span id="render-stalls" style="color:var(--red)"></span></div>
+      </div>
+      <div class="stage" id="ddp-card">
+        <div class="label">DDP Frames</div>
+        <div class="stat-val" id="ddp">0</div>
+        <div class="stat-sub"><span id="ddp-send-time"></span> <span id="ddp-errors"></span></div>
+      </div>
+      <div class="stage" id="power-card">
+        <div class="label">WLED</div>
+        <div class="stat-val"><span class="status-dot off" id="power-dot"></span><span id="power-state">Unknown</span></div>
+        <div class="stat-sub" id="power-timer"></div>
+        <div class="stat-sub" id="wifi-info"></div>
+        <button class="test-btn" id="btn-power" onclick="togglePower()" style="margin-top:0.5rem;font-size:0.75rem">Toggle</button>
+      </div>
     </div>
-  </div>
-  <div class="card" id="render-card">
-    <div class="label">Render</div>
-    <div class="value" id="render-fps" style="font-size:1.2rem">—</div>
-    <div style="font-size:0.75rem;color:var(--dim);margin-top:0.25rem;font-variant-numeric:tabular-nums">
-      <span id="render-gap"></span> &middot;
-      <span id="render-work"></span> &middot;
-      <span id="render-stalls" style="color:var(--red)"></span>
-    </div>
-  </div>
-  <div class="card" id="power-card">
-    <div class="label">WLED Connection</div>
-    <div class="value"><span class="status-dot off" id="power-dot"></span><span id="power-state">Unknown</span></div>
-    <div id="power-timer" style="font-size:0.8rem;color:var(--dim);margin-top:0.35rem;font-variant-numeric:tabular-nums"></div>
-    <div id="wifi-info" style="font-size:0.7rem;color:var(--dim);margin-top:0.25rem;font-variant-numeric:tabular-nums"></div>
-    <button class="test-btn" id="btn-power" onclick="togglePower()" style="margin-top:0.5rem;font-size:0.75rem">Toggle</button>
-  </div>
-  <div class="card" id="brightness-card">
-    <div class="label">Brightness</div>
-    <div class="value" id="brightness-pct">100%</div>
-    <input type="range" id="brightness-slider" min="0" max="255" value="255" step="1"
-           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
-  </div>
-  <div class="card" id="palette-card">
-    <div class="label">Color Palette</div>
-    <select id="palette-select" style="width:100%;margin-top:0.5rem;padding:0.4rem;border-radius:6px;
-            border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.85rem;
-            font-family:inherit;cursor:pointer">
-      <option value="default">Default (RGBY)</option>
-    </select>
-    <div id="palette-preview" style="display:flex;gap:2px;margin-top:0.5rem;height:16px;border-radius:4px;overflow:hidden"></div>
-  </div>
-  <div class="card" id="fps-card">
-    <div class="label">Target FPS</div>
-    <div class="value" id="fps-val">40</div>
-    <div class="btn-grid" id="fps-btns" style="margin-top:0.4rem"></div>
-  </div>
-  <div class="card" id="direction-card">
-    <div class="label">LED Direction</div>
-    <div class="value" id="direction-val">Normal</div>
-    <button class="test-btn" id="btn-direction" onclick="toggleDirection()" style="margin-top:0.5rem;font-size:0.75rem">Reverse</button>
-  </div>
-  <div class="card" id="blur-card">
-    <div class="label">Blur Amount</div>
-    <div class="value" id="blur-pct">35%</div>
-    <input type="range" id="blur-slider" min="0" max="100" value="35" step="1"
-           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
-  </div>
-  <div class="card" id="venue-intensity-card">
-    <div class="label">Venue Sparkle</div>
-    <div class="value" id="venue-intensity-pct">100%</div>
-    <input type="range" id="venue-intensity-slider" min="0" max="100" value="100" step="1"
-           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
-  </div>
-  <div class="card" id="section-intensity-card">
-    <div class="label">Section Bias</div>
-    <div class="value" id="section-intensity-pct">100%</div>
-    <input type="range" id="section-intensity-slider" min="0" max="100" value="100" step="1"
-           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
-  </div>
-  <div class="card" id="palette-strictness-card"
-       title="How tightly the vocal ribbon, biases, cue gradients and star-power tint follow the selected palette. 0% restores their original fixed colours.">
-    <div class="label">Palette Strictness</div>
-    <div class="value" id="palette-strictness-pct">100%</div>
-    <input type="range" id="palette-strictness-slider" min="0" max="100" value="100" step="1"
-           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
-  </div>
-  <div class="card" id="cue-fade-card"
-       title="How long a cue change is blended against the previous frame. This is the largest latency term in the pipeline — 250 ms was the old value and cost ~120 ms per cue change. Cues YARG names 'fast' (blackout/flare/strobe/frenzy) always snap, and the 'slow' ones always take 250 ms, whatever this is set to.">
-    <div class="label">Cue Fade</div>
-    <div class="value" id="cue-fade-ms">120 ms</div>
-    <input type="range" id="cue-fade-slider" min="0" max="250" value="120" step="5"
-           style="width:100%;margin-top:0.5rem;accent-color:var(--accent)">
   </div>
 </div>
 
@@ -697,10 +712,71 @@ STATUS_HTML = """\
       against the 10&nbsp;Hz page update. Stage Kit colours, not the palette.
       The strobe lamp shows the rate, not the exact flash phase.</div>
   </div>
+  <details class="sk-raw">
+    <summary>Raw zone bitmasks</summary>
+    <div id="zones"></div>
+  </details>
 </div>
 
-<h3 style="margin:1rem 0 0.5rem">Zone Bitmasks</h3>
-<div id="zones"></div>
+<h3 style="margin:1rem 0 0.5rem">Event Log</h3>
+<div class="log" id="log"></div>
+
+<!-- ═══ CONTROLS: what you can change ═══ -->
+<h2 class="band">Controls</h2>
+<div class="control-grid">
+  <div class="card">
+    <div class="group-title">Look</div>
+    <div class="ctl" id="brightness-card">
+      <div class="ctl-head"><span class="label">Brightness</span><span class="ctl-val" id="brightness-pct">100%</span></div>
+      <input type="range" id="brightness-slider" min="0" max="255" value="255" step="1">
+    </div>
+    <div class="ctl" id="palette-card">
+      <div class="ctl-head"><span class="label">Color Palette</span></div>
+      <select id="palette-select" class="ctl-select">
+        <option value="default">Default (RGBY)</option>
+      </select>
+      <div id="palette-preview" style="display:flex;gap:2px;margin-top:0.4rem;height:16px;border-radius:4px;overflow:hidden"></div>
+    </div>
+    <div class="ctl" id="palette-strictness-card"
+         title="How tightly the vocal ribbon, biases, cue gradients and star-power tint follow the selected palette. 0% restores their original fixed colours.">
+      <div class="ctl-head"><span class="label">Palette Strictness</span><span class="ctl-val" id="palette-strictness-pct">100%</span></div>
+      <input type="range" id="palette-strictness-slider" min="0" max="100" value="100" step="1">
+    </div>
+    <div class="ctl" id="blur-card">
+      <div class="ctl-head"><span class="label">Blur Amount</span><span class="ctl-val" id="blur-pct">35%</span></div>
+      <input type="range" id="blur-slider" min="0" max="100" value="35" step="1">
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="group-title">Timing &amp; output</div>
+    <div class="ctl" id="cue-fade-card"
+         title="How long a cue change is blended against the previous frame. This is the largest latency term in the pipeline — 250 ms was the old value and cost ~120 ms per cue change. Cues YARG names 'fast' (blackout/flare/strobe/frenzy) always snap, and the 'slow' ones always take 250 ms, whatever this is set to.">
+      <div class="ctl-head"><span class="label">Cue Fade</span><span class="ctl-val" id="cue-fade-ms">120 ms</span></div>
+      <input type="range" id="cue-fade-slider" min="0" max="250" value="120" step="5">
+    </div>
+    <div class="ctl" id="fps-card">
+      <div class="ctl-head"><span class="label">Target FPS</span><span class="ctl-val" id="fps-val">40</span></div>
+      <div class="btn-grid" id="fps-btns"></div>
+    </div>
+    <div class="ctl" id="direction-card">
+      <div class="ctl-head"><span class="label">LED Direction</span><span class="ctl-val" id="direction-val">Normal</span></div>
+      <button class="test-btn" id="btn-direction" onclick="toggleDirection()" style="font-size:0.75rem">Reverse</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="group-title">Venue response</div>
+    <div class="ctl" id="venue-intensity-card">
+      <div class="ctl-head"><span class="label">Venue Sparkle</span><span class="ctl-val" id="venue-intensity-pct">100%</span></div>
+      <input type="range" id="venue-intensity-slider" min="0" max="100" value="100" step="1">
+    </div>
+    <div class="ctl" id="section-intensity-card">
+      <div class="ctl-head"><span class="label">Section Bias</span><span class="ctl-val" id="section-intensity-pct">100%</span></div>
+      <input type="range" id="section-intensity-slider" min="0" max="100" value="100" step="1">
+    </div>
+  </div>
+</div>
 
 <h3 style="margin:1rem 0 0.5rem">Effect Layers</h3>
 <div class="test-panel">
@@ -783,8 +859,6 @@ STATUS_HTML = """\
   </div>
 </div>
 
-<h3 style="margin:1rem 0 0.5rem">Event Log</h3>
-<div class="log" id="log"></div>
 
 <script>
 const ZONE_NAMES = ['red','green','blue','yellow'];
@@ -1536,7 +1610,53 @@ function updateBeat(d) {
   num.textContent = live ? ((d.bar_beat || 0) + 1) : '\\u2014';
 }
 
+// ── Health: the bridge's anomaly feed (anomalies.py) ──────────────────────
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+}
+let anomalySeq = -1;
+function updateAnomalies(a) {
+  const card = document.getElementById('anomaly-card');
+  const state = document.getElementById('anomaly-state');
+  if (!a) {
+    card.className = 'card health-card';
+    state.innerHTML = '<span style="color:var(--dim);font-weight:400">Anomaly detection is off (ANOMALY_DETECTION=0)</span>';
+    return;
+  }
+  const open = a.open || [];
+  const alerts = open.filter(e => e.level === 'ALERT').length;
+  const warns = open.filter(e => e.level === 'WARN').length;
+  card.className = 'card health-card' + (alerts ? ' alert' : warns ? ' warn' : '');
+  if (alerts) {
+    state.innerHTML = '<span class="status-dot off"></span>' + alerts + ' problem' + (alerts > 1 ? 's' : '') + ' right now';
+  } else if (warns) {
+    state.innerHTML = '<span class="status-dot" style="background:var(--yellow)"></span>' + warns + ' thing' + (warns > 1 ? 's' : '') + ' look' + (warns > 1 ? '' : 's') + ' off';
+  } else {
+    state.innerHTML = '<span class="status-dot on"></span>All clear';
+  }
+  document.getElementById('anomaly-open').innerHTML = open.map(e =>
+    '<div class="health-item"><span class="pill lvl-' + e.level + '">' + e.level + '</span>' +
+    '<span class="kind">' + escHtml(e.kind) + '</span>' +
+    '<span class="msg">' + escHtml(e.msg) + ' &middot; ' + escHtml(e.cls) + '</span></div>').join('');
+  const t = a.today || {};
+  document.getElementById('anomaly-today').textContent =
+    'today: ' + (t.alerts || 0) + ' alerts · ' + (t.warnings || 0) + ' warnings' +
+    (a.song ? ' · ' + a.song : '') + (a.errors ? ' · detector errors ' + a.errors : '');
+  if (a.seq === anomalySeq) return;   // the list only changes when an event arrives
+  anomalySeq = a.seq;
+  const recent = a.recent || [];
+  document.getElementById('anomaly-recent').innerHTML = recent.length ? recent.map(e =>
+    '<div class="health-item"><span class="ts">' + escHtml(e.time) + '</span>' +
+    '<span class="pill lvl-' + e.level + '">' + e.level + '</span>' +
+    '<span class="kind">' + escHtml(e.kind) + '</span>' +
+    '<span class="msg">' + escHtml(e.msg) + (e.song ? ' &middot; ' + escHtml(e.song) : '') + '</span>' +
+    (e.evidence_file ? '<span class="ev">' + escHtml(e.evidence_file) + '</span>' : '') +
+    '</div>').join('') : '<div class="health-item msg">Nothing yet today.</div>';
+}
+
 function update(d) {
+  updateAnomalies(d.anomalies);
   const dot = document.getElementById('dot');
   const conn = document.getElementById('conn');
   if (d.connected || d.test_active) { dot.className = 'status-dot on'; conn.textContent = d.test_active ? 'Test Mode' : 'Connected'; }

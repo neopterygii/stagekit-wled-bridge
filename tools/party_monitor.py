@@ -333,6 +333,9 @@ def report(out):
                 lines.append(f"  - evidence: {', '.join(files[:3])}")
         lines.append("")
 
+    if any(str(e.get("evidence_file", "")).startswith("bridge:") for e in evs):
+        lines += ["_`bridge:` evidence is a replayable capture of the 30 s before the episode (plus "
+                  "`….status.jsonl`), on Tower under `/mnt/user/appdata/stagekit-wled-bridge/captures/`._", ""]
     lines += ["## Candidate updates", "",
               "Draft only: each needs the evidence read and the operator's word on what they saw before",
               "it becomes a BACKLOG.md item. Deploy/template steps are not backlog.", ""]

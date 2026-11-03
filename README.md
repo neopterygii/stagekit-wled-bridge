@@ -87,6 +87,8 @@ All settings are controlled via environment variables:
 | `IDLE_TIMEOUT` | `1800` | Seconds of no YARG packets before WLED is powered off (0 = disabled) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 | `SETTINGS_FILE` | `/data/settings.json` | Where to store runtime settings (brightness, palette, FPS, direction) |
+| `ANOMALY_DETECTION` | `1` | Built-in anomaly detection (the dashboard's Health card); `0` switches it off entirely |
+| `ANOMALY_DIR` | `/data/anomalies` | One JSONL file per day of anomaly events; evidence captures go to `CAPTURE_DIR/anomalies/` |
 
 ### Persistent Settings
 
@@ -213,25 +215,58 @@ Each zone bitmask bit controls one 12-LED cell. When multiple zones share a cell
 
 ## Status Page
 
-The built-in web dashboard at port 8080 shows:
+The built-in web dashboard at port 8080 puts what is happening at the top and
+what you can change below it.
 
-- **Connection status** — whether YARG packets are being received
-- **Current cue** — active Stage Kit lighting cue name
-- **BPM / Strobe / Packets/sec / DDP frames** — real-time metrics
-- **WLED power** — Live / Idle / Off mode with idle countdown timer and manual toggle
-- **Brightness** — 5 step controls (10%, 25%, 50%, 75%, 100%)
-- **Color palette** — dropdown to switch between 12 palettes with live preview swatches
-- **Palette strictness** — slider for how tightly the reactivity layers follow the selected palette (0% = their original fixed colours)
+**Status**
+
+- **Health** — the built-in anomaly detection (see below): "All clear", or what
+  is wrong right now (red border for ALERT, amber for WARN), today's counts, and
+  tonight's log with each event's evidence file
+- **Now** — YARG connection and current cue, with BPM, beat, song section,
+  strobe and star power beneath them
+- **Output chain** — packets/sec from YARG → render timing → DDP frames → WLED
+  mode (Live / Idle / Off, idle countdown, WiFi, manual toggle), one stage per
+  hop so a break shows where it is
 - **Live strip preview** — what the strip is actually showing. While the bridge
   is not driving the strip the canvases go black and a caption names why; they
   are a picture of the strip, not of the bridge's render buffer
-- **Idle look** — the effect, palette, colour and grace period for what the
-  strip shows between songs
-- **Zone bitmask visualization** — 4×8 LED grid with colors matching the active palette
+- **Stage Kit** — the cue engine's four masks drawn as the physical pod, with
+  the raw 4×8 zone bitmasks folded underneath
 - **Event log** — scrolling log of cue changes, beats, and strobe events (capped at 200 entries)
 - **Build identity** — a quiet line beside the title naming the version and the
   commit the image was built from; hover for the build time and source. See
   [Versioning](#versioning)
+
+**Controls**
+
+- **Look** — brightness, colour palette (with preview), palette strictness
+  (how tightly the reactivity layers follow the palette; 0% = their original
+  fixed colours), blur
+- **Timing & output** — cue fade, target FPS, LED direction
+- **Venue response** — venue sparkle, section bias
+- **Effect layers**, **Idle look** (what the strip shows between songs) and
+  **Test patterns**
+
+### Anomaly Detection
+
+The bridge watches its own output and flags what looks broken or unintended,
+always on and at the full frame rate (`anomalies.py`). Each kind has a level —
+**ALERT** (the lights are broken now: dark while a song plays, render thread
+dead, WLED unreachable or latched in realtime, a second DDP sender, the
+datagram parser reading values YARG can't send), **WARN** (looks unintended:
+strip black under a lit cue, flicker under a cue that shouldn't flash, a frozen
+strip, a stuck strobe, render stutter, packet loss, no beats from YARG) or
+**NOTE** — and a likely cause class: bridge, config, device, transport, yarg or
+chart.
+
+Each new episode saves the last ~30 s of YARG datagrams as a capture in
+`CAPTURE_DIR/anomalies/` (replay it with `python -m replay.cli`), with the
+status snapshots over the same span beside it. `GET /api/anomalies?since=N`
+returns events after sequence number N. WARN items are heuristics; treat them as
+"worth a look", not as confirmed bugs. For a party, `tools/party_start.sh`
+relays this feed with song titles and adds the checks the bridge can't make
+about itself (see `tools/RUNBOOK.md`).
 
 ### Test Controls
 
