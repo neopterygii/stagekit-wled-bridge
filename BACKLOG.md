@@ -46,6 +46,11 @@ In order:
 
 ### Recently closed
 
+- ~~The dashboard showed bitmasks, not the pattern~~ — requested and built
+  2026-11-02; [write-up](#done-2026-11-02-feature--the-dashboard-showed-zone-bitmasks-not-the-pattern).
+  A Stage Kit pod visualizer that replays every mask change instead of sampling
+  at the 10 Hz page rate.
+
 - ~~The held cue outlived its sender~~ — reported and built 2026-08-25;
   [write-up](#done-2026-08-25-bugfix--the-held-cue-was-never-released-so-it-outlived-the-sender-by-hours).
   The 2026-07-29 ruling to *label* a held cue was right; leaving it unbounded
@@ -125,6 +130,38 @@ Blocking none of the above: the replay harness is **merged to `main`
 before/after beats remembering last night's show.
 
 ---
+
+## DONE 2026-11-02 `feature` — The dashboard showed zone bitmasks, not the pattern
+
+**Requested:** 2026-11-02 by the operator — "add a stagekit visualizer to the
+dashboard similar to yalcy so we can see the pattern, not just our zone
+bitmasks."
+
+The engine already carried the Stage Kit model: `engine.zones` holds four 8-bit
+masks, and `cue_engine.py` keeps them on each motion pattern's logical step for
+the status page even while the strip renders continuous heads. The data was
+right. Two things kept it from reading as a pattern:
+
+- **Layout.** Four rows of bits hide rotations and sweeps. The new Stage Kit
+  card draws the masks as the physical pod — blue inner diamond, green pairs at
+  the diamond tips, yellow and red alternating round a 16-LED outer ring, LED 0
+  at 12 o'clock, clockwise — the layout YALCY's `LedDisplay` uses, with bit *i*
+  as LED *i* in both. Fixed Stage Kit colours, not the palette; the strobe
+  flashes at the engine's rate (not its phase), and fog lays a haze over it.
+- **Sampling.** The SSE snapshot runs at 10 Hz and patterns step faster (4 a
+  beat at 180 BPM is 12 Hz), so painting the current masks aliased: steps were
+  skipped and a rotation could appear to stall or reverse. The tracker now logs
+  every mask change from the render thread with its monotonic time
+  (`stagekit.events`, last 1 s on every snapshot), and the page replays them at
+  their recorded spacing 200 ms behind live, using a min-filtered offset
+  between the page and bridge clocks. The bitmask rows are driven from the same
+  replay, so the two views never disagree.
+
+Verified by running the page's own script in Node against a DOM stub with a
+simulated 12 Hz chase and 0–40 ms SSE delivery jitter: 36/36 steps shown in
+order, 203–237 ms behind the bridge, steady-state spacing 80–96 ms against the
+true 83 ms (the 16 ms animation frame). No render change, so no golden digest
+moved.
 
 ## DONE 2026-08-25 `bugfix` — The held cue was never released, so it outlived the sender by hours
 

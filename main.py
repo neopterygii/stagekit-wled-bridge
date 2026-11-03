@@ -146,6 +146,7 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # Fog/haze (Phase 6) — lifts the post-process blur toward a soft
         # blur-glow floor while the venue haze is up.
         self.engine.on_fog(pkt.fog_state)
+        self.tracker.on_fog(pkt.fog_state)
 
         # Song section (offset 13) — slow palette/energy bias per section.
         # YARG only changes the byte on a Verse/Chorus lighting event, so this
