@@ -10,11 +10,13 @@ How it works, and why it can work at all:
 
 - The bridge publishes what it just rendered at `/api/status` under
   `preview.strip` — 60 cells x RGB, a 2:1 downsample of the 120-LED strip.
-- WLED publishes what it is currently displaying at `/json/live` — 120 hex RGB
-  triples, read straight out of the live buffer that DDP writes into.
-- On this rig the two are related by a plain linear scale: `bri` is 128 and
-  realtime gamma correction is off (`if.live["no-gc"]: true`), so a device LED
-  is its bridge cell times ~128/255.
+- WLED publishes what it is currently displaying — the live buffer that DDP
+  writes into. On 16.x that is the websocket live peek (pushed, <=25 Hz); on
+  0.14.x it was `/json/live` (polled). `tools.wled_peek` picks whichever the
+  device offers; read its docstring before comparing numbers across the two.
+- The two are related by a plain linear scale (realtime gamma correction is
+  off, `if.live["no-gc"]: true`): the bridge's own brightness, the 2:1
+  downsample, and — on `/json/live` only — WLED's `bri`.
 
 Rather than match frames pixel-for-pixel, both sides are reduced to one scalar
 per sample — total frame brightness — giving two time series of the same
@@ -28,8 +30,9 @@ then whichever shift maximises their cross-correlation.
 Run it repeatedly across a long soak and compare. A lag that is the same at
 +6 h as at +0 h is constant latency; one that grows is drift.
 
-Keep probes short and occasional: this polls the ESP32's HTTP server hard, and
-the point is to observe the stream, not to perturb it.
+Keep probes short and occasional: the bridge side is still polled over HTTP,
+and on `/json/live` firmware so is the device. The point is to observe the
+stream, not to perturb it.
 """
 
 import argparse
@@ -40,6 +43,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+from tools.wled_peek import (LIVE_SOURCES, PeekError, get_power, open_live,
+                             realtime_source, set_power)
 
 DEFAULT_WLED = "192.168.0.53"
 DEFAULT_BRIDGE = "192.168.0.230:36180"
@@ -76,39 +82,40 @@ def bridge_brightness(addr: str) -> tuple[float, float]:
     return float(sum(strip)), t
 
 
-def device_brightness(host: str) -> tuple[float, float]:
-    """Total brightness of the frame the strip is displaying, and its time."""
-    data, t = _get(f"http://{host}/json/live")
-    leds = data.get("leds") or []
-    if not leds:
-        raise LagError("WLED /json/live carried no leds (is JSONLIVE enabled?)")
-    total = 0
-    for hexrgb in leds:
-        v = int(hexrgb, 16)
-        total += (v >> 16 & 0xFF) + (v >> 8 & 0xFF) + (v & 0xFF)
-    return float(total), t
+# A read that failed for a reason worth retrying. PeekError covers the device
+# being off, the live view going stale, and /json/live errors.
+READ_ERRORS = (urllib.error.URLError, OSError, ValueError, LagError, PeekError)
 
 
-def collect(wled: str, bridge: str, seconds: float) -> tuple[list, list]:
-    """Alternate between the two endpoints, returning (bridge, device) series.
+def collect(view, bridge: str, seconds: float) -> tuple[list, list]:
+    """Sample both sides for *seconds*, returning (bridge, device) series.
 
-    Alternating rather than threading keeps one request in flight at a time, so
-    neither side is answering two overlapping polls and inflating the other's
-    apparent latency.
+    A pushed device view (the websocket peek) records every frame by itself,
+    so only the bridge is polled and the device series is read back from the
+    view's history afterwards. A polled view (`/json/live`) alternates with the
+    bridge instead: one request in flight at a time, so neither side answers
+    two overlapping polls and inflates the other's apparent latency.
     """
     bridge_pts, device_pts = [], []
     t0 = time.monotonic()
     errors = 0
+    pushed = view.pushed
+    sources = [(bridge_brightness, bridge_pts)]
+    if not pushed:
+        sources.append((lambda _arg: view.brightness(), device_pts))
     while time.monotonic() - t0 < seconds:
-        for fn, sink, arg in ((bridge_brightness, bridge_pts, bridge),
-                              (device_brightness, device_pts, wled)):
+        for fn, sink in sources:
             try:
-                value, t = fn(arg)
+                value, t = fn(bridge)
                 sink.append((t - t0, value))
-            except (urllib.error.URLError, OSError, ValueError, LagError):
+            except READ_ERRORS:
                 errors += 1
                 if errors > 20:
                     raise LagError(f"too many failed reads ({errors}) during probe")
+        if pushed:
+            view.latest()          # abort now, not after 45 s, if the peek died
+    if pushed:
+        device_pts = [(t - t0, v) for t, v in view.history(since=t0)]
     return bridge_pts, device_pts
 
 
@@ -253,6 +260,9 @@ def main(argv=None) -> int:
     probe.add_argument("--max-lag", type=float, default=2.0,
                        help="widest lag to search, seconds")
     probe.add_argument("--out", help="write the full result (incl. curve) as JSON")
+    probe.add_argument("--live", choices=LIVE_SOURCES, default="auto",
+                       help="device live view: websocket peek, /json/live, or "
+                            "whichever the firmware offers (default)")
 
     step = sub.add_parser("step", help="alias-proof latency via randomised cue steps")
     step.add_argument("--wled", default=DEFAULT_WLED)
@@ -263,39 +273,55 @@ def main(argv=None) -> int:
     step.add_argument("--out", help="write per-step results as JSON")
     step.add_argument("--direct", action="store_true",
                       help="send DDP straight to WLED, bypassing the bridge "
-                           "(stop the bridge's own DDP output first)")
+                           "(stop the bridge's own DDP output first). Switches "
+                           "WLED on for the run if it is off, and back after, "
+                           "because the websocket peek reads black while off")
     step.add_argument("--leds", type=int, default=120)
+    step.add_argument("--live", choices=LIVE_SOURCES, default="auto",
+                      help="device live view (see probe --help)")
 
     args = parser.parse_args(argv)
-
-    if args.command == "step":
-        try:
-            if args.direct:
-                results = step_probe_direct(args.wled, led_count=args.leds,
-                                            cycles=args.cycles)
-            else:
-                results = step_probe(args.wled, args.bridge_host,
-                                     args.yarg_port, cycles=args.cycles)
-        except (urllib.error.URLError, OSError, LagError) as exc:
-            print(f"step probe failed: {exc}", file=sys.stderr)
-            return 1
-        for line in summarise_steps(results):
-            print(line)
-        if args.out:
-            with open(args.out, "w", encoding="utf-8") as fh:
-                json.dump({"wall": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                           "steps": results}, fh, indent=2)
-        return 0
+    label = "step probe" if args.command == "step" else "lag probe"
 
     try:
-        bridge_pts, device_pts = collect(args.wled, args.bridge, args.seconds)
-        result = estimate_lag(bridge_pts, device_pts, max_lag=args.max_lag)
-    except LagError as exc:
-        print(f"lag probe failed: {exc}", file=sys.stderr)
+        view = open_live(args.wled, prefer=args.live)
+    except PeekError as exc:
+        print(f"{label} failed: {exc}", file=sys.stderr)
         return 1
-    except (urllib.error.URLError, OSError) as exc:
-        print(f"lag probe failed: {exc}", file=sys.stderr)
-        return 1
+
+    try:
+        print(f"  device live view: {view.source}")
+        if args.command == "step":
+            try:
+                if args.direct:
+                    results = step_probe_direct(args.wled, view, led_count=args.leds,
+                                                cycles=args.cycles)
+                else:
+                    results = step_probe(view, args.bridge_host,
+                                         args.yarg_port, cycles=args.cycles)
+            except (urllib.error.URLError, OSError, LagError, PeekError) as exc:
+                print(f"step probe failed: {exc}", file=sys.stderr)
+                return 1
+            for line in summarise_steps(results, source=view.source,
+                                        cadence_ms=view.cadence_ms()):
+                print(line)
+            if args.out:
+                with open(args.out, "w", encoding="utf-8") as fh:
+                    json.dump({"wall": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                               "live_source": view.source,
+                               "peek_cadence_ms": view.cadence_ms(),
+                               "steps": results}, fh, indent=2)
+            return 0
+
+        try:
+            bridge_pts, device_pts = collect(view, args.bridge, args.seconds)
+            result = estimate_lag(bridge_pts, device_pts, max_lag=args.max_lag)
+        except (LagError, PeekError, urllib.error.URLError, OSError) as exc:
+            print(f"lag probe failed: {exc}", file=sys.stderr)
+            return 1
+        result["live_source"] = view.source
+    finally:
+        view.close()
 
     for line in describe(result):
         print(line)
@@ -332,7 +358,7 @@ def _yarg_packet(cue: int) -> bytes:
     return build_packet(cue=cue)
 
 
-def step_probe(wled: str, bridge_host: str, yarg_port: int, cycles: int = 6,
+def step_probe(view, bridge_host: str, yarg_port: int, cycles: int = 6,
                dim_cue: int = 8, bright_cue: int = 12,
                quiet: bool = False) -> list[dict]:
     """Drive cue steps at randomised intervals; time when the strip reacts.
@@ -344,6 +370,10 @@ def step_probe(wled: str, bridge_host: str, yarg_port: int, cycles: int = 6,
     Nothing else may be feeding the bridge while this runs: a second sender
     fighting for the cue makes the strip oscillate, and then no step is
     distinguishable from the noise.
+
+    *view* is an open `tools.wled_peek` reader. Each step records the last
+    reason a device read failed, so a run where nothing was seen says why
+    instead of leaving the operator to guess.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     addr = (bridge_host, yarg_port)
@@ -353,17 +383,10 @@ def step_probe(wled: str, bridge_host: str, yarg_port: int, cycles: int = 6,
     def hold(cue: int, seconds: float) -> float:
         """Drive one cue for *seconds*, returning the settled brightness."""
         end = time.monotonic() + seconds
-        last = None
         while time.monotonic() < end:
             sock.sendto(_yarg_packet(cue), addr)
             time.sleep(1 / 60)
-        for _ in range(5):
-            try:
-                last, _ = device_brightness(wled)
-                break
-            except (urllib.error.URLError, OSError, ValueError, LagError):
-                continue
-        return last if last is not None else 0.0
+        return _settled(view)
 
     try:
         settled = hold(dim_cue, 2.0)
@@ -375,11 +398,14 @@ def step_probe(wled: str, bridge_host: str, yarg_port: int, cycles: int = 6,
             deadline = t_send + dwell
             detected = None
             seen_max = settled
+            last_error = None
             while time.monotonic() < deadline:
                 sock.sendto(_yarg_packet(cue), addr)
                 try:
-                    value, t_read = device_brightness(wled)
-                except (urllib.error.URLError, OSError, ValueError, LagError):
+                    value, t_read = view.brightness()
+                except READ_ERRORS as exc:
+                    last_error = str(exc)
+                    time.sleep(1 / 60)
                     continue
                 seen_max = max(seen_max, value)
                 # A step is a large move away from where the strip had settled,
@@ -398,6 +424,7 @@ def step_probe(wled: str, bridge_host: str, yarg_port: int, cycles: int = 6,
                 "settled_after": round(settled, 1),
                 "latency_ms": None if detected is None else round(detected, 1),
                 "dwell_s": round(dwell, 2),
+                "read_error": last_error,
             })
             if not quiet:
                 lat = "not seen" if detected is None else f"{detected:7.1f} ms"
@@ -407,9 +434,14 @@ def step_probe(wled: str, bridge_host: str, yarg_port: int, cycles: int = 6,
     return results
 
 
-def summarise_steps(results: list[dict]) -> list[str]:
+def summarise_steps(results: list[dict], source: str | None = None,
+                    cadence_ms: float | None = None) -> list[str]:
     seen = [r["latency_ms"] for r in results if r["latency_ms"] is not None]
     if not seen:
+        errors = [r.get("read_error") for r in results if r.get("read_error")]
+        if errors:
+            reason = max(set(errors), key=errors.count)
+            return [f"step probe: the device could not be read — {reason}"]
         return ["step probe: the strip never visibly reacted — check the bridge "
                 "is connected and the cues differ in brightness."]
     lines = [
@@ -419,6 +451,13 @@ def summarise_steps(results: list[dict]) -> list[str]:
         "lag lines up. Compare across a long run — a median that climbs and "
         "stays climbed is the persistent desync.",
     ]
+    if cadence_ms:
+        lines.append(
+            f"  Read via the {source or 'live view'}, which pushes a frame every "
+            f"~{cadence_ms:.0f} ms: each latency includes up to one interval of "
+            f"wait (~{cadence_ms / 2:.0f} ms on average). Numbers from "
+            f"/json/live-era firmware carry a different offset — compare like "
+            f"with like.")
     if max(seen) > 500:
         lines.append(f"  !! worst transition took {max(seen):.0f} ms to reach the "
                      f"strip. That is visible hesitation, not jitter.")
@@ -427,8 +466,9 @@ def summarise_steps(results: list[dict]) -> list[str]:
 
 
 
-def step_probe_direct(wled: str, led_count: int = 120, cycles: int = 12,
-                      quiet: bool = False) -> list[dict]:
+def step_probe_direct(wled: str, view, led_count: int = 120, cycles: int = 12,
+                      quiet: bool = False, manage_power: bool = True,
+                      check_sender: bool = True) -> list[dict]:
     """Same step timing, but driving DDP straight at the controller.
 
     Removes the bridge from the path entirely, so the difference against
@@ -438,10 +478,48 @@ def step_probe_direct(wled: str, led_count: int = 120, cycles: int = 12,
 
     Nothing else may be sending DDP at the same time — two senders write the
     same realtime buffer and the last one wins.
+
+    The websocket peek reads black while WLED is off, and with the bridge's
+    output stopped (as this probe requires) the bridge has usually switched it
+    off. So with *manage_power* the device is switched on for the run if it was
+    off, and back off afterwards — including when the run fails.
+
+    With *check_sender* the probe refuses to start while WLED is already in
+    realtime mode: someone else is writing the buffer, every step would race
+    them, and the device's `lip` says who.
     """
     from protocol.ddp_sender import DDPSender
 
+    if check_sender:
+        live, mode, sender_ip = realtime_source(wled)
+        if live:
+            raise LagError(
+                f"WLED is already receiving realtime data ({mode or '?'} from "
+                f"{sender_ip or 'unknown'}) — another sender would race every "
+                f"step. Stop it first: the bridge via POST /api/power "
+                f'{{"action":"off"}}, or YALCY\'s WLED output on the YARG PC. '
+                f"WLED leaves realtime ~2.5 s after the last frame.")
+
+    restore_off = False
+    if manage_power and not view.prescaled and not get_power(wled):
+        if not quiet:
+            print("  WLED is off; switching it on for the run (restored after)")
+        set_power(wled, True)
+        restore_off = True
+        time.sleep(0.3)            # let the state push reach the peek
+
     sender = DDPSender(wled)
+    try:
+        return _direct_steps(sender, view, led_count, cycles, quiet)
+    finally:
+        sender.close()
+        if restore_off:
+            time.sleep(0.2)
+            set_power(wled, False)
+
+
+def _direct_steps(sender, view, led_count: int, cycles: int,
+                  quiet: bool) -> list[dict]:
     dark = bytes(led_count * 3)
     bright = bytes([180, 180, 180] * led_count)
     results = []
@@ -452,13 +530,7 @@ def step_probe_direct(wled: str, led_count: int = 120, cycles: int = 12,
         while time.monotonic() < end:
             sender.send_pixels(frame)
             time.sleep(1 / 60)
-        for _ in range(5):
-            try:
-                value, _ = device_brightness(wled)
-                return value
-            except (urllib.error.URLError, OSError, ValueError, LagError):
-                continue
-        return 0.0
+        return _settled(view)
 
     settled = hold(dark, 2.0)
     for i in range(cycles):
@@ -467,11 +539,14 @@ def step_probe_direct(wled: str, led_count: int = 120, cycles: int = 12,
         t_send = time.monotonic()
         deadline = t_send + dwell
         detected = None
+        last_error = None
         while time.monotonic() < deadline:
             sender.send_pixels(frame)
             try:
-                value, t_read = device_brightness(wled)
-            except (urllib.error.URLError, OSError, ValueError, LagError):
+                value, t_read = view.brightness()
+            except READ_ERRORS as exc:
+                last_error = str(exc)
+                time.sleep(1 / 60)
                 continue
             span = max(200.0, abs(settled) * 0.4)
             if detected is None and abs(value - settled) > span:
@@ -483,11 +558,23 @@ def step_probe_direct(wled: str, led_count: int = 120, cycles: int = 12,
             "target": "bright" if frame is bright else "dark",
             "latency_ms": None if detected is None else round(detected, 1),
             "dwell_s": round(dwell, 2),
+            "read_error": last_error,
         })
         if not quiet:
             lat = "not seen" if detected is None else f"{detected:7.1f} ms"
             print(f"  step {i} -> {results[-1]['target']:>6}: {lat}")
     return results
+
+
+def _settled(view) -> float:
+    """The device's current brightness after a hold, or 0.0 if unreadable."""
+    for _ in range(5):
+        try:
+            value, _ = view.brightness()
+            return value
+        except READ_ERRORS:
+            time.sleep(0.05)
+    return 0.0
 
 
 if __name__ == "__main__":

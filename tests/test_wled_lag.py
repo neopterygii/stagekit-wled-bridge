@@ -17,6 +17,35 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import wled_lag  # noqa: E402
+from tools.wled_peek import PeekError  # noqa: E402
+
+
+class FakeView:
+    """Stands in for a tools.wled_peek reader. *read* returns (value, t)."""
+
+    source = "/json/live"
+    prescaled = True
+    pushed = False
+
+    def __init__(self, read, history=None):
+        self.read = read
+        self._history = history or []
+
+    def brightness(self):
+        return self.read()
+
+    def latest(self):
+        value, t = self.read()
+        return b"", t
+
+    def history(self, since=None):
+        return [p for p in self._history if since is None or p[0] >= since]
+
+    def cadence_ms(self):
+        return None
+
+    def close(self):
+        pass
 
 
 def _wave(duration=60.0, rate=15.0, lag=0.0, freq=2.0, scale=1.0, offset=0.0):
@@ -74,33 +103,61 @@ def test_describe_flags_an_untrustworthy_correlation():
     assert "positive = the strip is behind" in text
 
 
-def test_device_brightness_sums_hex_triples(monkeypatch):
-    monkeypatch.setattr(wled_lag, "_get",
-                        lambda url, timeout=4.0: ({"leds": ["FF0000", "000102"]}, 1.0))
-    total, t = wled_lag.device_brightness("h")
-    assert total == 255 + (0 + 1 + 2)
-    assert t == 1.0
-
-
 def test_bridge_brightness_sums_the_preview_strip(monkeypatch):
     monkeypatch.setattr(wled_lag, "_get",
                         lambda url, timeout=4.0: ({"preview": {"strip": [1, 2, 3, 4]}}, 2.0))
     assert wled_lag.bridge_brightness("h") == (10.0, 2.0)
 
 
-def test_missing_payloads_raise_lag_error(monkeypatch):
+def test_missing_bridge_preview_raises_lag_error(monkeypatch):
     monkeypatch.setattr(wled_lag, "_get", lambda url, timeout=4.0: ({}, 0.0))
     with pytest.raises(wled_lag.LagError, match="preview.strip"):
         wled_lag.bridge_brightness("h")
-    with pytest.raises(wled_lag.LagError, match="JSONLIVE"):
-        wled_lag.device_brightness("h")
 
 
 def test_cli_reports_failure_without_a_traceback(capsys, monkeypatch):
+    monkeypatch.setattr(wled_lag, "open_live", lambda host, prefer="auto": FakeView(lambda: (0.0, 0.0)))
     monkeypatch.setattr(wled_lag, "collect",
                         lambda *a, **k: (_ for _ in ()).throw(wled_lag.LagError("nope")))
     assert wled_lag.main(["probe", "--seconds", "1"]) == 1
     assert "lag probe failed: nope" in capsys.readouterr().err
+
+
+def test_cli_reports_an_unreadable_device_up_front(capsys, monkeypatch):
+    def no_view(host, prefer="auto"):
+        raise PeekError("no live view available from WLED: /json/live returned HTTP 501")
+    monkeypatch.setattr(wled_lag, "open_live", no_view)
+    assert wled_lag.main(["step", "--direct"]) == 1
+    assert "HTTP 501" in capsys.readouterr().err
+
+
+def test_collect_reads_a_pushed_view_from_its_history(monkeypatch):
+    # The peek records every frame itself; only the bridge is polled, and the
+    # device series comes back from the view's history on the same clock.
+    clock = {"t": 100.0}
+
+    def fake_bridge(addr):
+        clock["t"] += 0.05
+        return 1.0, clock["t"]
+
+    view = FakeView(lambda: (0.0, clock["t"]),
+                    history=[(99.0, 5.0), (100.5, 6.0), (101.0, 7.0)])
+    view.pushed = True
+    monkeypatch.setattr(wled_lag.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(wled_lag, "bridge_brightness", fake_bridge)
+    bridge_pts, device_pts = wled_lag.collect(view, "b", seconds=1.0)
+    assert len(bridge_pts) >= 19
+    assert device_pts == [(0.5, 6.0), (1.0, 7.0)]  # pre-start frame dropped
+
+
+def test_collect_aborts_when_the_peek_dies(monkeypatch):
+    def dead():
+        raise PeekError("no live frame for 2.0s")
+    view = FakeView(dead)
+    view.pushed = True
+    monkeypatch.setattr(wled_lag, "bridge_brightness", lambda a: (1.0, 0.0))
+    with pytest.raises(PeekError, match="no live frame"):
+        wled_lag.collect(view, "b", seconds=30.0)
 
 
 # --- step response ----------------------------------------------------------
@@ -138,7 +195,7 @@ def test_step_probe_times_each_transition(monkeypatch):
     def fake_monotonic():
         return clock["t"]
 
-    def fake_device(host):
+    def fake_device():
         elapsed = clock["t"] - state["changed_at"]
         bright = state["cue"] == 12 and elapsed >= 0.2
         return (900.0 if bright else 0.0), clock["t"]
@@ -156,10 +213,9 @@ def test_step_probe_times_each_transition(monkeypatch):
 
     monkeypatch.setattr(wled_lag.time, "sleep", fake_sleep)
     monkeypatch.setattr(wled_lag.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(wled_lag, "device_brightness", fake_device)
     monkeypatch.setattr(wled_lag.socket, "socket", lambda *a, **k: FakeSock())
 
-    results = wled_lag.step_probe("w", "b", 36107, cycles=2, quiet=True)
+    results = wled_lag.step_probe(FakeView(fake_device), "b", 36107, cycles=2, quiet=True)
     assert len(results) == 2
     lit = [r for r in results if r["cue"] == 12 and r["latency_ms"] is not None]
     assert lit, "the dark->bright transition should have been detected"
@@ -169,12 +225,18 @@ def test_step_probe_times_each_transition(monkeypatch):
 def test_step_probe_uses_fresh_dwells_so_a_period_cannot_masquerade(monkeypatch):
     # The whole point of the step test: dwell times must vary, or a periodic
     # artefact could line up with them.
-    monkeypatch.setattr(wled_lag, "device_brightness", lambda h: (0.0, 0.0))
-    monkeypatch.setattr(wled_lag.time, "sleep", lambda s: None)
+    clock = {"t": 0.0}
+
+    def fake_sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(wled_lag.time, "sleep", fake_sleep)
+    monkeypatch.setattr(wled_lag.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(wled_lag.socket, "socket",
                         lambda *a, **k: type("S", (), {"sendto": lambda *_: None,
                                                        "close": lambda _: None})())
-    results = wled_lag.step_probe("w", "b", 36107, cycles=6, quiet=True)
+    results = wled_lag.step_probe(FakeView(lambda: (0.0, clock["t"])), "b", 36107,
+                                  cycles=6, quiet=True)
     dwells = {r["dwell_s"] for r in results}
     assert len(dwells) > 1, "dwell times were constant — the probe can alias"
 
@@ -190,3 +252,80 @@ def test_summarise_steps_calls_out_a_visibly_late_transition():
     text = "\n".join(wled_lag.summarise_steps(steps))
     assert "visible hesitation" in text
     assert "n=2/2" in text
+
+
+def test_summarise_steps_names_the_read_failure_instead_of_blaming_the_bridge():
+    # The regression this port fixes: on WLED 16 every read failed, and the
+    # summary said the strip "never visibly reacted".
+    steps = [{"step": i, "latency_ms": None,
+              "read_error": "WLED is off (on:false or bri 0)"} for i in range(4)]
+    text = "\n".join(wled_lag.summarise_steps(steps))
+    assert "could not be read" in text
+    assert "WLED is off" in text
+    assert "never visibly reacted" not in text
+
+
+def test_summarise_steps_states_the_peek_cadence_allowance():
+    steps = [{"step": 0, "latency_ms": 40.0}]
+    text = "\n".join(wled_lag.summarise_steps(steps, source="websocket peek",
+                                               cadence_ms=42.0))
+    assert "~42 ms" in text and "~21 ms on average" in text
+
+
+class _FakeSender:
+    def __init__(self, host):
+        pass
+
+    def send_pixels(self, data):
+        pass
+
+    def close(self):
+        pass
+
+
+def _direct_fixture(monkeypatch, power_on, fail=False):
+    calls = []
+    monkeypatch.setattr(wled_lag, "get_power", lambda host: power_on)
+    monkeypatch.setattr(wled_lag, "set_power", lambda host, on: calls.append(on))
+    monkeypatch.setattr(wled_lag, "realtime_source", lambda host: (False, "", ""))
+    monkeypatch.setattr(wled_lag.time, "sleep", lambda s: None)
+    import protocol.ddp_sender as ddp
+    monkeypatch.setattr(ddp, "DDPSender", _FakeSender)
+    if fail:
+        monkeypatch.setattr(wled_lag, "_direct_steps",
+                            lambda *a: (_ for _ in ()).throw(PeekError("boom")))
+    else:
+        monkeypatch.setattr(wled_lag, "_direct_steps", lambda *a: [])
+    view = FakeView(lambda: (0.0, 0.0))
+    view.prescaled = False          # a peek: reads black while off
+    return view, calls
+
+
+def test_direct_switches_an_off_device_on_and_restores_it(monkeypatch):
+    view, calls = _direct_fixture(monkeypatch, power_on=False)
+    wled_lag.step_probe_direct("w", view, quiet=True)
+    assert calls == [True, False]
+
+
+def test_direct_restores_power_even_when_the_run_fails(monkeypatch):
+    view, calls = _direct_fixture(monkeypatch, power_on=False, fail=True)
+    with pytest.raises(PeekError):
+        wled_lag.step_probe_direct("w", view, quiet=True)
+    assert calls == [True, False]
+
+
+def test_direct_leaves_an_already_on_device_alone(monkeypatch):
+    view, calls = _direct_fixture(monkeypatch, power_on=True)
+    wled_lag.step_probe_direct("w", view, quiet=True)
+    assert calls == []
+
+
+def test_direct_refuses_while_another_sender_drives_wled(monkeypatch):
+    # The bridge or YALCY's WLED output already writing the buffer would race
+    # every step; refuse and name who it is rather than measure the race.
+    view, calls = _direct_fixture(monkeypatch, power_on=True)
+    monkeypatch.setattr(wled_lag, "realtime_source",
+                        lambda host: (True, "DDP", "192.168.0.15"))
+    with pytest.raises(wled_lag.LagError, match="DDP from 192.168.0.15"):
+        wled_lag.step_probe_direct("w", view, quiet=True)
+    assert calls == []
