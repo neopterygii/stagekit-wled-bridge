@@ -6,9 +6,11 @@ Includes built-in test pattern controls to trigger cues from the web UI.
 """
 
 import asyncio
+import collections
 import json
 import logging
 import math
+import threading
 import time
 from http import HTTPStatus
 
@@ -60,6 +62,16 @@ TEST_PATTERNS = {
 }
 
 
+# Stage Kit visualizer feed. The dashboard's SSE snapshot runs at ~10 Hz, but
+# cue patterns step faster than that (4 steps a beat at 180 BPM is 12 Hz), so
+# sampling the current masks would alias — a rotation could stall or run
+# backwards on screen. Instead the tracker logs every mask change with its
+# time, each snapshot carries the recent window, and the page replays the
+# changes at their recorded spacing a fixed delay behind live.
+STAGEKIT_WINDOW_S = 1.0     # history each snapshot carries; > the 0.1 s push
+STAGEKIT_LOG_MAX = 256      # ~4 s of changes at the 60 fps render ceiling
+
+
 class StatusTracker:
     """Collects bridge state for the status page."""
 
@@ -99,6 +111,13 @@ class StatusTracker:
         self.sp_active = False      # any player's overdrive engaged
         self.sp_charge = 0.0        # fullest player's meter, 0..1
         self.sp_active_count = 0    # players in overdrive
+
+        self.fog = False            # venue fog/haze (the Stage Kit fogger)
+
+        # (monotonic time, (r, g, b, y)) on every change of the four masks.
+        # Appended from the render thread, read from the event loop.
+        self._zone_log: collections.deque = collections.deque(maxlen=STAGEKIT_LOG_MAX)
+        self._zone_log_lock = threading.Lock()
 
         self._pkt_count_window: list[float] = []
         self._sse_queues: list[asyncio.Queue] = []
@@ -162,6 +181,10 @@ class StatusTracker:
     def on_render(self, zones: list[int], strobe_rate: float, bpm: float, ddp_sent: bool = False,
                   beat_phase: float | None = None, bar_beat: int | None = None):
         self.zones = list(zones)
+        masks = tuple(zones)
+        with self._zone_log_lock:
+            if not self._zone_log or self._zone_log[-1][1] != masks:
+                self._zone_log.append((time.monotonic(), masks))
         self.strobe_rate = strobe_rate
         self.bpm = bpm
         if beat_phase is not None:
@@ -174,6 +197,26 @@ class StatusTracker:
 
     def on_beat(self, beat: int):
         self.last_beat = beat
+
+    def on_fog(self, foggy: bool):
+        self.fog = bool(foggy)
+
+    def stagekit_snapshot(self, now: float) -> dict:
+        """Mask changes within the last STAGEKIT_WINDOW_S, for the visualizer.
+
+        Times are integer ms on the tracker's monotonic clock, with `now_ms`
+        on the same clock, so the page can place each change relative to the
+        snapshot without trusting either machine's wall clock. `events` rows
+        are [t_ms, red, green, blue, yellow] — the masks in engine zone order.
+        """
+        cutoff = now - STAGEKIT_WINDOW_S
+        with self._zone_log_lock:
+            log = list(self._zone_log)
+        return {
+            "now_ms": round(now * 1000),
+            "events": [[round(t * 1000), *masks] for t, masks in log if t >= cutoff],
+            "fog": self.fog,
+        }
 
     def on_scene(self, scene: int):
         self.scene = scene
@@ -223,6 +266,7 @@ class StatusTracker:
                 "yellow": f"{self.zones[3]:08b}",
             },
             "zones_raw": self.zones,
+            "stagekit": self.stagekit_snapshot(now),
             "packets_received": self.packets_received,
             "packets_per_sec": round(pps, 1),
             "ddp_frames_sent": self.ddp_frames_sent,
@@ -325,6 +369,22 @@ STATUS_HTML = """\
   .zone-label { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; margin-bottom: 4px;
                display: flex; align-items: center; gap: 6px; }
   .zone-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+
+  .sk-wrap { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
+  .sk-pod { width: 100%; max-width: 280px; height: auto; flex: 0 1 280px; }
+  .sk-led { fill: #1c2128; stroke: #30363d; stroke-width: 1.5; }
+  .sk-led.on { stroke: rgba(255,255,255,0.35); filter: url(#sk-glow); }
+  .sk-strobe { fill: #1c2128; stroke: #30363d; stroke-width: 1.5; }
+  .sk-strobe.on { fill: #ffffff; filter: url(#sk-glow); }
+  .sk-haze { fill: url(#sk-haze-grad); opacity: 0; transition: opacity 0.6s; pointer-events: none; }
+  .sk-haze.on { opacity: 1; }
+  .sk-side { display: flex; flex-direction: column; gap: 0.6rem; min-width: 180px; flex: 1 1 180px; }
+  .sk-stat { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; }
+  .sk-lamp { width: 12px; height: 12px; border-radius: 50%; background: #21262d;
+             border: 1px solid var(--border); flex: none; }
+  .sk-lamp.strobe.on { background: #fff; box-shadow: 0 0 8px #fff; }
+  .sk-lamp.fog.on { background: #9aa4b2; box-shadow: 0 0 8px #9aa4b2; }
+  .sk-note { font-size: 0.75rem; color: var(--dim); line-height: 1.4; max-width: 34em; }
 
   /* Live strip + per-layer preview (Phase 7) */
   .strip-canvas { width: 100%; height: 34px; border-radius: 6px; border: 1px solid var(--border);
@@ -577,6 +637,40 @@ STATUS_HTML = """\
   <div class="layer-rows" id="layer-rows"></div>
 </div>
 
+<h3 style="margin:1rem 0 0.5rem">Stage Kit</h3>
+<div class="card sk-wrap">
+  <svg id="sk-pod" class="sk-pod" viewBox="-150 -150 300 300" role="img"
+       aria-label="Stage Kit pod: the four LED masks laid out as the physical pod">
+    <defs>
+      <filter id="sk-glow" x="-100%" y="-100%" width="300%" height="300%">
+        <feGaussianBlur stdDeviation="4" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+      <radialGradient id="sk-haze-grad">
+        <stop offset="0%" stop-color="#c9d1d9" stop-opacity="0.22"/>
+        <stop offset="100%" stop-color="#c9d1d9" stop-opacity="0"/>
+      </radialGradient>
+    </defs>
+    <circle cx="0" cy="0" r="146" fill="none" stroke="#21262d" stroke-width="2"/>
+    <g id="sk-leds"></g>
+    <circle id="sk-strobe" class="sk-strobe" cx="0" cy="0" r="22"><title>strobe</title></circle>
+    <circle id="sk-haze" class="sk-haze" cx="0" cy="0" r="150"/>
+  </svg>
+  <div class="sk-side">
+    <div class="sk-stat"><span class="sk-lamp strobe" id="sk-strobe-lamp"></span>
+      Strobe <span id="sk-strobe-text" style="color:var(--dim)">off</span></div>
+    <div class="sk-stat"><span class="sk-lamp fog" id="sk-fog-lamp"></span>
+      Fog <span id="sk-fog-text" style="color:var(--dim)">off</span></div>
+    <div class="sk-stat" style="color:var(--dim)">Cue <span id="sk-cue" style="color:var(--text)">&mdash;</span></div>
+    <div class="sk-note">The cue engine's four 8-LED masks drawn as the physical pod:
+      blue inner diamond, green pairs, yellow and red alternating round the outer
+      ring, LED&nbsp;0 at the top, clockwise. Every step is replayed about
+      0.2&nbsp;s behind live, so fast chases show each step instead of aliasing
+      against the 10&nbsp;Hz page update. Stage Kit colours, not the palette.
+      The strobe lamp shows the rate, not the exact flash phase.</div>
+  </div>
+</div>
+
 <h3 style="margin:1rem 0 0.5rem">Zone Bitmasks</h3>
 <div id="zones"></div>
 
@@ -695,6 +789,12 @@ function updateZoneColors(colors) {
       if (swatch) swatch.style.background = ZONE_COLORS[zone];
     }
   });
+  // The rows repaint only on a mask change, so recolour lit cells now.
+  if (typeof skMasks !== 'undefined' && skMasks[0] !== -1) {
+    const cur = skMasks.slice();
+    skMasks = [-1, -1, -1, -1];
+    skApply(cur);
+  }
 }
 
 function initZones() {
@@ -714,6 +814,116 @@ function initZones() {
     }
     container.appendChild(sec);
   }
+}
+
+// ── Stage Kit visualizer ─────────────────────────────────────────────
+// Pod geometry: LED i of each colour sits at the position the physical pod
+// gives it, LED 0 at 12 o'clock and running clockwise (bit i of the engine's
+// mask is LED i, as in YALCY's StageKitTalker). Coordinates centred on 0.
+const SK_COLORS = { red: '#ff453a', green: '#32d74b', blue: '#3d8bff', yellow: '#ffd60a' };
+function skRing(radius, startDeg) {
+  const pts = [];
+  for (let i = 0; i < 8; i++) {
+    const a = (startDeg + 45 * i) * Math.PI / 180;
+    pts.push([radius * Math.sin(a), -radius * Math.cos(a)]);
+  }
+  return pts;
+}
+const SK_LAYOUT = {
+  // inner diamond: tips at the cardinals, edge midpoints between them
+  blue: [[0,-68],[34,-34],[68,0],[34,34],[0,68],[-34,34],[-68,0],[-34,-34]],
+  // a pair either side of each diamond tip, further out
+  green: [[35,-88],[88,-35],[88,35],[35,88],[-35,88],[-88,35],[-88,-35],[-35,-88]],
+  // outer ring of 16: yellow on the cardinals/diagonals, red between
+  yellow: skRing(128, 0),
+  red: skRing(128, 22.5),
+};
+const SK_DELAY_MS = 200;   // > one SSE period plus delivery jitter
+let skOffset = null;       // page clock minus bridge clock, min-filtered
+let skLastEventT = -Infinity, skLastNow = null;
+let skQueue = [];
+let skMasks = [-1, -1, -1, -1];
+let skStrobeHz = 0;
+const skEls = { red: [], green: [], blue: [], yellow: [] };
+
+function initStageKit() {
+  const g = document.getElementById('sk-leds');
+  const ns = 'http://www.w3.org/2000/svg';
+  for (const name of ZONE_NAMES) {
+    SK_LAYOUT[name].forEach(([x, y], i) => {
+      const c = document.createElementNS(ns, 'circle');
+      c.setAttribute('cx', x.toFixed(1));
+      c.setAttribute('cy', y.toFixed(1));
+      c.setAttribute('r', name === 'blue' || name === 'green' ? 10 : 11);
+      c.setAttribute('class', 'sk-led');
+      const t = document.createElementNS(ns, 'title');
+      t.textContent = name + ' ' + i;
+      c.appendChild(t);
+      g.appendChild(c);
+      skEls[name].push(c);
+    });
+  }
+  requestAnimationFrame(skFrame);
+}
+
+// One set of masks, in engine zone order [red, green, blue, yellow], drives
+// both the pod and the bitmask rows so the two can never disagree.
+function skApply(masks) {
+  ZONE_NAMES.forEach((name, z) => {
+    const mask = masks[z];
+    if (mask === skMasks[z]) return;
+    for (let i = 0; i < 8; i++) {
+      const on = (mask >> i) & 1;
+      const c = skEls[name][i];
+      c.classList.toggle('on', !!on);
+      c.style.fill = on ? SK_COLORS[name] : '';
+      document.getElementById('led-' + name + '-' + i).style.background =
+        on ? ZONE_COLORS[name] : ZONE_OFF;
+    }
+    skMasks[z] = mask;
+  });
+}
+
+function skIngest(d) {
+  const sk = d.stagekit;
+  if (!sk) { skApply(d.zones_raw); return; }
+  // The bridge restarted (its monotonic clock went backwards): start over.
+  if (skLastNow !== null && sk.now_ms < skLastNow - 1000) {
+    skOffset = null; skLastEventT = -Infinity; skQueue = [];
+  }
+  skLastNow = sk.now_ms;
+  // Min-filter the clock offset: the fastest-delivered snapshot is the
+  // truest. Let it creep up 1 ms per snapshot (10 ms/s — far above real
+  // clock drift, far below delivery jitter) so a lucky early minimum cannot
+  // pin it forever without the timeline wobbling with every delivery.
+  const off = performance.now() - sk.now_ms;
+  skOffset = skOffset === null ? off : Math.min(off, skOffset + 1);
+  if (skLastEventT === -Infinity && !sk.events.length) skApply(d.zones_raw);
+  for (const ev of sk.events) {
+    if (ev[0] > skLastEventT) { skQueue.push(ev); skLastEventT = ev[0]; }
+  }
+  skStrobeHz = d.strobe_hz || 0;
+  document.getElementById('sk-strobe-text').textContent =
+    skStrobeHz > 0 ? skStrobeHz.toFixed(1) + ' Hz' : 'off';
+  document.getElementById('sk-fog-lamp').classList.toggle('on', !!sk.fog);
+  document.getElementById('sk-haze').classList.toggle('on', !!sk.fog);
+  document.getElementById('sk-fog-text').textContent = sk.fog ? 'on' : 'off';
+  document.getElementById('sk-cue').textContent = d.cue;
+}
+
+function skFrame(now) {
+  if (skOffset !== null) {
+    const due = now - skOffset - SK_DELAY_MS;   // bridge time to show now
+    if (skQueue.length > 240) {                 // tab was hidden: skip ahead
+      skApply(skQueue[skQueue.length - 1].slice(1));
+      skQueue = [];
+    }
+    while (skQueue.length && skQueue[0][0] <= due) skApply(skQueue.shift().slice(1));
+  }
+  const flash = skStrobeHz > 0 && ((now / 1000) * skStrobeHz) % 1 < 0.3;
+  document.getElementById('sk-strobe').classList.toggle('on', flash);
+  document.getElementById('sk-strobe-lamp').classList.toggle('on', flash);
+  requestAnimationFrame(skFrame);
 }
 
 function addLog(msg) {
@@ -1408,13 +1618,7 @@ function update(d) {
     lastBeat = d.last_beat;
   }
 
-  for (const name of ['red','green','blue','yellow']) {
-    const mask = d.zones_raw[['red','green','blue','yellow'].indexOf(name)];
-    for (let i = 0; i < 8; i++) {
-      const on = (mask >> i) & 1;
-      document.getElementById('led-' + name + '-' + i).style.background = on ? ZONE_COLORS[name] : ZONE_OFF;
-    }
-  }
+  skIngest(d);
 
   // Sync active button highlight with server state
   if (!d.test_active && activePattern) {
@@ -1438,6 +1642,7 @@ function update(d) {
 }
 
 initZones();
+initStageKit();
 
 const evtSource = new EventSource('/events');
 evtSource.onmessage = function(e) { update(JSON.parse(e.data)); };
