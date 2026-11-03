@@ -20,6 +20,16 @@ print which one they used. Numbers below dated 2026-07-28 were taken through
 10 Hz keep-alive alongside the bridge. Two senders interleave frames on the
 strip, and that looks exactly like a desync.
 
+## During a party: the lighting monitor
+
+`tools/party_start.sh` runs `tools/party_monitor.py` for the night: read-only, it follows the
+bridge's own 10 Hz `/events` stream, samples WLED every 10 s, and prints ALERT / WARN / SONG lines
+(dark while playing, latch, second sender, parser garbage, flicker, frozen or black strip, stuck
+strobe, stutter…), with the 20 s of snapshots before each one saved as evidence. Phone page on
+Tailscale `:8733`. Afterwards `python -m tools.party_monitor report out/sessions/<date>-party`
+writes `report.md`, grouped by cause class, which is what the update plan is drafted from. The
+`party-lights` skill drives start / status / end. An ALERT means: come here and capture first.
+
 ## If it is happening right now — do this first, before anything else
 
 **Do not power cycle yet.** The bad state is the evidence. Capture it:

@@ -15,3 +15,6 @@ __pycache__/
 tests/fixtures/captures/
 *.jsonl
 !tests/fixtures/format_v1_sample.jsonl
+
+# Party monitor sessions (tools/party_monitor.py): the operator's, like captures.
+out/
