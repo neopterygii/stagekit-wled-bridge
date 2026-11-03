@@ -10,12 +10,18 @@ Virtual.thread_function pattern.
 """
 
 import asyncio
+import json
 import logging
 import signal
+import socket
 import sys
 import threading
 import time
+from array import array
+from collections import deque
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
 
 from config import (
     YARG_LISTEN_HOST, YARG_LISTEN_PORT,
@@ -24,6 +30,7 @@ from config import (
     STATUS_HOST, STATUS_PORT,
     IDLE_TIMEOUT,
     CAPTURE_DIR,
+    ANOMALY_DETECTION, ANOMALY_DIR,
     LOG_LEVEL,
 )
 from protocol.yarg_packet import (
@@ -41,6 +48,9 @@ from version import VERSION_LABEL
 
 log = logging.getLogger(__name__)
 
+RECENT_DATAGRAMS = 2700   # ~30 s of YARG's ~90 datagrams/s, kept for anomaly evidence
+LEVEL_RING = 256          # frames of brightness history; the status loop reads ~6 per tick
+
 
 class YARGProtocol(asyncio.DatagramProtocol):
     """Receives YARG UDP packets and feeds the cue engine."""
@@ -53,6 +63,9 @@ class YARGProtocol(asyncio.DatagramProtocol):
         # Optional CaptureController. When a recording is active its recorder
         # buffers datagrams for replay; see replay/controller.py.
         self.capture = capture
+        # The last ~30 s of raw datagrams, so an anomaly can be saved as a replayable capture of
+        # what led up to it. One deque append per datagram; nothing is encoded until needed.
+        self.recent: deque = deque(maxlen=RECENT_DATAGRAMS)
         self._last_cue = -1
         self._last_strobe = -1
         self._last_camera_subject = -1
@@ -70,6 +83,7 @@ class YARGProtocol(asyncio.DatagramProtocol):
             recorder = self.capture.recorder
             if recorder is not None:
                 recorder.record(data)
+        self.recent.append((time.monotonic(), data))
 
         pkt = parse_packet(data)
         if pkt is None:
@@ -755,6 +769,13 @@ class RenderThread(threading.Thread):
         self._wled_power = wled_power
         self._active = False
 
+        # Mean channel value of every frame sent, for anomaly detection (flicker, black, frozen)
+        # at the full frame rate rather than the dashboard's 10 Hz sample. A fixed ring written
+        # only here and read from the event loop by count, so it needs no lock: a reader that
+        # races the writer gets at most one stale value. Costs one C-level sum() per frame.
+        self._levels = array('f', bytes(4 * LEVEL_RING))
+        self._levels_n = 0
+
         # Frame-skip tracking
         self._frames_rendered = 0
         self._frames_skipped = 0
@@ -1039,6 +1060,8 @@ class RenderThread(threading.Thread):
         # gate was checked above; reaching here means it was open.
         self._sender.send_pixels(pixel_data)
         ddp_sent = True
+        self._levels[self._levels_n % LEVEL_RING] = sum(pixel_data) / len(pixel_data)
+        self._levels_n += 1
 
         self._tracker.on_render(self._engine.zones,
                                 self._engine.strobe_hz(),
@@ -1105,6 +1128,17 @@ class RenderThread(threading.Thread):
             "layers": [],
         }
 
+    def frame_levels_since(self, n: int) -> tuple[int, list]:
+        """Brightness of each frame sent since count `n`: (new count, levels oldest first)."""
+        end = self._levels_n
+        start = max(n, end - LEVEL_RING + 1)
+        ring = self._levels
+        return end, [ring[i % LEVEL_RING] for i in range(start, end)]
+
+    def last_frame(self) -> bytes:
+        """The last visible frame sent (strobe blanks excluded), for the frozen-strip check."""
+        return bytes(self._last_sent)
+
     def render_stats(self) -> dict:
         """Rolling timing stats for diagnostics / status page."""
         fps = self._settings.fps
@@ -1136,6 +1170,104 @@ class RenderThread(threading.Thread):
             "target_ms": round(1000.0 / fps, 1),
             "ddp": self._sender.stats(),
         }
+
+
+def _bridge_ip_toward(host: str) -> str:
+    """The local address our DDP leaves from, which is what WLED reports as `lip`.
+
+    A UDP connect sends nothing; it only asks the kernel which interface it would use.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((host, WLED_DDP_PORT))
+            return s.getsockname()[0]
+    except OSError:
+        return ""
+
+
+def _read_pids(root: str = "/sys/fs/cgroup") -> tuple[int, int] | None:
+    """This container's (pids.current, pids.max), or None outside a pid-limited cgroup v2."""
+    try:
+        with open(f"{root}/pids.current") as f:
+            current = int(f.read())
+        with open(f"{root}/pids.max") as f:
+            maximum = f.read().strip()
+        return None if maximum == "max" else (current, int(maximum))
+    except (OSError, ValueError):
+        return None
+
+
+EVIDENCE_SNAPSHOTS = 200  # ~20 s of status snapshots kept beside each anomaly capture
+PIDS_EVERY = 60.0
+
+
+def wire_anomalies(tracker, render_thread, protocol, wled_api, capture_dir, anomaly_dir, loop,
+                   clock=time.time):
+    """Build the bridge's AnomalyLog and hook it into the status loop. Returns the log.
+
+    Everything runs on the event loop inside StatusTracker.broadcast_loop, which guards it, so
+    the render thread pays only for its brightness ring. Evidence for each new episode is a
+    replayable capture of the last ~30 s of datagrams (`<capture_dir>/anomalies/<stamp>-<kind>.jsonl`,
+    the format `python -m replay.cli` plays) plus the status snapshots over the same span
+    (`….status.jsonl`), written off the loop.
+    """
+    from anomalies import AnomalyLog
+    from replay.capture import CaptureWriter
+
+    capture_dir = Path(capture_dir)
+    snaps: deque = deque(maxlen=EVIDENCE_SNAPSHOTS)
+    state = {"n": 0, "pids_at": float("-inf")}
+
+    def on_evidence(ev: dict) -> str:
+        stamp = datetime.fromtimestamp(ev["t"]).strftime("%Y%m%d-%H%M%S")
+        name = f"anomalies/{stamp}-{ev['kind']}.jsonl"
+        packets = list(protocol.recent)
+        statuses = list(snaps)
+        meta = {k: ev.get(k) for k in ("kind", "level", "cls", "msg", "song", "t")}
+
+        def write():
+            path = capture_dir / name
+            t0 = packets[0][0] if packets else 0.0
+            with CaptureWriter(path, note=f"anomaly {ev['kind']}: {ev['msg']}",
+                               extra={"anomaly": meta, "source": "anomaly-evidence"}) as w:
+                for t, data in packets:
+                    w.add(t - t0, data)
+            with open(path.with_suffix(".status.jsonl"), "w", encoding="utf-8") as f:
+                for s in statuses:
+                    f.write(json.dumps(s) + "\n")
+
+        def done(fut):
+            if fut.exception() is not None:
+                log.warning("Anomaly evidence %s not written: %s", name, fut.exception())
+
+        try:
+            loop.run_in_executor(None, write).add_done_callback(done)
+        except RuntimeError:
+            # No thread to be had (the pid-exhaustion failure): write inline rather than lose it.
+            write()
+        return name
+
+    anomaly_log = AnomalyLog(directory=anomaly_dir, bridge_ip=_bridge_ip_toward(WLED_HOST),
+                             on_evidence=on_evidence, clock=clock)
+
+    def on_snapshot(data: dict):
+        n, levels = render_thread.frame_levels_since(state["n"])
+        state["n"] = n
+        snaps.append({"t": round(clock(), 3),
+                      "snap": {k: v for k, v in data.items()
+                               if k not in ("settings", "preview", "anomalies", "stagekit")}})
+        pids = None
+        now = time.monotonic()
+        if now - state["pids_at"] >= PIDS_EVERY:
+            state["pids_at"] = now
+            pids = _read_pids()
+        anomaly_log.tick(data, levels=levels, frame=render_thread.last_frame() if levels else None,
+                         wled=wled_api.device_info, pids=pids)
+
+    tracker.anomalies = anomaly_log
+    tracker.on_snapshot = on_snapshot
+    anomaly_log.start(VERSION_LABEL)
+    return anomaly_log
 
 
 async def main():
@@ -1196,6 +1328,14 @@ async def main():
 
     # Provide render thread reference for status snapshots
     tracker.render_thread = render_thread
+
+    if ANOMALY_DETECTION:
+        anomaly_log = wire_anomalies(tracker, render_thread, protocol, wled_api,
+                                     CAPTURE_DIR, ANOMALY_DIR, loop)
+        log.info("  Anomaly detection: on (log %s, evidence %s/anomalies, bridge seen as %s)",
+                 ANOMALY_DIR, CAPTURE_DIR, anomaly_log.det.bridge_ip or "unknown")
+    else:
+        log.info("  Anomaly detection: off (ANOMALY_DETECTION=0)")
 
     # Start WLED idle watchdog
     watchdog_task = asyncio.create_task(wled_power.watchdog_loop())
