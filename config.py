@@ -54,5 +54,11 @@ IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT", 1800, min_val=0)
 # a recording survives a container recreate and can be copied off the host.
 CAPTURE_DIR = os.environ.get("CAPTURE_DIR", "/data/captures")
 
+# Anomaly detection (anomalies.py): on by default. Set ANOMALY_DETECTION=0 to switch it off
+# without a rebuild if it ever misbehaves; the bridge then runs exactly as before it existed.
+ANOMALY_DETECTION = os.environ.get("ANOMALY_DETECTION", "1").strip().lower() not in ("0", "false", "no", "off")
+# The night's anomaly log, one file per day. Evidence captures go to CAPTURE_DIR/anomalies/.
+ANOMALY_DIR = os.environ.get("ANOMALY_DIR", "/data/anomalies")
+
 # Logging
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()

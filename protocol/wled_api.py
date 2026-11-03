@@ -22,6 +22,7 @@ short timeout and is expected to be run via `asyncio.to_thread`.
 
 import json
 import logging
+import time
 import urllib.request
 import urllib.error
 
@@ -54,6 +55,9 @@ class WLEDApi:
         self.effects: list[str] = []
         self.palettes: list[str] = []
         self.realtime_timeout_ms: int = DEFAULT_REALTIME_TIMEOUT_MS
+        # The device-health fields of the last /json/info read, for anomaly detection. A new
+        # dict on every read (consumers spot a fresh sample by identity), or {"error": ...}.
+        self.device_info: dict | None = None
 
     # ── plumbing ────────────────────────────────────────────────────────
 
@@ -207,11 +211,19 @@ class WLEDApi:
 
     def fetch_wifi_info(self) -> dict:
         """Fetch WiFi diagnostics from /json/info. Returns {} on failure."""
+        start = time.monotonic()
         data = self._get("/info")
         if data is None:
             self.wifi_info = {}
+            self.device_info = {"error": "no reply to /json/info"}
             return {}
         wifi = data.get("wifi", {})
+        self.device_info = {
+            "http_ms": round((time.monotonic() - start) * 1000, 1),
+            "live": data.get("live"), "lm": data.get("lm"), "lip": data.get("lip"),
+            "uptime": data.get("uptime"), "freeheap": data.get("freeheap"),
+            "rssi": wifi.get("rssi"), "fps": (data.get("leds") or {}).get("fps"),
+        }
         self.wifi_info = {
             "signal": wifi.get("signal", 0),
             "rssi": wifi.get("rssi", 0),

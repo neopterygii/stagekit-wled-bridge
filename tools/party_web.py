@@ -57,6 +57,7 @@ def state(session):
             if ep.open:
                 level, cls, _ = KINDS[kind]
                 open_eps.append({"kind": kind, "level": level, "cls": cls, "msg": ep.msg})
+    open_eps += (snap.get("anomalies") or {}).get("open") or []  # the bridge's own, in relay mode
     strip = (snap.get("preview") or {}).get("strip") or []
     render = snap.get("render") or {}
     return {

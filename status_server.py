@@ -87,6 +87,9 @@ class StatusTracker:
         self.packets_per_sec = 0.0
         self.ddp_frames_sent = 0
         self.last_beat = 0
+        # Beat datagrams actually received from YARG. The engine's beat_phase free-runs from BPM,
+        # so only this can show YARG having stopped sending beats.
+        self.beats_received = 0
         self.test_active = False
         self.test_pattern = ""
         self.render_thread = None  # set after creation in main()
@@ -121,6 +124,13 @@ class StatusTracker:
 
         self._pkt_count_window: list[float] = []
         self._sse_queues: list[asyncio.Queue] = []
+
+        # Anomaly detection (anomalies.AnomalyLog), wired by main() when enabled. `on_snapshot`
+        # is called with each ~10 Hz snapshot so the detectors see exactly what the dashboard
+        # sees; it must never raise, and broadcast_loop guards it anyway.
+        self.anomalies = None
+        self.on_snapshot = None
+        self._snapshot_hook_errors = 0
 
     @property
     def has_subscribers(self) -> bool:
@@ -197,6 +207,8 @@ class StatusTracker:
 
     def on_beat(self, beat: int):
         self.last_beat = beat
+        if beat:
+            self.beats_received += 1
 
     def on_fog(self, foggy: bool):
         self.fog = bool(foggy)
@@ -271,6 +283,7 @@ class StatusTracker:
             "packets_per_sec": round(pps, 1),
             "ddp_frames_sent": self.ddp_frames_sent,
             "last_beat": self.last_beat,
+            "beats_received": self.beats_received,
             "beat_phase": round(self.beat_phase, 3),
             "bar_beat": self.bar_beat,
             "connected": self.connected,
@@ -307,6 +320,8 @@ class StatusTracker:
             preview = self.render_thread.preview_snapshot()
             if preview:
                 d["preview"] = preview
+        if self.anomalies is not None:
+            d["anomalies"] = self.anomalies.summary()
         return d
 
     def subscribe(self) -> asyncio.Queue:
@@ -322,6 +337,19 @@ class StatusTracker:
         """Pushes snapshots to all SSE subscribers at ~10Hz."""
         while True:
             data = self.snapshot(wled_power=wled_power, settings=settings)
+            if self.on_snapshot is not None:
+                # This loop is the dashboard's only feed: a detector bug must cost the anomaly
+                # card, never the stream (the watchdog task once died silently and took the
+                # strip with it).
+                try:
+                    self.on_snapshot(data)
+                    if self.anomalies is not None:
+                        data["anomalies"] = self.anomalies.summary()
+                except Exception:
+                    self._snapshot_hook_errors += 1
+                    if self._snapshot_hook_errors in (1, 10, 100, 1000):
+                        log.exception("Anomaly hook failed (%d so far); the stream carries on",
+                                      self._snapshot_hook_errors)
             dead = []
             for q in self._sse_queues:
                 try:
@@ -1974,6 +2002,9 @@ class StatusServer:
             elif path == '/api/settings' and method == 'GET':
                 body = json.dumps(self.settings.snapshot() if self.settings else {}).encode()
                 await self._send_response(writer, 200, 'application/json', body)
+            elif path.split('?', 1)[0] == '/api/anomalies' and method == 'GET':
+                status, body = self._anomalies_response(path)
+                await self._send_response(writer, status, 'application/json', body)
             elif path == '/api/wled' and method == 'GET':
                 caps = self.wled_power.capabilities() if self.wled_power else {}
                 await self._send_response(writer, 200, 'application/json',
@@ -2022,6 +2053,31 @@ class StatusServer:
         )
         writer.write(header.encode() + body)
         await writer.drain()
+
+    def _anomalies_response(self, path: str) -> tuple[int, bytes]:
+        """GET /api/anomalies?since=N — events after sequence N, plus what is open now.
+
+        404 when detection is switched off, which is how an external watcher knows to run the
+        detectors itself.
+        """
+        log_ = self.tracker.anomalies
+        if log_ is None:
+            return 404, json.dumps({"error": "anomaly detection is off"}).encode()
+        since = 0
+        query = path.split('?', 1)[1] if '?' in path else ''
+        for part in query.split('&'):
+            key, _, value = part.partition('=')
+            if key == 'since':
+                try:
+                    since = max(0, int(value))
+                except ValueError:
+                    return 400, json.dumps({"error": "since must be an integer"}).encode()
+        summary = log_.summary()
+        return 200, json.dumps({
+            "seq": summary["seq"], "open": summary["open"], "today": summary["today"],
+            "song": summary["song"], "errors": summary["errors"],
+            "events": log_.since(since),
+        }).encode()
 
     async def _handle_sse(self, writer: asyncio.StreamWriter):
         header = (
