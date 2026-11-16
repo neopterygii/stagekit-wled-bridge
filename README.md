@@ -395,9 +395,41 @@ instead; a `checkout` build renders in yellow on the dashboard, because it is
 never what the rig should be on.
 
 `version` comes from `__version__` in `version.py`, except on a `v*` tag build,
-where the tag wins. **Bump `__version__` and tag the release commit to match** —
-a forgotten bump shows up as a mismatch between the reported version and the
-commit rather than shipping silently.
+where the tag wins. CI refuses to build a tag that disagrees with
+`__version__`, so the two cannot drift apart; see [Releasing](#releasing).
+
+### Releasing
+
+A release is a `v*` tag on a commit that is already on `main`. Pushing the tag
+makes CI publish the image as `:X.Y.Z` and `:X.Y`, alongside the `:latest` that
+every push to `main` moves. What changed in each release is in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+1. On a branch, set `__version__` in `version.py` to the new `X.Y.Z` and add a
+   `## X.Y.Z — draft` entry at the top of `CHANGELOG.md`. The test suite fails
+   if the two disagree.
+2. Merge to `main` and wait for CI to go green on that commit.
+3. When the release is ready to cut, replace `draft` in the changelog heading
+   with the date (`YYYY-MM-DD`), commit that to `main`, and check locally:
+
+   ```bash
+   python tools/check_release_tag.py vX.Y.Z
+   ```
+
+4. Tag that commit and push the tag:
+
+   ```bash
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+CI runs the same check on the tag before building. If the tag does not match
+`__version__`, or the changelog entry is missing or still says `draft`, the
+test job fails and no image is built. Delete the tag, fix `main`, and tag
+again; do not move a tag that has already produced an image.
+
+Minor versions (`1.2.0` → `1.3.0`) are for anything that changes what the strip
+or the dashboard does; patch versions are for fixes that do not.
 
 ## Development
 
@@ -488,6 +520,7 @@ docker build -t stagekit-wled-bridge \
 ├── config.py                # Environment variable configuration
 ├── settings.py              # Persistent settings (brightness, palette)
 ├── version.py               # Build identity (CI-injected commit + build time)
+├── CHANGELOG.md             # What changed in each release
 ├── status_server.py         # Web dashboard + SSE + test controls
 ├── test_sender.py           # Standalone fake YARG packet generator
 ├── protocol/

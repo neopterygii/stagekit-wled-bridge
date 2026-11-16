@@ -36,6 +36,13 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -q
 
+      # A v* tag overrides __version__ in the image, so a tag pushed without
+      # the bump would ship an image whose name disagrees with its source.
+      # Failing here stops build-and-push, which needs this job.
+      - name: Check the release tag matches version.py and CHANGELOG.md
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python tools/check_release_tag.py "$GITHUB_REF_NAME"
+
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
