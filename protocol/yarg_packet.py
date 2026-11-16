@@ -2,37 +2,45 @@
 
 Parses the YARG datagram protocol (header 0x59415247 "YARG") and extracts
 the fields relevant to Stage Kit lighting control.
+
+Where each field sits is declared once, in `protocol/schema.py`.
 """
 
 import struct
 from dataclasses import dataclass, field
 
+from protocol import schema
+
 # YARG packet header magic bytes
 PACKET_HEADER = 0x59415247  # "YARG"
-MIN_PACKET_SIZE = 44
+_MAGIC = struct.pack("<I", PACKET_HEADER)  # little-endian uint32 (C# BinaryWriter)
+MIN_PACKET_SIZE = schema.MIN_PACKET_SIZE   # 44: the oldest known version's core
 
-# Datagram versions whose layout this parser has been verified against in
-# YARG's DataStreamController.cs:
+# Datagram versions whose layout has been verified against YARG's
+# DataStreamController.cs:
 #   1 = v0.14.0
 #   3 = v0.15.0            (+3 camera-cut bytes)
 #   4 = nightly (dev)      (+ushort count, then variable-length star-power)
 #   5 = nightly (dev)      (+ushort FogRemainingCentiseconds INSERTED at 37)
 #
-# v1-v4 were purely append-only, so offsets 0-43 were identical across them.
-# v5 (YARG PR #1605, "Added fog timer and changed all bytes to a queue") is
-# the first version to insert a field mid-packet: a ushort fog countdown
-# between FogState and StrobeState, shifting every later field by 2. So
-# parse_packet branches on the version byte for everything past offset 36.
+# v1-v4 were purely append-only. v5 (YARG PR #1605, "Added fog timer and
+# changed all bytes to a queue") is the first version to insert a field
+# mid-packet, shifting every later field by 2 — which is why the layout is a
+# per-version table in `protocol/schema.py` rather than offsets typed here.
 #
 # A version outside this set means the layout *may* have shifted again under
 # the fields we read. parse_packet still parses at the newest known offsets
 # (best effort); the caller warns so it gets re-verified against upstream
 # rather than silently rendering wrong lighting.
+# `tools/check_yarg_schema.py` does that verification, daily, in CI.
 # See memory: yarg-datagram-version.
-KNOWN_DATAGRAM_VERSIONS = frozenset({1, 3, 4, 5})
+KNOWN_DATAGRAM_VERSIONS = schema.KNOWN_VERSIONS
 
 # First datagram version carrying FogRemainingCentiseconds at offset 37.
 FOG_TIMER_VERSION = 5
+
+_LAYOUTS = schema.LAYOUTS
+_PREFIX = schema.PREFIX
 
 
 @dataclass
@@ -296,74 +304,45 @@ class CameraCutSubject:
 
 
 def parse_packet(data: bytes) -> YARGPacket | None:
-    """Parse a raw YARG UDP datagram. Returns None if invalid."""
-    if len(data) < MIN_PACKET_SIZE:
-        return None
+    """Parse a raw YARG UDP datagram. Returns None if invalid.
 
-    header = struct.unpack_from("<I", data, 0)[0]  # little-endian uint32 (C# BinaryWriter)
-    if header != PACKET_HEADER:
+    Offsets come from `protocol/schema.py`; nothing here names one. The layout
+    is chosen by the version byte, NOT by length: a v4 packet carrying one
+    star-power player is 51 bytes, exactly like a v5 packet carrying none, so
+    length cannot tell the two apart.
+    """
+    size = len(data)
+    if size < MIN_PACKET_SIZE or data[:4] != _MAGIC:
         return None
 
     pkt = YARGPacket()
-    # Byte 4 onward — BinaryReader-style sequential read (little-endian for floats)
-    pkt.datagram_version = data[4]
-    pkt.platform = data[5]
-    pkt.scene = data[6]
-    pkt.paused = data[7]
-    pkt.venue_size = data[8]
-    pkt.bpm = struct.unpack_from("<f", data, 9)[0]  # little-endian float32
-    pkt.song_section = data[13]
-    pkt.guitar_notes = data[14]
-    pkt.bass_notes = data[15]
-    pkt.drum_notes = data[16]
-    pkt.keys_notes = data[17]
-    pkt.vocal_note = struct.unpack_from("<f", data, 18)[0]
-    pkt.harmony0_note = struct.unpack_from("<f", data, 22)[0]
-    pkt.harmony1_note = struct.unpack_from("<f", data, 26)[0]
-    pkt.harmony2_note = struct.unpack_from("<f", data, 30)[0]
-    pkt.lighting_cue = data[34]
-    pkt.post_processing = data[35]
-    pkt.fog_state = bool(data[36])
+    fields = pkt.__dict__
+    lay = _LAYOUTS[data[4]]
 
-    # ── v5+: fog timer inserted at offset 37 ─────────────────────
-    # Branch on the version byte, NOT on length: a v4 packet carrying one
-    # star-power player is 51 bytes, exactly like a v5 packet carrying none,
-    # so length cannot tell the two layouts apart. Everything from StrobeState
-    # on is addressed relative to `tail`, so both layouts share one code path.
-    if pkt.datagram_version >= FOG_TIMER_VERSION:
-        if len(data) < 46:
-            return pkt  # truncated v5; cue/post/fog above are still valid
-        pkt.fog_remaining_cs = struct.unpack_from("<H", data, 37)[0]
-        tail = 39
-    else:
-        tail = 37
+    core = lay.core
+    if size < core.end:
+        # Truncated for its version. The fields ahead of the first one any
+        # version moved are still at known offsets; the rest keep defaults.
+        fields.update(zip(_PREFIX.names, _PREFIX.unpack_from(data, 0)))
+        return pkt
+    fields.update(zip(core.names, core.unpack_from(data, 0)))
 
-    pkt.strobe_state = data[tail]
-    pkt.beat = data[tail + 1]
-    pkt.keyframe = data[tail + 2]
-    pkt.bonus_effect = bool(data[tail + 3])
-    pkt.auto_gen = bool(data[tail + 4])
-    pkt.spotlight = data[tail + 5]
-    pkt.singalong = data[tail + 6]
-
-    # ── v3+: camera cut (tail+7..tail+9 — 44-46 on v1-v4) ───────
-    # Still length-guarded so a short packet degrades instead of raising.
-    cam = tail + 7
-    if len(data) >= cam + 3:
-        pkt.camera_cut_constraint = data[cam]
-        pkt.camera_cut_priority = data[cam + 1]
-        pkt.camera_cut_subject = data[cam + 2]
+    # Later additions (camera cut, …), each guarded as a unit so a short
+    # packet degrades instead of raising.
+    for block in lay.groups:
+        if size >= block.end:
+            fields.update(zip(block.names, block.unpack_from(data, block.offset)))
 
     # ── v4+: per-player star power ──────────────────────────────
-    # uint16 count at cam+3 (47 on v1-v4), then <Amount:byte, IsActive:byte>
-    # pairs after it. Length-guarded: a truncated or garbage count never reads
-    # past the buffer (clamp to the pairs actually present) so a malformed
-    # packet degrades to "no star power" instead of crashing the UDP handler.
-    sp_count_off = cam + 3
-    if len(data) >= sp_count_off + 2:
-        count = struct.unpack_from("<H", data, sp_count_off)[0]
+    # uint16 count, then <Amount:byte, IsActive:byte> pairs. Length-guarded: a
+    # truncated or garbage count never reads past the buffer (clamp to the
+    # pairs actually present) so a malformed packet degrades to "no star
+    # power" instead of crashing the UDP handler.
+    sp_count_off = lay.star_power_count
+    if sp_count_off is not None and size >= sp_count_off + 2:
+        count = data[sp_count_off] | (data[sp_count_off + 1] << 8)
         first = sp_count_off + 2
-        avail = (len(data) - first) // 2
+        avail = (size - first) // 2
         n = count if count <= avail else avail
         pkt.sp_player_count = n
         players = []

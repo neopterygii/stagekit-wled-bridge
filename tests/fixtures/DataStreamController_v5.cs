@@ -1,0 +1,827 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Diagnostics;
+using System.Threading;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using YARG.Core.Chart;
+using YARG.Core.Logging;
+using YARG.Gameplay.Player;
+
+namespace YARG.Integration
+{
+    public class DataStreamController :  MonoSingleton<DataStreamController>
+    {
+        public readonly struct PlayerStarPowerState
+        {
+            public byte Amount { get; }
+            public bool IsActive { get; }
+
+            public PlayerStarPowerState(byte amount, bool isActive)
+            {
+                Amount = amount;
+                IsActive = isActive;
+            }
+        }
+
+        private readonly struct CameraCutState
+        {
+            public CameraCutEvent.CameraCutConstraint Constraint { get; }
+            public CameraCutEvent.CameraCutPriority Priority { get; }
+            public CameraCutEvent.CameraCutSubject Subject { get; }
+
+            public CameraCutState(CameraCutEvent.CameraCutConstraint constraint,
+                CameraCutEvent.CameraCutPriority priority, CameraCutEvent.CameraCutSubject subject)
+            {
+                Constraint = constraint;
+                Priority = priority;
+                Subject = subject;
+            }
+        }
+
+        // Queues for instrument notes to prevent missed notes between timer ticks
+        // 1/20 being a blink of an eye. It should never lag more than that, and if so shows a larger problem elsewhere.
+        private static readonly int        _defaultSize   =  (int)Math.Ceiling(TARGET_FPS * (1f / 20f)) + 1;
+        private static readonly Queue<int> _drumQueue     = new(_defaultSize);
+        private static readonly Queue<int> _guitarQueue   = new(_defaultSize);
+        private static readonly Queue<int> _bassQueue     = new(_defaultSize);
+        private static readonly Queue<int> _keysQueue     = new(_defaultSize);
+        private static readonly object     _queueLock     = new();
+        private static readonly object     _byteQueueLock = new();
+
+        private static readonly Queue<SceneIndexByte>    _sceneQueue              = new(_defaultSize);
+        private static readonly Queue<PauseStateType>    _pauseQueue              = new(_defaultSize);
+        private static readonly Queue<VenueType>         _venueQueue              = new(_defaultSize);
+        private static readonly Queue<LightingType>      _songSectionQueue        = new(_defaultSize);
+        private static readonly Queue<LightingType>      _lightingCueQueue        = new(_defaultSize);
+        private static readonly Queue<PostProcessingType> _postProcessingQueue    = new(_defaultSize);
+        private static readonly Queue<bool>              _fogStateQueue           = new(_defaultSize);
+        private static readonly Queue<LightingType>      _strobeStateQueue        = new(_defaultSize);
+        private static readonly Queue<byte>              _beatQueue               = new(_defaultSize);
+        private static readonly Queue<LightingType>      _keyframeQueue           = new(_defaultSize);
+        private static readonly Queue<bool>              _bonusEffectQueue        = new(_defaultSize);
+        private static readonly Queue<bool>              _autoGenVenueTrackQueue  = new(_defaultSize);
+        private static readonly Queue<Performer>         _spotlightQueue          = new(_defaultSize);
+        private static readonly Queue<Performer>         _singalongQueue          = new(_defaultSize);
+        private static readonly Queue<CameraCutState>    _cameraCutQueue          = new(_defaultSize);
+
+        private static readonly object _playerStarPowerLock = new();
+        private static PlayerStarPowerState[] _playerStarPowerSnapshot = Array.Empty<PlayerStarPowerState>();
+
+        [Serializable]
+        public struct DataMessage
+        {
+            public uint Header;
+
+            public byte           DatagramVersion;
+            public PlatformByte   Platform;
+            public SceneIndexByte CurrentScene;
+            public PauseStateType Paused;
+            public VenueType      VenueSize;
+
+            public float BeatsPerMinute;
+            public LightingType CurrentSongSection;
+            public int CurrentGuitarNotes;
+            public int CurrentBassNotes;
+            public int CurrentDrumNotes;
+            public int CurrentKeysNotes;
+            public float CurrentVocalNote;
+            public float CurrentHarmony0Note;
+            public float CurrentHarmony1Note;
+            public float CurrentHarmony2Note;
+
+            public LightingType                       LightingCue;
+            public PostProcessingType                 PostProcessing;
+            public bool                               FogState;
+            public ushort                             FogRemainingCentiseconds;
+            public LightingType                       StrobeState;
+            public byte                               Performer;
+            public byte                               Beat;
+            public LightingType                       Keyframe;
+            public bool                               BonusEffect;
+            public bool                               AutoGenVenueTrack;
+            public Performer                          Spotlight;
+            public Performer                          Singalong;
+            public CameraCutEvent.CameraCutConstraint CameraCutConstraint;
+            public CameraCutEvent.CameraCutPriority   CameraCutPriority;
+            public CameraCutEvent.CameraCutSubject    CameraCutSubject;
+            public PlayerStarPowerState[]             PlayerStarPower;
+        }
+
+        public enum PlatformByte
+        {
+            Unknown,
+            Windows,
+            Linux,
+            Mac,
+        }
+
+        public enum SceneIndexByte
+        {
+            Unknown,
+            Menu,
+            Gameplay,
+            Score,
+            Calibration,
+            Practice
+        }
+
+        public enum VenueType
+        {
+            None,
+            Small,
+            Large,
+        }
+
+        public enum PauseStateType
+        {
+            AtMenu,
+            Unpaused,
+            Paused,
+        }
+
+
+        private static UdpClient _sendClient = new();
+
+        //Has to be at least 44 because of DMX, 88 should be enough... for now...
+        private const  byte          DATAGRAM_VERSION   = 5;
+        private const  float         TARGET_FPS         = 88f;
+        private const  float         TIME_BETWEEN_CALLS = 1f / TARGET_FPS;
+        private        Thread        _sendThread;
+        private        CancellationTokenSource _sendCts;
+        private        DataMessage   _message = new DataMessage();
+        private static LightingEvent _currentLightingCue;
+
+        // NYI - waiting for parser rewrite.
+        // public static PerformerEvent CurrentPerformerEvent;
+        public static PlatformByte   MLCPlatform;
+        public static PauseStateType MLCPaused;
+        public static VenueType      MLCVenueSize;
+        public static SceneIndexByte MLCSceneIndex;
+
+        public static int MLCCurrentGuitarNotes;
+        public static int MLCCurrentBassNotes;
+        public static int MLCCurrentDrumNotes;
+        public static int MLCCurrentKeysNotes;
+
+        public static float MLCCurrentVocalNote;
+        public static float MLCCurrentHarmony0Note;
+        public static float MLCCurrentHarmony1Note;
+        public static float MLCCurrentHarmony2Note;
+
+        public static bool               MLCBonusFX;
+        public static LightingType       MLCCurrentSongSection;
+        public static bool               MLCFogState;
+        public static ushort             MLCFogRemainingCentiseconds;
+        public static LightingType       MLCStrobeState;
+        public static float              MLCCurrentBPM;
+        public static byte               MLCCurrentBeat;
+        public static LightingType       MLCKeyframe;
+        public static LightingType       MLCCurrentLightingCue;
+        public static PostProcessingType MLCPostProcessing;
+        public static bool               MLCAutoGenVenueTrack;
+        public static Performer          MLCSpotlight;
+        public static Performer          MLCSingalong;
+        public static CameraCutEvent.CameraCutConstraint MLCCameraCutConstraint;
+        public static CameraCutEvent.CameraCutPriority MLCCameraCutPriority;
+        public static CameraCutEvent.CameraCutSubject MLCCameraCutSubject;
+
+        public static ushort MLCudpPort = 36107; //hardcoded for now.
+        public static string MLCudpIP = "255.255.255.255"; // "this" network's broadcast address
+
+        public static LightingEvent CurrentLightingCue
+        {
+            get => _currentLightingCue;
+
+            set
+            {
+                // Could probably move this into the gameplay monitor
+
+                // This is for the debug menu
+                _currentLightingCue = value;
+
+                //Keyframes are indicators and not really lighting cues themselves, also chorus and verse act more as modifiers and section labels and also not really lighting cues, they can be stacked under a lighting cue.
+                if (value.Type is not (LightingType.KeyframeNext or LightingType.KeyframePrevious or LightingType.KeyframeFirst or LightingType.Chorus or LightingType.Verse))
+                {
+                    EnqueueLightingCue(value.Type);
+                    // might need a null check here = NoCue, testing needed
+                }
+                else if (value.Type is LightingType.KeyframeNext or LightingType.KeyframePrevious
+                    or LightingType.KeyframeFirst)
+                {
+                    EnqueueKeyframe(value.Type);
+                    //might need an else here to keep keyframe at current value, testing needed
+                }
+                else if (value.Type is LightingType.Verse or LightingType.Chorus)
+                {
+                    EnqueueCurrentSongSection(value.Type);
+                    //might need an else here to keep the section at current value, testing needed
+                }
+            }
+        }
+
+        /// <summary>
+        /// Enqueues instrument note values to ensure no notes are missed between timer ticks.
+        /// Call this from the gameplay monitor instead of setting MLCCurrent*Notes directly.
+        /// </summary>
+        public static void EnqueueInstrumentNotes(int drums, int guitar, int bass, int keys)
+        {
+            lock (_queueLock)
+            {
+                _drumQueue.Enqueue(drums);
+                _guitarQueue.Enqueue(guitar);
+                _bassQueue.Enqueue(bass);
+                _keysQueue.Enqueue(keys);
+            }
+        }
+
+        public static void EnqueueSceneIndex(SceneIndexByte sceneIndex)
+        {
+            lock (_byteQueueLock)
+            {
+                _sceneQueue.Enqueue(sceneIndex);
+            }
+            MLCSceneIndex = sceneIndex;
+        }
+
+        public static void EnqueuePauseState(PauseStateType pauseState)
+        {
+            lock (_byteQueueLock)
+            {
+                _pauseQueue.Enqueue(pauseState);
+            }
+            MLCPaused = pauseState;
+        }
+
+        public static void EnqueueVenueSize(VenueType venueSize)
+        {
+            lock (_byteQueueLock)
+            {
+                _venueQueue.Enqueue(venueSize);
+            }
+            MLCVenueSize = venueSize;
+        }
+
+        public static void EnqueueCurrentSongSection(LightingType songSection)
+        {
+            lock (_byteQueueLock)
+            {
+                _songSectionQueue.Enqueue(songSection);
+            }
+            MLCCurrentSongSection = songSection;
+        }
+
+        public static void EnqueueLightingCue(LightingType lightingCue)
+        {
+            lock (_byteQueueLock)
+            {
+                _lightingCueQueue.Enqueue(lightingCue);
+            }
+            MLCCurrentLightingCue = lightingCue;
+        }
+
+        public static void EnqueuePostProcessing(PostProcessingType postProcessing)
+        {
+            lock (_byteQueueLock)
+            {
+                _postProcessingQueue.Enqueue(postProcessing);
+            }
+            MLCPostProcessing = postProcessing;
+        }
+
+        public static void EnqueueFogState(bool fogState)
+        {
+            lock (_byteQueueLock)
+            {
+                _fogStateQueue.Enqueue(fogState);
+            }
+            MLCFogState = fogState;
+        }
+
+        public static void EnqueueStrobeState(LightingType strobeState)
+        {
+            lock (_byteQueueLock)
+            {
+                _strobeStateQueue.Enqueue(strobeState);
+            }
+            MLCStrobeState = strobeState;
+        }
+
+        public static void EnqueueBeat(byte beat)
+        {
+            lock (_byteQueueLock)
+            {
+                _beatQueue.Enqueue(beat);
+            }
+            MLCCurrentBeat = beat;
+        }
+
+        public static void EnqueueKeyframe(LightingType keyframe)
+        {
+            lock (_byteQueueLock)
+            {
+                _keyframeQueue.Enqueue(keyframe);
+            }
+            MLCKeyframe = keyframe;
+        }
+
+        public static void EnqueueBonusEffect()
+        {
+            lock (_byteQueueLock)
+            {
+                _bonusEffectQueue.Enqueue(true);
+            }
+            MLCBonusFX = true;
+        }
+
+        public static void EnqueueAutoGenVenueTrack(bool autoGenVenueTrack)
+        {
+            lock (_byteQueueLock)
+            {
+                _autoGenVenueTrackQueue.Enqueue(autoGenVenueTrack);
+            }
+            MLCAutoGenVenueTrack = autoGenVenueTrack;
+        }
+
+        public static void EnqueueSpotlight(Performer spotlight)
+        {
+            lock (_byteQueueLock)
+            {
+                _spotlightQueue.Enqueue(spotlight);
+            }
+            MLCSpotlight = spotlight;
+        }
+
+        public static void EnqueueSingalong(Performer singalong)
+        {
+            lock (_byteQueueLock)
+            {
+                _singalongQueue.Enqueue(singalong);
+            }
+            MLCSingalong = singalong;
+        }
+
+        public static void EnqueueCameraCutState(CameraCutEvent.CameraCutConstraint constraint,
+            CameraCutEvent.CameraCutPriority priority, CameraCutEvent.CameraCutSubject subject)
+        {
+            lock (_byteQueueLock)
+            {
+                _cameraCutQueue.Enqueue(new CameraCutState(constraint, priority, subject));
+            }
+
+            MLCCameraCutConstraint = constraint;
+            MLCCameraCutPriority = priority;
+            MLCCameraCutSubject = subject;
+        }
+
+        private static void ClearInstrumentQueues()
+        {
+            lock (_queueLock)
+            {
+                _drumQueue.Clear();
+                _guitarQueue.Clear();
+                _bassQueue.Clear();
+                _keysQueue.Clear();
+            }
+        }
+
+        private static void ClearByteQueues()
+        {
+            lock (_byteQueueLock)
+            {
+                _sceneQueue.Clear();
+                _pauseQueue.Clear();
+                _venueQueue.Clear();
+                _songSectionQueue.Clear();
+                _lightingCueQueue.Clear();
+                _postProcessingQueue.Clear();
+                _fogStateQueue.Clear();
+                _strobeStateQueue.Clear();
+                _beatQueue.Clear();
+                _keyframeQueue.Clear();
+                _bonusEffectQueue.Clear();
+                _autoGenVenueTrackQueue.Clear();
+                _spotlightQueue.Clear();
+                _singalongQueue.Clear();
+                _cameraCutQueue.Clear();
+            }
+        }
+
+        private static T DequeueByteValue<T>(Queue<T> queue, T fallback)
+        {
+            lock (_byteQueueLock)
+            {
+                if (queue.Count > 0)
+                {
+                    return queue.Dequeue();
+                }
+            }
+
+            return fallback;
+        }
+
+        public static void UpdatePlayerStarPowerSnapshot(IReadOnlyList<BasePlayer> players)
+        {
+            if (players == null || players.Count <= 0)
+            {
+                ClearPlayerStarPowerSnapshot();
+                return;
+            }
+
+            var snapshot = new PlayerStarPowerState[players.Count];
+            for (int i = 0; i < players.Count; i++)
+            {
+                var player = players[i];
+                if (player == null)
+                {
+                    continue;
+                }
+
+                var engine = player.BaseEngine;
+                snapshot[i] = new PlayerStarPowerState(
+                    EncodeStarPowerAmount(engine.GetStarPowerBarAmount()),
+                    engine.BaseStats.IsStarPowerActive);
+            }
+
+            lock (_playerStarPowerLock)
+            {
+                _playerStarPowerSnapshot = snapshot;
+            }
+        }
+
+        public static void ClearPlayerStarPowerSnapshot()
+        {
+            lock (_playerStarPowerLock)
+            {
+                _playerStarPowerSnapshot = Array.Empty<PlayerStarPowerState>();
+            }
+        }
+
+        private static PlayerStarPowerState[] GetPlayerStarPowerSnapshot()
+        {
+            lock (_playerStarPowerLock)
+            {
+                return _playerStarPowerSnapshot;
+            }
+        }
+
+        private static byte EncodeStarPowerAmount(double amount)
+        {
+            float normalized = (float) amount;
+            if (float.IsNaN(normalized) || float.IsInfinity(normalized))
+            {
+                return 0;
+            }
+
+            return (byte) Mathf.RoundToInt(Mathf.Clamp01(normalized) * byte.MaxValue);
+        }
+
+        // Datagram version history
+        // v0 - inital release
+        // v1 - added "HasVenueTrack?" byte. renamed 'venue' to 'venueSize'.
+        // v2 - added Practice to scene, fixed pause
+        // v3 - added CameraCut
+        // v4 - added per-player Star Power amount and active state
+        // v5 - added Fog remaining duration before the player Star Power table
+        public static void Sender(DataMessage message)
+        {
+            message.Header = 0x59415247; // Y A R G
+
+            message.DatagramVersion = DATAGRAM_VERSION;
+            message.Platform = MLCPlatform;                                      // Set by the Preprocessor Directive above.
+            message.CurrentScene = DequeueByteValue(_sceneQueue, MLCSceneIndex); // gets set by the initializer.
+            message.Paused = DequeueByteValue(_pauseQueue, MLCPaused);           // gets set by the GameplayMonitor.
+            message.VenueSize = DequeueByteValue(_venueQueue, MLCVenueSize);     // gets set on chart load by the GameplayMonitor.
+            message.BeatsPerMinute = MLCCurrentBPM;               // gets set by the GameplayMonitor.
+            message.CurrentSongSection = DequeueByteValue(_songSectionQueue, MLCCurrentSongSection); // gets set on lighting cue change.
+
+            // Drain all queued instrument notes and OR them together (notes are bitmasks)
+            // This prevents queue buildup when notes enqueue faster than send rate
+            lock (_queueLock)
+            {
+                if (_drumQueue.Count > 0)
+                {
+                    int combined = 0;
+                    while (_drumQueue.Count > 0)
+                        combined |= _drumQueue.Dequeue();
+                    MLCCurrentDrumNotes = combined;
+                }
+
+                if (_guitarQueue.Count > 0)
+                {
+                    int combined = 0;
+                    while (_guitarQueue.Count > 0)
+                        combined |= _guitarQueue.Dequeue();
+                    MLCCurrentGuitarNotes = combined;
+                }
+
+                if (_bassQueue.Count > 0)
+                {
+                    int combined = 0;
+                    while (_bassQueue.Count > 0)
+                        combined |= _bassQueue.Dequeue();
+                    MLCCurrentBassNotes = combined;
+                }
+
+                if (_keysQueue.Count > 0)
+                {
+                    int combined = 0;
+                    while (_keysQueue.Count > 0)
+                        combined |= _keysQueue.Dequeue();
+                    MLCCurrentKeysNotes = combined;
+                }
+            }
+
+            message.CurrentGuitarNotes = MLCCurrentGuitarNotes;   // dequeued above or last known value.
+            message.CurrentBassNotes = MLCCurrentBassNotes;       // dequeued above or last known value.
+            message.CurrentDrumNotes = MLCCurrentDrumNotes;       // dequeued above or last known value.
+            message.CurrentKeysNotes = MLCCurrentKeysNotes;       // dequeued above or last known value.
+
+            message.CurrentVocalNote = MLCCurrentVocalNote;       // gets set by the GameplayMonitor.
+            message.CurrentHarmony0Note = MLCCurrentHarmony0Note; // gets set by the GameplayMonitor.
+            message.CurrentHarmony1Note = MLCCurrentHarmony1Note; // gets set by the GameplayMonitor.
+            message.CurrentHarmony2Note = MLCCurrentHarmony2Note; // gets set by the GameplayMonitor.
+
+            message.LightingCue = DequeueByteValue(_lightingCueQueue, MLCCurrentLightingCue); // setter triggered by the GameplayMonitor.
+            message.PostProcessing = DequeueByteValue(_postProcessingQueue, MLCPostProcessing); // setter triggered by the GameplayMonitor.
+            message.FogState = DequeueByteValue(_fogStateQueue, MLCFogState); // gets set by the GameplayMonitor.
+            message.FogRemainingCentiseconds = MLCFogRemainingCentiseconds; // gets set by the GameplayMonitor.
+            message.StrobeState = DequeueByteValue(_strobeStateQueue, MLCStrobeState); // gets set by the GameplayMonitor.
+            message.Beat = DequeueByteValue(_beatQueue, (byte) 3); // gets set by the GameplayMonitor.
+            message.Keyframe = DequeueByteValue(_keyframeQueue, default(LightingType)); // gets set on lighting cue change.
+            message.BonusEffect = DequeueByteValue(_bonusEffectQueue, false); // gets set by the GameplayMonitor.
+
+            message.AutoGenVenueTrack = DequeueByteValue(_autoGenVenueTrackQueue, MLCAutoGenVenueTrack); // gets set on chart load by the GameplayMonitor.
+            message.Spotlight = DequeueByteValue(_spotlightQueue, MLCSpotlight); // gets set by the GameplayMonitor.
+            message.Singalong = DequeueByteValue(_singalongQueue, MLCSingalong); // gets set by the GameplayMonitor.
+
+            var cameraCut = DequeueByteValue(_cameraCutQueue,
+                new CameraCutState(MLCCameraCutConstraint, MLCCameraCutPriority, MLCCameraCutSubject));
+            message.CameraCutConstraint = cameraCut.Constraint; // gets set by the GameplayMonitor.
+            message.CameraCutPriority = cameraCut.Priority;     // gets set by the GameplayMonitor.
+            message.CameraCutSubject = cameraCut.Subject;       // gets set by the GameplayMonitor.
+            message.PlayerStarPower = GetPlayerStarPowerSnapshot();
+
+            SerializeAndSend(message);
+
+            // Reset the keyframe and section after sending
+            // Honestly, this iS a bit of a hack to have it here.
+            MLCKeyframe = 0;
+            MLCCurrentBeat = 3; // I'm using 3 here as 'off' for the beatline due to the BeatlineType enum. This also changes the casting of it.
+            MLCBonusFX = false;
+        }
+
+        public void HandleEnabledChanged(bool isEnabled)
+        {
+            if (isEnabled)
+            {
+#if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
+                MLCPlatform = PlatformByte.Windows;
+#elif UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
+			MLCPlatform = PlatformByte.Mac;
+#elif UNITY_EDITOR_LINUX || UNITY_STANDALONE_LINUX
+			MLCPlatform = PlatformByte.Linux;
+#endif
+                Initializer(SceneManager.GetActiveScene());
+                _sendClient = new();
+                _sendClient.Connect(new IPEndPoint(IPAddress.Parse(MLCudpIP), MLCudpPort));
+                StartSendThread();
+
+            }
+            else
+            {
+                StopSendThread();
+                _sendClient?.Dispose();
+                ClearInstrumentQueues();
+                ClearByteQueues();
+                ClearPlayerStarPowerSnapshot();
+            }
+        }
+        public static void Initializer(Scene scene)
+        {
+            // Ignore the persistent scene
+            if ((SceneIndex) scene.buildIndex == SceneIndex.Persistent) return;
+
+            // Clear instrument queues on scene change
+            ClearInstrumentQueues();
+            ClearByteQueues();
+            ClearPlayerStarPowerSnapshot();
+
+            MLCPaused = PauseStateType.AtMenu;
+            MLCVenueSize = VenueType.None;
+            MLCCurrentBPM = 0;
+            MLCCurrentSongSection = 0;
+
+            MLCCurrentGuitarNotes = 0;
+            MLCCurrentBassNotes = 0;
+            MLCCurrentDrumNotes = 0;
+            MLCCurrentKeysNotes = 0;
+
+            MLCCurrentVocalNote = 0;
+            MLCCurrentHarmony0Note = 0;
+            MLCCurrentHarmony1Note = 0;
+            MLCCurrentHarmony2Note = 0;
+
+            MLCPostProcessing = 0;
+            MLCFogState = false;
+            MLCFogRemainingCentiseconds = 0;
+            MLCStrobeState = LightingType.StrobeOff;
+            MLCCurrentBeat = 3;
+            MLCKeyframe = 0;
+            MLCBonusFX = false;
+            MLCAutoGenVenueTrack = false;
+            MLCSpotlight = Performer.None;
+            MLCSingalong = Performer.None;
+            MLCCameraCutPriority = CameraCutEvent.CameraCutPriority.Normal;
+            MLCCameraCutConstraint = CameraCutEvent.CameraCutConstraint.None;
+            MLCCameraCutSubject = CameraCutEvent.CameraCutSubject.AllFar;
+
+            switch ((SceneIndex) scene.buildIndex)
+            {
+                case SceneIndex.Gameplay:
+                    EnqueueSceneIndex(SceneIndexByte.Gameplay);
+                    break;
+
+                case SceneIndex.Menu:
+                    CurrentLightingCue = new LightingEvent(LightingType.Menu, 0, 0);
+                    EnqueueSceneIndex(SceneIndexByte.Menu);
+                    break;
+
+                case SceneIndex.Calibration:
+                    EnqueueSceneIndex(SceneIndexByte.Calibration);
+                    break;
+
+                case SceneIndex.Score:
+                    CurrentLightingCue = new LightingEvent(LightingType.Score, 0, 0);
+                    EnqueueSceneIndex(SceneIndexByte.Score);
+                    break;
+
+                default:
+                    YargLogger.LogWarning("Unknown Scene loaded!");
+                    EnqueueSceneIndex(SceneIndexByte.Unknown);
+                    break;
+            }
+        }
+
+        private void OnApplicationQuit()
+        {
+            YargLogger.LogInfo("Killing Data Stream sender...");
+
+            StopSendThread();
+            ClearInstrumentQueues();
+            ClearByteQueues();
+            ClearPlayerStarPowerSnapshot();
+
+            if (_sendClient == null) return;
+
+            // force send a blank packet to turn everything off.
+
+            _message = new DataMessage
+            {
+                Header = 0x59415247, // Y A R G
+                DatagramVersion = DATAGRAM_VERSION,
+                PlayerStarPower = Array.Empty<PlayerStarPowerState>(),
+                // Everything else is 0 or off
+            };
+
+            SerializeAndSend(_message);
+
+            _sendClient.Dispose();
+        }
+
+        private void StartSendThread()
+        {
+            StopSendThread();
+
+            _sendCts = new CancellationTokenSource();
+            _sendThread = new Thread(() => SendLoop(_sendCts.Token))
+            {
+                IsBackground = true,
+                Name = "YARG DataStream Sender"
+            };
+            _sendThread.Start();
+        }
+
+        private void StopSendThread()
+        {
+            if (_sendCts == null)
+            {
+                return;
+            }
+
+            try
+            {
+                _sendCts.Cancel();
+                _sendThread?.Join();
+            }
+            catch (Exception ex)
+            {
+                YargLogger.LogError($"Error stopping UDP sender thread: {ex.Message}");
+            }
+            finally
+            {
+                _sendCts.Dispose();
+                _sendCts = null;
+                _sendThread = null;
+            }
+        }
+
+        private void SendLoop(CancellationToken token)
+        {
+            try
+            {
+                var stopwatch = Stopwatch.StartNew();
+                var nextTick = stopwatch.Elapsed;
+                var tickInterval = TimeSpan.FromSeconds(TIME_BETWEEN_CALLS);
+
+                while (!token.IsCancellationRequested)
+                {
+                    nextTick += tickInterval;
+                    Sender(_message);
+
+                    var remaining = nextTick - stopwatch.Elapsed;
+                    if (remaining > TimeSpan.Zero)
+                    {
+                        token.WaitHandle.WaitOne(remaining);
+                    }
+                    else
+                    {
+                        // If we fell behind, reset to avoid drift piling up.
+                        nextTick = stopwatch.Elapsed;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                YargLogger.LogError($"Error in UDP sender thread: {ex.Message}");
+            }
+        }
+
+        private static void SerializeAndSend(DataMessage message)
+        {
+            try
+            {
+                var playerStarPower = message.PlayerStarPower ?? Array.Empty<PlayerStarPowerState>();
+                ushort playerStarPowerCount = (ushort) Math.Min(playerStarPower.Length, ushort.MaxValue);
+
+                using var _ms = new MemoryStream(66 + (playerStarPowerCount * 2));
+                using var _writer = new BinaryWriter(_ms);
+
+                // Reset the MemoryStream's position to the beginning
+                _ms.SetLength(0);
+                _ms.Position = 0;
+
+                _writer.Write(message.Header); //uint - 4
+                _writer.Write(message.DatagramVersion);
+
+                _writer.Write((byte) message.Platform);
+                _writer.Write((byte) message.CurrentScene);
+                _writer.Write((byte)message.Paused);
+                _writer.Write((byte)message.VenueSize);
+                _writer.Write(message.BeatsPerMinute);      //float - 4
+
+                _writer.Write((byte) message.CurrentSongSection);
+                _writer.Write((byte) message.CurrentGuitarNotes); // While .Write can do an int, the instruments
+                _writer.Write((byte) message.CurrentBassNotes);   // are only 5 to 8 bits, so might as well save space.
+                _writer.Write((byte) message.CurrentDrumNotes);
+                _writer.Write((byte) message.CurrentKeysNotes);
+
+                _writer.Write(message.CurrentVocalNote);    //float
+                _writer.Write(message.CurrentHarmony0Note); //float
+                _writer.Write(message.CurrentHarmony1Note); //float
+                _writer.Write(message.CurrentHarmony2Note); //float
+
+                _writer.Write((byte) message.LightingCue);
+                _writer.Write((byte) message.PostProcessing);
+                _writer.Write(message.FogState); //bool
+                _writer.Write(message.FogRemainingCentiseconds);
+                _writer.Write((byte) message.StrobeState);
+                _writer.Write(message.Beat); //byte
+                _writer.Write((byte) message.Keyframe);
+                _writer.Write(message.BonusEffect); //bool
+                _writer.Write(message.AutoGenVenueTrack); //bool
+                _writer.Write((byte) message.Spotlight);
+                _writer.Write((byte) message.Singalong);
+                _writer.Write((byte) message.CameraCutConstraint);
+                _writer.Write((byte) message.CameraCutPriority);
+                _writer.Write((byte) message.CameraCutSubject);
+                _writer.Write(playerStarPowerCount);
+
+                for (int i = 0; i < playerStarPowerCount; i++)
+                {
+                    _writer.Write(playerStarPower[i].Amount);
+                    _writer.Write((byte) (playerStarPower[i].IsActive ? 1 : 0));
+                }
+
+                _sendClient.Send(_ms.GetBuffer(), (int) _ms.Position);
+            }
+            catch (Exception ex)
+            {
+                YargLogger.LogError($"Error sending UDP packet: {ex.Message}");
+            }
+        }
+    }
+}

@@ -472,6 +472,7 @@ docker build -t stagekit-wled-bridge \
 ├── status_server.py         # Web dashboard + SSE + test controls
 ├── test_sender.py           # Standalone fake YARG packet generator
 ├── protocol/
+│   ├── schema.py            # YARG datagram layout: one field table, per version
 │   ├── yarg_packet.py       # YARG UDP packet parser & enums
 │   ├── ddp_sender.py        # DDP protocol sender
 │   └── wled_api.py          # WLED JSON API (power control)

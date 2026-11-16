@@ -1,0 +1,39 @@
+name: Upstream drift
+
+# Has YARG changed the datagram the bridge reads?
+#
+# Kept apart from CI on purpose. This asks a question about someone else's
+# repository, so its answer must not gate this one's image: a red run here
+# means "look at upstream", not "this commit is bad". GitHub mails the
+# repository owner when a scheduled run fails, which is the notification.
+#
+# Note GitHub pauses scheduled workflows after 60 days without repository
+# activity. If this stops appearing under Actions, re-enable it there.
+
+on:
+  schedule:
+    - cron: '17 9 * * *'   # daily, 09:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  yarg-datagram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Stdlib only — nothing to install.
+      # Exit 1 = YARG's serialiser no longer matches protocol/schema.py.
+      # Exit 2 = the check could not run (fetch failed, or upstream
+      #          restructured the file). Both fail the job: a check that did
+      #          not run has not passed.
+      - name: Compare protocol/schema.py with YARG dev
+        run: python tools/check_yarg_schema.py

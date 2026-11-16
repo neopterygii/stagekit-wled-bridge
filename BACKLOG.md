@@ -29,27 +29,28 @@ template" as a backlog step.
 
 In order:
 
-1. **Version-proof the datagram parser** (`refactor`) — new, and first because
-   it is the only item here that has already taken the rig down mid-song, and
-   will do so again on the next YARG nightly that touches the layout.
-   [Write-up below](#open-refactor--the-datagram-parser-hardcodes-absolute-offsets-so-any-yarg-field-insertion-silently-renders-wrong-lighting).
-2. **W3 — lighting alignment trim** (`feature`). A persisted,
+1. **W3 — lighting alignment trim** (`feature`). A persisted,
    dashboard-adjustable output delay in milliseconds plus a visible calibration
    pattern. Default **0 ms**: YARG emits venue events against
    `GameManager.SongTime`, which already models its own audio timing, so copying
    the in-game audio latency setting would double-compensate. Treat this as an
    additional trim for network, controller and display latency.
-3. **W4 — read-only state, optionally over MQTT** (`feature`).
-4. **W5 — WLED firmware qualification** (`ops`). The desync item is an argument
+2. **W4 — read-only state, optionally over MQTT** (`feature`).
+3. **W5 — WLED firmware qualification** (`ops`). The desync item is an argument
    *for* W5 but also a reason to gather evidence before it, since a firmware
    upgrade could mask the cause rather than fix it.
-5. **Review: should the smooth cues show the beat?** (`review`) — new
+4. **Review: should the smooth cues show the beat?** (`review`) — new
    2026-11-02. [Write-up below](#open-review--the-smooth-cues-are-tempo-locked-but-nothing-on-the-strip-marks-the-beat).
 
 ### Recently closed
 
-- ~~A stuck one-shot input could pin an overlay on~~ — built 2026-11-17;
-  [write-up](#done-2026-11-17-bugfix--one-shot-inputs-were-not-guarded-against-a-stuck-value).
+- ~~Version-proof the datagram parser~~ — built 2026-11-16;
+  [write-up](#done-2026-11-16-refactor--the-datagram-parser-hardcodes-absolute-offsets-so-any-yarg-field-insertion-silently-renders-wrong-lighting).
+  The layout is one table (`protocol/schema.py`) and a daily workflow compares
+  it with YARG `dev`. No golden digest moved.
+
+- ~~A stuck one-shot input could pin an overlay on~~ — built 2026-11-16;
+  [write-up](#done-2026-11-16-bugfix--one-shot-inputs-were-not-guarded-against-a-stuck-value).
   Option 3 of the parser item below. Bounds the next layout shift; does not
   prevent it. Three synthetic golden digests moved.
 
@@ -138,9 +139,9 @@ before/after beats remembering last night's show.
 
 ---
 
-## DONE 2026-11-17 `bugfix` — One-shot inputs were not guarded against a stuck value
+## DONE 2026-11-16 `bugfix` — One-shot inputs were not guarded against a stuck value
 
-**Found:** 2026-08-23 as option 3 of the parser item below; built 2026-11-17
+**Found:** 2026-08-23 as option 3 of the parser item below; built 2026-11-16
 from the 2026-11-16 bridge review (finding F1).
 
 `main.py` called `engine.on_bonus()` on every datagram whose `bonus_effect`
@@ -554,7 +555,7 @@ the operator separately.
 
 ---
 
-## OPEN `refactor` — The datagram parser hardcodes absolute offsets, so any YARG field insertion silently renders wrong lighting
+## DONE 2026-11-16 `refactor` — The datagram parser hardcodes absolute offsets, so any YARG field insertion silently renders wrong lighting
 
 **Found:** 2026-08-23, mid-session, by the operator — *"bridge appears to show
 correct cues, but the strip is just white solid."* Fixed for v5 the same night
@@ -646,20 +647,72 @@ hardcodes the same offsets (`UdpIntake.Enums.cs`, `ByteIndexName.StrobeState =
    menu/score-screen case where most bytes are zero. If built, it must log which
    layout it chose, loudly and once, and never be the only signal.
 
-**Option 3 is done (2026-11-17)** — see the write-up near the top of this file.
+**Options 1, 2 and 3 are done (2026-11-16).** Option 3 has its own write-up
+near the top of this file; 1 and 2 are described under "What was built" below.
+Option 4 stays parked.
 
-**Recommended:** ~~3 first (an afternoon, bounds the damage)~~, then 1, then 2.
-Doing 1 without 2 leaves us reading the wrong bytes confidently; doing 2 without
-1 means CI tells us to go do the hand-surgery again.
+### What was built (options 1 and 2, 2026-11-16, `feat/packet-schema`)
+
+- **`protocol/schema.py`** — one ordered table of
+  `(name, fmt, since, until, upstream)` rows. `layout(version)` walks it to
+  produce every offset; the 256 per-version-byte layouts are built once at
+  import, each as a few precompiled `struct` blocks. `parse_packet` no longer
+  names an offset: it picks the layout by version byte and unpacks the core
+  block, then each later-added group (camera cut) under its own length guard,
+  then walks the star-power table as before.
+- **`tools/check_yarg_schema.py`** — reads `SerializeAndSend()` out of
+  `DataStreamController.cs`, resolves each `_writer.Write(...)` to a member
+  name and a wire type (from the cast, or from the declaration), and compares
+  that sequence and `DATAGRAM_VERSION` against the newest schema version.
+  Exit 0 in step, 1 drift, 2 could not check. Status 2 covers a failed fetch
+  and a file it can no longer read, so a restructured upstream fails loudly.
+- **`.github/workflows/upstream-drift.yml`** — runs that daily and on demand.
+  Separate from CI: it asks a question about someone else's repository and
+  must not gate this one's image. A failed scheduled run mails the owner.
+- **`tests/test_packet_schema.py`** (33 tests) — hand-typed offset maps for
+  v1/v3/v4/v5 as the independent copy; a parser test that plants a distinct
+  value in every field of every version; a hypothetical v6 as a one-row
+  insert; and the drift check against `tests/fixtures/DataStreamController_v5.cs`
+  (upstream's file verbatim, LGPL-3.0) with an inserted field, a reorder, a
+  type change, a bare version bump, and five kinds of unreadable source.
+
+### What it does not do
+
+- It reports drift the morning after upstream merges; it does not adapt. The
+  fix is still a person adding rows. Between YARG shipping a nightly and that
+  fix, the stuck-input guard (option 3) is what bounds the damage.
+- `test_sender.build_packet` and `tests/replay_fixtures._patch` still type
+  their offsets by hand. Left alone on purpose for now: they are the second
+  opinion the golden digests rely on, and deriving them from the same table
+  would make every replay test agree with a wrong table.
+- GitHub pauses scheduled workflows after 60 days without repository activity.
+
+### Behaviour that changed
+
+The version byte now decides which fields exist. Before, the camera cut and
+star-power table were read from any datagram long enough to hold them. Now a
+datagram labelled v1 or v2 never yields a camera cut and one labelled v3 never
+yields star power, whatever its length. YARG does not send such packets. An
+unknown version below the oldest known one is read at the oldest layout; above
+the newest, at the newest (unchanged).
+
+### Evidence
+
+- 775 tests pass (742 before). **No golden digest moved** in any of the three
+  tables, which is the proof this is behaviour-preserving on real traffic.
+- `parse_packet`, best of 7 × 200,000 calls on this devbox: v5 with two
+  players 4.12 µs before, 3.88 µs after; v4 3.92 µs before, 3.74 µs after.
+- The check passes against live YARG `dev` (2026-11-16): datagram v5, 31 fixed
+  fields plus the star-power table.
 
 ### Acceptance
 
-- Adding a hypothetical v6 field is a data change, with a test that asserts the
+- [x] Adding a hypothetical v6 field is a data change, with a test that asserts the
   full v6 offset map, and no edits to parsing logic.
-- CI fails when the vendored `YARG/dev` clone's `SerializeAndSend()` field order
+- [x] A scheduled workflow fails when upstream `dev`'s `SerializeAndSend()` field order
   or `DATAGRAM_VERSION` no longer matches our schema.
-- A stuck-true one-shot input cannot pin a mapper layer on.
-- The v1/v3/v4/v5 golden digests are unchanged by the refactor — this is a
+- [x] A stuck-true one-shot input cannot pin a mapper layer on.
+- [x] The v1/v3/v4/v5 golden digests are unchanged by the refactor — this is a
   behaviour-preserving change, and the digests are how we prove it.
 
 ### Evidence kept
