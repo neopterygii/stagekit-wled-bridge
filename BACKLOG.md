@@ -36,14 +36,18 @@ In order:
    the in-game audio latency setting would double-compensate. Treat this as an
    additional trim for network, controller and display latency.
 2. **W4 — read-only state, optionally over MQTT** (`feature`).
-3. **W5 — WLED firmware qualification** (`ops`). The desync item is an argument
-   *for* W5 but also a reason to gather evidence before it, since a firmware
-   upgrade could mask the cause rather than fix it.
+3. **W5 — WLED controller backup and recovery** (`ops`). The controller is
+   already on 16.0.1, so there is no upgrade to qualify; what is left is
+   operator work at the device. [Write-up below](#open-ops--w5-be-able-to-put-the-wled-controller-back).
 4. **Review: should the smooth cues show the beat?** (`review`) — new
    2026-11-02. [Write-up below](#open-review--the-smooth-cues-are-tempo-locked-but-nothing-on-the-strip-marks-the-beat).
 
 ### Recently closed
 
+- ~~`WLED_SETUP.md` described firmware the controller no longer runs~~ —
+  rewritten 2026-11-16 for 16.0.1 with a fresh backup; the recovery steps that
+  need hands on the device stay open as
+  [W5](#open-ops--w5-be-able-to-put-the-wled-controller-back).
 - ~~Cross-site POSTs to the control endpoints were accepted~~ — built
   2026-11-16;
   [write-up](#done-2026-11-16-hardening--any-web-page-on-the-lan-could-drive-the-bridges-controls).
@@ -150,6 +154,61 @@ In order:
 Blocking none of the above: the replay harness is **merged to `main`
 (2026-07-29)**, so anything here can lean on it — a recorded passage replayed
 before/after beats remembering last night's show.
+
+---
+
+## OPEN `ops` — W5: be able to put the WLED controller back
+
+**Rewritten 2026-11-16.** W5 was "qualify a 0.14.4 firmware upgrade". The
+operator upgraded the controller to stock WLED 16.0.1 outside the plan (found
+2026-11-02) and it has run the rig since, so that question is closed by the
+fact. The risk the item was guarding against is unchanged: there is one
+controller, and nobody has shown it can be recovered.
+
+### What exists
+
+- A GET-only backup of the 16.0.1 state, taken 2026-11-16, at
+  `~/wled-backups/192.168.0.53/2026-11-16/` (outside every repository), with a
+  `NOTES.txt` that diffs it against the 2026-07-28 backup of 0.14.4.
+- The settings the bridge depends on survived the upgrade: `if.live.timeout`
+  **25** (2.5 s — the latch fix held), realtime gamma correction disabled,
+  force-max-brightness off, 120 px APA102 on GPIO 18/5 at 5 MHz, 3 A limiter.
+- `WLED_SETUP.md` rewritten for 16.0.1 with the backup command, what a restore
+  needs, and the firmware rollback path.
+- The identity of the running build: `release: ESP32`, `repo: wled/WLED`,
+  `brand: WLED` — the upstream build, not the Athom vendor image. The rollback
+  image is therefore `WLED_16.0.1_ESP32.bin` from the upstream v16.0.1 release.
+
+### What is still open
+
+All three need the operator at the controller; none is bridge code.
+
+1. **Passwords.** `wsec.json` is not served over HTTP (404), so the backup has
+   only password lengths: WiFi PSK 8 characters, OTA password 7, no AP
+   password. Confirm both are recorded somewhere a restore can reach. Without
+   the PSK a restored controller comes up on its own open access point.
+2. **Rollback image on disk.** Download `WLED_16.0.1_ESP32.bin` and keep it
+   beside the backup with its SHA-256. Not done here.
+3. **One exercised USB/serial reflash.** Until this has been done once the
+   recovery path is a belief. Do it with the strip disconnected, restore
+   `cfg.json`, re-enter the passwords, then check the realtime timeout reads
+   2500 ms before the bridge sends a frame.
+
+### Unexplained, worth a look during step 3
+
+`/json/info` on 16.0.1 reports `flash: 8` (MB, from `ESP.getFlashChipSize()`).
+The Athom build reported `getflash: 4194304` and the July baseline recorded
+4 MB. The filesystem is still 983 KB, which is the 4 MB partition layout, so
+the running image is the 4 MB one either way. Read the chip with
+`esptool flash_id` before choosing an image for a full erase-and-flash.
+
+### What this is not
+
+Not a reason to change firmware again. Not blocked by the realtime latch any
+more: the timeout is 25, the controller leaves realtime mode 2.5 s after the
+bridge stops, and OTA works whenever the bridge is not sending. The
+`tools/wled_lag.py` and `tools/frame_match.py` breakage from the upgrade
+(`/json/live` now 501) was already fixed on 2026-11-02 via the WebSocket peek.
 
 ---
 
@@ -1821,7 +1880,9 @@ state" for the full description of each:
 3. `OPEN` `feature` — Persisted operator lighting-alignment trim plus a
    calibration pattern. Default 0 ms.
 4. `OPEN` `feature` — Expanded read-only game/bridge state, optionally over MQTT.
-5. `OPEN` `ops` — WLED 0.14.4 firmware upgrade qualification with backups, an exact
+5. `OPEN` `ops` — **Superseded 2026-11-16:** the controller is on 16.0.1 and this is
+   now [backup and recovery](#open-ops--w5-be-able-to-put-the-wled-controller-back). Original text, kept as history:
+   WLED 0.14.4 firmware upgrade qualification with backups, an exact
    rollback image, and proven recovery. **Blocked in practice until the realtime
    latch above is fixed:** a latched controller never runs `ArduinoOTA.handle()`,
    so it cannot be OTA-flashed at all, and it latches on the first DDP frame
