@@ -27,6 +27,12 @@ log = logging.getLogger(__name__)
 # the stream stopped.
 CONNECTED_TIMEOUT = 3.0
 
+# Longest a dashboard test pattern runs before the bridge ends it. A pattern
+# keeps the strip live and holds off the idle timeout for as long as it runs,
+# so one left going in a closed browser tab would light the room indefinitely.
+# Choosing a pattern again restarts the allowance.
+TEST_PATTERN_MAX_S = 600.0
+
 
 # Reverse lookup: cue byte value → name
 _CUE_NAMES = {v: k for k, v in vars(CueByte).items() if isinstance(v, int)}
@@ -92,6 +98,9 @@ class StatusTracker:
         self.beats_received = 0
         self.test_active = False
         self.test_pattern = ""
+        # Why the last test pattern ended without the operator stopping it:
+        # "timeout", "yarg", or "" while one runs or after a manual stop.
+        self.test_ended = ""
         # One-shot inputs (beat, bonus_effect, keyframe) the protocol is
         # ignoring because they read "set" on every datagram — the signature of
         # a datagram layout that shifted under the parser. Rebound, never
@@ -296,6 +305,7 @@ class StatusTracker:
             "output_live": self.output_live,
             "test_active": self.test_active,
             "test_pattern": self.test_pattern,
+            "test_ended": self.test_ended,
             "scene": _SCENE_NAMES.get(self.scene, "Unknown"),
             "scene_id": self.scene,
             "auto_gen": self.auto_gen,
@@ -863,6 +873,7 @@ STATUS_HTML = """\
   <div class="btn-grid" style="margin-top:0.75rem">
     <button class="test-btn stop" id="btn-stop" onclick="sendTest('stop')" style="display:none">&#9632; Stop Test</button>
   </div>
+  <div id="test-note" style="display:none;margin-top:0.5rem;font-size:0.8rem;color:var(--red, #e5484d)"></div>
 </div>
 
 
@@ -1504,8 +1515,24 @@ function sendTest(action, extra) {
   const body = { action: action };
   if (extra) Object.assign(body, extra);
   body.bpm = parseInt(document.getElementById('test-bpm').value);
-  fetch('/api/test', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                       body: JSON.stringify(body) });
+  return fetch('/api/test', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify(body) })
+    .then(r => r.json().then(j => {
+      testRefused = r.ok ? '' : (j.message || 'Request refused');
+      showTestNote();
+      return r.ok;
+    }))
+    .catch(() => false);
+}
+
+let testRefused = '';
+let testEnded = '';
+function showTestNote() {
+  const ended = { timeout: 'Test pattern stopped after 10 minutes.',
+                  yarg: 'Test pattern stopped: YARG started sending.' }[testEnded] || '';
+  const el = document.getElementById('test-note');
+  el.textContent = testRefused || ended;
+  el.style.display = el.textContent ? '' : 'none';
 }
 
 function highlightActivePattern(pattern) {
@@ -1518,17 +1545,20 @@ function highlightActivePattern(pattern) {
 // Wire up cue buttons
 document.querySelectorAll('#cue-btns .test-btn').forEach(btn => {
   btn.addEventListener('click', () => {
-    sendTest('pattern', { pattern: btn.dataset.pattern });
-    highlightActivePattern(btn.dataset.pattern);
+    sendTest('pattern', { pattern: btn.dataset.pattern }).then(ok => {
+      if (ok) highlightActivePattern(btn.dataset.pattern);
+    });
   });
 });
 
 // Wire up strobe buttons
 document.querySelectorAll('#strobe-btns .test-btn').forEach(btn => {
   btn.addEventListener('click', () => {
-    sendTest('strobe', { level: btn.dataset.strobe });
-    document.querySelectorAll('#strobe-btns .test-btn').forEach(b => b.classList.remove('active'));
-    if (btn.dataset.strobe !== 'off') btn.classList.add('active');
+    sendTest('strobe', { level: btn.dataset.strobe }).then(ok => {
+      if (!ok) return;
+      document.querySelectorAll('#strobe-btns .test-btn').forEach(b => b.classList.remove('active'));
+      if (btn.dataset.strobe !== 'off') btn.classList.add('active');
+    });
   });
 });
 
@@ -1672,6 +1702,9 @@ function update(d) {
 
   const badge = document.getElementById('test-badge');
   badge.className = d.test_active ? 'test-indicator on' : 'test-indicator off';
+  if (!d.connected && testRefused.indexOf('YARG') === 0) testRefused = '';
+  testEnded = d.test_ended || '';
+  showTestNote();
 
   // Show/hide Stop Test button based on test state
   document.getElementById('btn-stop').style.display = d.test_active ? '' : 'none';
@@ -1812,11 +1845,19 @@ evtSource.onerror = function() {
 """
 
 
+def _current_task():
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
 class StatusServer:
     """Async HTTP server serving the status page, SSE stream, and test controls."""
 
     def __init__(self, tracker: StatusTracker, host: str = "0.0.0.0", port: int = 8080,
-                 engine=None, wled_power=None, settings=None, capture=None):
+                 engine=None, wled_power=None, settings=None, capture=None,
+                 on_yarg_takeover=None, clock=time.monotonic):
         self.tracker = tracker
         self.host = host
         self.port = port
@@ -1824,6 +1865,13 @@ class StatusServer:
         self.wled_power = wled_power
         self.settings = settings
         self.capture = capture
+        # Called when YARG starts sending while a test pattern runs. Wired to
+        # YARGProtocol.release_latched_state, which clears the engine and the
+        # protocol's change detectors together so YARG's next datagram re-sends
+        # its whole state instead of comparing equal to what it sent before.
+        self.on_yarg_takeover = on_yarg_takeover
+        self._clock = clock
+        self._test_deadline = 0.0
         self._beat_task: asyncio.Task | None = None
 
     async def start(self):
@@ -1847,6 +1895,12 @@ class StatusServer:
         beat_count = 0
         try:
             while True:
+                if self.tracker.connected:
+                    self._end_test("yarg")
+                    return
+                if self._clock() >= self._test_deadline:
+                    self._end_test("timeout")
+                    return
                 beat_count += 1
                 beat_type = BeatByte.MEASURE if beat_count % 4 == 0 else BeatByte.STRONG
                 if self.engine:
@@ -1859,13 +1913,39 @@ class StatusServer:
                 # partway through a test.
                 if self.wled_power:
                     self.wled_power.on_test_activity()
-                    # Fire keyframe every other beat for cues that listen for keyframes
-                    if beat_count % 2 == 0:
-                        self.engine.on_keyframe(KeyframeByte.NEXT)
+                # Fire keyframe every other beat for cues that listen for keyframes
+                if self.engine and beat_count % 2 == 0:
+                    self.engine.on_keyframe(KeyframeByte.NEXT)
                 interval = 60.0 / max(bpm, 30.0) / 4  # sub-beats at 4× rate
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass
+
+    def _end_test(self, reason: str = ""):
+        """Leave test mode. `reason` is "" for an operator stop.
+
+        Safe to call from inside the beat task: it drops the task reference
+        without cancelling, and the caller returns.
+        """
+        task, self._beat_task = self._beat_task, None
+        if task is not None and task is not _current_task():
+            task.cancel()
+        self.tracker.test_active = False
+        self.tracker.test_pattern = ""
+        self.tracker.test_ended = reason
+        if reason == "yarg" and self.on_yarg_takeover is not None:
+            # YARG's cue may already be in the engine, with the protocol's
+            # change detector holding the same byte. Clearing the engine alone
+            # would leave the strip dark until YARG's cue next changed.
+            self.on_yarg_takeover()
+        else:
+            self.engine.on_cue(CueByte.NO_CUE)
+            self.engine.on_strobe(StrobeSpeed.OFF)
+            self.tracker.on_cue(CueByte.NO_CUE)
+        if reason:
+            log.info("Test pattern ended: %s", {
+                "yarg": "YARG started sending",
+                "timeout": "ran for %d s" % TEST_PATTERN_MAX_S}.get(reason, reason))
 
     def _handle_test_action(self, body: dict) -> tuple[int, str]:
         """Process a test control request. Returns (status_code, message)."""
@@ -1873,6 +1953,10 @@ class StatusServer:
             return 500, "Engine not connected"
 
         action = body.get("action", "")
+        # The test controls write to the same engine YARG drives. Stop is
+        # always allowed; anything that would change the light is not.
+        if action != "stop" and self.tracker.connected:
+            return 409, "YARG is sending; test controls are disabled while it plays"
         try:
             bpm = float(body.get("bpm", 120))
         except (ValueError, TypeError):
@@ -1891,6 +1975,8 @@ class StatusServer:
             self.tracker.on_cue(cue_byte)
             self.tracker.test_active = True
             self.tracker.test_pattern = pattern
+            self.tracker.test_ended = ""
+            self._test_deadline = self._clock() + TEST_PATTERN_MAX_S
             self._start_test_beats(bpm)
             if self.wled_power:
                 self.wled_power.on_test_activity()
@@ -1913,12 +1999,7 @@ class StatusServer:
             return 200, f"BPM set to {bpm}"
 
         elif action == "stop":
-            self._stop_test_beats()
-            self.engine.on_cue(CueByte.NO_CUE)
-            self.engine.on_strobe(StrobeSpeed.OFF)
-            self.tracker.on_cue(CueByte.NO_CUE)
-            self.tracker.test_active = False
-            self.tracker.test_pattern = ""
+            self._end_test()
             return 200, "Stopped"
 
         return 400, f"Unknown action: {action}"

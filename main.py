@@ -1519,6 +1519,9 @@ async def main() -> int:
     # gone, the protocol owns the state latched from it. Wired here because the
     # protocol does not exist until create_datagram_endpoint has run.
     wled_power.on_release = protocol.release_latched_state
+    # A dashboard test pattern hands over the same way when YARG starts
+    # sending while it runs.
+    status_server.on_yarg_takeover = protocol.release_latched_state
 
     # Start status broadcast task
     broadcast_task = asyncio.create_task(tracker.broadcast_loop(wled_power=wled_power, settings=settings))
