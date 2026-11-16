@@ -462,6 +462,56 @@ is blocking (ethernet does not help). `analyse` prints the verdict.
 Note RSSI alone cannot settle it — it reports link strength, not congestion or
 airtime, so a flat RSSI correlation does not clear WiFi.
 
+### Finding 2026-11-16: every `wled_slow_http` warning was raised with the strip off
+
+Tower's anomaly logs for 3–15 November (one bridge run, v1.1.0 `b733c27`, 23
+songs) hold seven `wled_slow_http` warnings. Times are local (UTC−5). "State"
+is read from the 20 s of status snapshots saved with each warning.
+
+| Date | Time | `/json/info` reply | Episode | Song playing | State at the time | RSSI |
+|---|---|---|---|---|---|---|
+| 11-04 | 14:11:41 | 2516 ms | 30 s | no | strip off, YARG silent 20.9 h | −47 dBm |
+| 11-06 | 10:48:45 | 1076 ms | 30 s | no | strip off, YARG silent 65.5 h | −46 dBm |
+| 11-06 | 20:02:15 | 1113 ms | 30 s | no | strip off, YARG silent 74.7 h | −50 dBm |
+| 11-11 | 01:49:45 | 2307 ms | 30 s | no | strip off, YARG silent 176.5 h | −47 dBm |
+| 11-14 | 08:52:33 | 544 ms | 30 s | no | strip off, YARG silent 63.1 h | −46 dBm |
+| 11-15 | 20:48:13 | 1051 ms | 30 s | no | strip off, YARG silent 32.3 h | −47 dBm |
+| 11-15 | 23:15:09 | 1855 ms | 30 s | no | strip off, YARG silent 34.7 h | −47 dBm |
+
+**Conclusion: all seven at idle, none during a song.** In every case the strip
+was powered off, YARG was not sending, and the bridge had sent no DDP frame for
+at least 20 hours. The logs hold no `wled_weak_wifi` and no `wled_heap_low`
+event at all, so there is no nearest one to cite.
+
+What that settles:
+
+- **DDP load is not the cause.** The slow replies happen with no stream
+  running, so there is nothing to gain from suppressing the warning or raising
+  `HTTP_SLOW_MS` while sending. No detector change is proposed.
+- **Each episode is one slow poll.** The bridge polls every 30 s and every
+  episode cleared after 30 s, so each is a single slow reply followed by a
+  normal one. Seven in roughly 35,000 polls is about 1 in 5,000.
+
+What it does not settle:
+
+- **Songs are not shown to be clean.** The 23 songs cover about 80 minutes,
+  roughly 160 polls. At 1 in 5,000 the expected count during songs is 0.03, so
+  seeing none says nothing either way.
+- **Class 1 against class 3.** The warning text reads "TCP connect None ms":
+  the bridge times the HTTP reply but not the TCP connect, so the measurement
+  that separates transport from main loop is missing from all seven. Signal
+  strength was good throughout (−45 to −50 dBm), which by the note above does
+  not clear WiFi.
+
+One unverified reading: three of the seven replies are 1.05–1.11 s, which is
+what a single lost SYN costs on Linux (1 s retransmit plus a normal reply).
+That would point at transport, class 1. The other four do not fit that
+pattern, and nothing here tests it.
+
+To classify them, leave `tools/wled_soak.py log` sampling the powered-off strip
+for a day or more, then run `analyse`; it records both timings and at this rate
+should catch a few.
+
 ---
 
 ## OPEN `evidence` — Desync: not reproduced since the realtime-timeout fix; testing is parked, not finished
