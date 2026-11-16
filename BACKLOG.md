@@ -63,6 +63,10 @@ says what would reopen it.
 
 ### Recently closed
 
+- ~~The dashboard's JavaScript had no automated check~~ — built 2026-11-16;
+  [write-up](BACKLOG_ARCHIVE.md#done-2026-11-16-hardening--the-dashboards-javascript-had-no-automated-check).
+  The page script is syntax-checked and run in Node against real snapshots on
+  every test run. Not a browser: layout and CSS are still checked by eye.
 - ~~The version said 1.1.0 for three months and nothing checked it~~ — built 2026-11-16;
   [write-up](BACKLOG_ARCHIVE.md#done-2026-11-16-hardening--the-version-said-110-for-three-months-and-nothing-checked-it).
   `__version__` is 1.2.0, `CHANGELOG.md` has the draft notes, and CI refuses a

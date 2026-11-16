@@ -13,7 +13,7 @@ carry the version of the *next* release, so the commit is what identifies one.
 Not tagged yet. Everything below is on `main` and in the `:latest` image.
 
 This release is hardening: nothing here changes how a song looks. It covers
-the seven changes merged on 2026-11-16, on top of the image that reported
+the changes merged on 2026-11-16, on top of the image that reported
 `v1.1.0 · b733c27`.
 
 ### Changed behaviour you may notice
@@ -53,6 +53,9 @@ the seven changes merged on 2026-11-16, on top of the image that reported
   differ, so a layout change is noticed before it reaches the rig.
 - **Release check.** CI refuses to build a `v*` tag that disagrees with
   `__version__` or with this file.
+- **Dashboard script check.** The page's JavaScript is syntax-checked and run
+  against real status snapshots in Node as part of the suite, so a script
+  error fails the build instead of shipping a blank dashboard.
 
 ### Documentation
 

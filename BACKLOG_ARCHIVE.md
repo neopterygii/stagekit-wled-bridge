@@ -83,6 +83,81 @@ a one-line pointer under *Recently closed*.
 
 ---
 
+## DONE 2026-11-16 `hardening` — The dashboard's JavaScript had no automated check
+
+`status_server.STATUS_HTML` is one Python string holding the dashboard's HTML,
+CSS and about 960 lines of JavaScript. Nothing parsed or ran that script. The
+archive records two occasions when it was checked by hand in Node against a
+DOM stub, and neither check was kept. A syntax error would have passed the
+whole suite, built an image, and shown the operator a blank page.
+
+### What was built
+
+- **`tests/test_dashboard_js.py`** (14 tests). Extracts the page's one
+  `<script>` block and:
+  - runs `node --check` on it;
+  - loads it in `tests/fixtures/dashboard_stub.js` and feeds it snapshots
+    through the page's own `EventSource.onmessage` handler: live, idle,
+    powered off, an older bridge's payload (no `version`, no `anomalies`), a
+    bare `StatusTracker().snapshot()`, and live again;
+  - asserts what the page then shows: cue, connection, venue and star-power
+    text, the build label, the "not sending" note and its reason, the Health
+    card with its message HTML-escaped, the idle editor's selects filled from
+    `/api/wled`, the strip canvas painted only while live, and that no element
+    ever reads `undefined` or `NaN`.
+- **Snapshots come from the real code.** Each is `StatusTracker.snapshot()`
+  with a real `WLEDPowerManager`, `BridgeSettings`, `RenderThread` (one or two
+  frames rendered, never started) and `AnomalyLog`; only the WLED API and the
+  DDP sender are fakes. A snapshot key renamed in Python therefore reaches the
+  script under its new name.
+- **The stand-ins are strict.** An element has a fixed set of members, so
+  `el.clasList` throws as it would in a browser. `getElementById` returns
+  `null` for an id the markup does not define. The canvas context has only
+  `createImageData` and `putImageData`.
+- **Controls are exercised.** After the snapshots, every listener the script
+  registered is fired once, then every inline `onclick` in the markup is
+  evaluated, with `fetch` answered by a stub. Queued animation frames and
+  debounce timers are run.
+- **The older-bridge payload gets a fresh page.** The script writes the build
+  line once and never reads `version` again, so the first draft, which fed the
+  older payload after a live one, could not see an unguarded `d.version.label`.
+  A second Node run starts with it.
+- **CI.** `ubuntu-latest` ships Node, so `.github/workflows/docker.yml` is
+  unchanged. Without `node` the Node tests skip; with `CI` set a missing `node`
+  fails `test_ci_does_not_skip_these_tests`, so the check cannot silently stop
+  running there.
+
+### What it does not do
+
+- It is not a browser. Nothing here tests CSS, layout, real canvas output, or
+  whether the page looks right. That is still checked by eye.
+- `querySelector` has no selector engine: it returns one stand-in element per
+  selector. Code that depends on a selector matching nothing, or matching
+  several elements, is not exercised.
+- Handlers run against a `fetch` that always answers 200 with `{"ok": true}`
+  (or the WLED capabilities). The 409 and 403 paths of the test controls are
+  not reached.
+- The page's own `.catch()` on the `/api/wled` chain swallows errors there by
+  design, so a bug inside it shows only through the select-options assertion.
+- The stub is about 190 lines, over the 150 the task set as the point to stop
+  at. The extra is the canvas context, inline handlers and the state dump that
+  let the tests assert what the page shows.
+
+### Evidence
+
+- 868 tests pass (854 before, 14 new); the new file runs in about 0.4 s.
+- Six bugs seeded into the script, one at a time: an unguarded
+  `d.version.label`, an unguarded `anomalies`, `clasList`, a call to an
+  undefined function, a throw inside `togglePower()`, and a throw inside the
+  `/api/wled` promise chain. The harness exits non-zero on the first five; the
+  sixth is caught by the options assertion. Before the fresh-page run and the
+  inline-handler pass, the first and fifth went undetected.
+- `test_the_harness_fails_when_the_script_throws` keeps one such seeded bug in
+  the suite.
+- With `CI=true` and no `node` on `PATH`: 1 failed, 12 skipped.
+
+---
+
 ## DONE 2026-11-16 `hardening` — The version said 1.1.0 for three months and nothing checked it
 
 `__version__` was set to 1.1.0 on 2026-08-26 and no `v1.1.0` tag was ever made.
