@@ -274,6 +274,10 @@ class ReplayBridge:
         # production per-cue table; `{}` plus cue_fade_ms=250 is the documented
         # rollback to the pre-2026-07-29 look.
         self.settings.cue_fade_ms = cue_fade_ms
+        # A replay renders what the bridge composed, not when the strip showed
+        # it: no output delay, and never the calibration flash.
+        self.settings.output_delay_ms = 0
+        self.settings.set_effect("calibration", False)
         self.settings.fps = fps
         self.fps = fps
 

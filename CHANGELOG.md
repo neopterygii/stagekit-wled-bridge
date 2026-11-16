@@ -12,9 +12,23 @@ carry the version of the *next* release, so the commit is what identifies one.
 
 Not tagged yet. Everything below is on `main` and in the `:latest` image.
 
-This release is hardening: nothing here changes how a song looks. It covers
-the changes merged on 2026-11-16, on top of the image that reported
-`v1.1.0 · b733c27`.
+This release is mostly hardening: nothing here changes how a song looks
+unless you move the new Output Delay slider. It covers the changes merged on
+2026-11-16, on top of the image that reported `v1.1.0 · b733c27`.
+
+### New
+
+- **Output Delay.** A slider under *Timing & output*, 0 to 500 ms, default 0.
+  It holds every frame that long before sending it, to line the strip up with
+  the game's picture and sound. It can only make the light later. At 0 nothing
+  changes. When the delay is first raised from 0, and each time the bridge
+  starts sending again after being idle, the strip is black for the length of
+  the delay.
+- **Calibration Flash.** A toggle under the effect switches. While it is on
+  the stage look is replaced by a white flash on every beat YARG sends. Play a
+  song and raise Output Delay until the flash lands on the beat. It turns
+  itself off after 10 minutes and is always off after a restart. Leave both
+  alone unless the strip is visibly early.
 
 ### Changed behaviour you may notice
 

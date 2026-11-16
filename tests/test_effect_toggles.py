@@ -41,7 +41,7 @@ def test_toggles_default_to_their_registry_default():
 def test_registry_covers_the_reactive_layers():
     assert set(EFFECT_TOGGLES) == {
         "note_accents", "vocal_ribbon", "performer_bias", "post_processing",
-        "camera_cut", "venue_patterns", "blur", "mirror"}
+        "camera_cut", "venue_patterns", "blur", "mirror", "calibration"}
     # Every entry carries the UI + gating metadata the framework relies on.
     for meta in EFFECT_TOGGLES.values():
         assert {"label", "description", "key", "off"} <= set(meta)

@@ -256,7 +256,7 @@ repeatable, observable, and safe to evolve:
    Use a headless DDP receiver (the WLED Simulator is a candidate) in CI.
    Official RB3/YARG songs can still produce useful live captures even when
    their `.sng`/`.yargsong` sources are encrypted.
-3. **Lighting alignment trim.** *(Not started.)* Add a persisted, dashboard-adjustable delay in
+3. **Lighting alignment trim.** *(Built 2026-11-16; not yet judged on the rig.)* Add a persisted, dashboard-adjustable delay in
    milliseconds plus a calibration pattern. Default to **0 ms**: YARG emits
    venue events against `GameManager.SongTime`, which already incorporates its
    audio calibration and modeled playback latency, so copying the in-game audio
@@ -434,8 +434,8 @@ heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
     supervisor that restarts a crashed thread or exits non-zero, test patterns
     that end on their own and refuse to start over a live song, and
     same-origin checks on the control endpoints.
-- Test suite: 868 tests as of 2026-11-16, run in CI before the image is built.
-- **Current focus, as of 2026-11-16:** workstreams 1 and 2 are done.
+- Test suite: 905 tests as of 2026-11-16, run in CI before the image is built.
+- **Current focus, as of 2026-11-16:** workstreams 1, 2 and 3 are done.
   Workstream 5 has its backup and written procedure; the steps that need hands
-  on the controller are open. Workstreams 3 (alignment trim) and 4 (read-only
-  state / MQTT) are not started. `BACKLOG.md` has the order.
+  on the controller are open. Workstream 4 (read-only state / MQTT) is not
+  started. `BACKLOG.md` has the order.

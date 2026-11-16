@@ -37,22 +37,16 @@ template" as a backlog step.
 
 In order:
 
-1. **W3 — lighting alignment trim** (`feature`). A persisted,
-   dashboard-adjustable output delay in milliseconds plus a visible calibration
-   pattern. Default **0 ms**: YARG emits venue events against
-   `GameManager.SongTime`, which already models its own audio timing, so copying
-   the in-game audio latency setting would double-compensate. Treat this as an
-   additional trim for network, controller and display latency.
-2. **W4 — read-only state, optionally over MQTT** (`feature`).
-3. **W5 — WLED controller backup and recovery** (`ops`). The controller is
+1. **W4 — read-only state, optionally over MQTT** (`feature`).
+2. **W5 — WLED controller backup and recovery** (`ops`). The controller is
    already on 16.0.1, so there is no upgrade to qualify; what is left is
    operator work at the device. [Write-up below](#open-ops--w5-be-able-to-put-the-wled-controller-back).
-4. **Review: should the smooth cues show the beat?** (`review`) — new
+3. **Review: should the smooth cues show the beat?** (`review`) — new
    2026-11-02. [Write-up below](#open-review--the-smooth-cues-are-tempo-locked-but-nothing-on-the-strip-marks-the-beat).
 
-W3, W4 and W5 are workstreams 3–5 of the reliability push described in
-`VISION.md` under "Current focus". Workstreams 1 and 2 (the `v1.0.0` release
-and the replay harness) are done.
+W4 and W5 are workstreams 4 and 5 of the reliability push described in
+`VISION.md` under "Current focus". Workstreams 1 to 3 (the `v1.0.0` release,
+the replay harness and the alignment trim) are done.
 
 **Deferred:** a multi-WLED logical canvas with performer-region routing
 (`feature`). Blocked on having enough equivalent hardware to test geometry and
@@ -63,6 +57,11 @@ says what would reopen it.
 
 ### Recently closed
 
+- ~~W3 — lighting alignment trim~~ — built 2026-11-16;
+  [write-up](BACKLOG_ARCHIVE.md#done-2026-11-16-feature--w3-lighting-alignment-trim-output-delay-and-calibration-flash).
+  An Output Delay slider (0–500 ms, default 0) holds frames before they are
+  sent, and a Calibration Flash toggle shows a white flash on each beat to set
+  it by. It can only make the light later. Not judged on the rig yet.
 - ~~The dashboard's JavaScript had no automated check~~ — built 2026-11-16;
   [write-up](BACKLOG_ARCHIVE.md#done-2026-11-16-hardening--the-dashboards-javascript-had-no-automated-check).
   The page script is syntax-checked and run in Node against real snapshots on
