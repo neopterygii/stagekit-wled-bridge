@@ -92,6 +92,11 @@ class StatusTracker:
         self.beats_received = 0
         self.test_active = False
         self.test_pattern = ""
+        # One-shot inputs (beat, bonus_effect, keyframe) the protocol is
+        # ignoring because they read "set" on every datagram — the signature of
+        # a datagram layout that shifted under the parser. Rebound, never
+        # mutated, by YARGProtocol; empty in normal running.
+        self.stuck_inputs: list = []
         self.render_thread = None  # set after creation in main()
         self._last_packet_time = 0.0
 
@@ -305,6 +310,7 @@ class StatusTracker:
             "sp_active": self.sp_active,
             "sp_charge": round(self.sp_charge, 2),
             "sp_active_count": self.sp_active_count,
+            "stuck_inputs": self.stuck_inputs,
             # Static for the process's lifetime, but carried on the same
             # snapshot as everything else so "which image is this?" is
             # answerable from the one endpoint the operator already curls, and

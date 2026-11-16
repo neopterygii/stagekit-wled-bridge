@@ -34,7 +34,8 @@ from config import (
     LOG_LEVEL,
 )
 from protocol.yarg_packet import (
-    parse_packet, CueByte, StrobeSpeed, KNOWN_DATAGRAM_VERSIONS,
+    parse_packet, BeatByte, CueByte, KeyframeByte, StrobeSpeed,
+    KNOWN_DATAGRAM_VERSIONS,
 )
 from protocol.ddp_sender import DDPSender
 from protocol.wled_api import WLEDApi
@@ -50,6 +51,13 @@ log = logging.getLogger(__name__)
 
 RECENT_DATAGRAMS = 2700   # ~30 s of YARG's ~90 datagrams/s, kept for anomaly evidence
 LEVEL_RING = 256          # frames of brightness history; the status loop reads ~6 per tick
+
+# Consecutive datagrams a one-shot input (bonus, a real beat, a keyframe) may
+# read "set" before it is judged stuck rather than real. Datagrams are ~11 ms
+# apart and real beats at least 150 ms, so a run this long is never musical;
+# YARG queues these events, so a hitch can legitimately release a handful on
+# consecutive datagrams, which is why the bar is not 2.
+STUCK_ONESHOT_RUN = 8
 
 
 class YARGProtocol(asyncio.DatagramProtocol):
@@ -71,6 +79,16 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self._last_camera_subject = -1
         self._last_venue_size = -1
         self._last_song_section = -1
+        # One-shot inputs. A misparsed layout can leave a different byte under
+        # one of these that reads "set" on every datagram — the v5 break pinned
+        # the bonus burst on for a whole song that way. Bonus is edge-gated;
+        # each also carries a run length, and at STUCK_ONESHOT_RUN the input
+        # stops reaching the engine until a datagram arrives without it.
+        self._last_bonus = False
+        self._bonus_run = 0
+        self._beat_run = 0
+        self._keyframe_run = 0
+        self._stuck: tuple = ()
         self._warned_versions: set[int] = set()
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
@@ -131,12 +149,27 @@ class YARGProtocol(asyncio.DatagramProtocol):
             self.engine.on_strobe(pkt.strobe_state)
             self._last_strobe = pkt.strobe_state
 
-        # Beat events
-        self.engine.on_beat(pkt.beat)
+        # Beat events. WEAK doubles as YARG's "no beat" filler and arrives on
+        # most datagrams, so only MEASURE/STRONG count toward a stuck run.
+        beat = pkt.beat
+        if beat == BeatByte.MEASURE or beat == BeatByte.STRONG:
+            self._beat_run += 1
+            if self._beat_run >= STUCK_ONESHOT_RUN:
+                beat = BeatByte.OFF
+        else:
+            self._beat_run = 0
+        self.engine.on_beat(beat)
         self.tracker.on_beat(pkt.beat)
 
         # Keyframe events
-        self.engine.on_keyframe(pkt.keyframe)
+        keyframe = pkt.keyframe
+        if keyframe == KeyframeByte.NEXT:
+            self._keyframe_run += 1
+            if self._keyframe_run >= STUCK_ONESHOT_RUN:
+                keyframe = KeyframeByte.OFF
+        else:
+            self._keyframe_run = 0
+        self.engine.on_keyframe(keyframe)
 
         # Note-hold accents (Phase 4) — rising-edge per-instrument hits
         # (guitar/bass/drums/keys) light a brief accent in each instrument's
@@ -169,9 +202,24 @@ class YARGProtocol(asyncio.DatagramProtocol):
             self.engine.on_song_section(pkt.song_section)
             self._last_song_section = pkt.song_section
 
-        # Bonus FX flag — one-frame celebration burst on the strip.
-        if pkt.bonus_effect:
-            self.engine.on_bonus()
+        # Bonus FX flag — one-frame celebration burst on the strip. Rising
+        # edge only: a flag that reads true on every datagram must not re-arm
+        # the burst ~88 times a second.
+        bonus = pkt.bonus_effect
+        if bonus:
+            self._bonus_run += 1
+            if not self._last_bonus:
+                self.engine.on_bonus()
+        else:
+            self._bonus_run = 0
+        self._last_bonus = bonus
+
+        # Publish which one-shots are stuck, on change only. The three runs are
+        # compared against a cached tuple so the steady state allocates nothing.
+        run = STUCK_ONESHOT_RUN
+        if (self._beat_run >= run or self._bonus_run >= run
+                or self._keyframe_run >= run or self._stuck):
+            self._publish_stuck()
 
         # Pause state — freezes pattern motion + dims output.
         # YARG: 0 = AtMenu, 1 = Unpaused, 2 = Paused.
@@ -197,6 +245,29 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self.tracker.on_song_section(pkt.song_section)
         self.tracker.on_paused(pkt.paused == 2)
         self.tracker.on_star_power(pkt.sp_active, pkt.sp_charge, pkt.sp_active_count)
+
+    def _publish_stuck(self):
+        """Tell the dashboard which one-shot inputs are being ignored as stuck.
+
+        Off the normal path: reached only while some run is at the threshold,
+        or on the one datagram that clears the last of them.
+        """
+        run = STUCK_ONESHOT_RUN
+        stuck = tuple(name for name, n in (("beat", self._beat_run),
+                                           ("bonus_effect", self._bonus_run),
+                                           ("keyframe", self._keyframe_run))
+                      if n >= run)
+        if stuck == self._stuck:
+            return
+        if stuck:
+            log.warning(
+                "YARG one-shot input(s) %s set on %d+ consecutive datagrams — "
+                "ignoring them as stuck; the datagram layout has probably "
+                "changed under the parser", ", ".join(stuck), run)
+        else:
+            log.info("YARG one-shot inputs no longer stuck")
+        self._stuck = stuck
+        self.tracker.stuck_inputs = list(stuck)
 
     def release_latched_state(self):
         """Forget the cue latched from a sender that has gone away.
@@ -232,6 +303,13 @@ class YARGProtocol(asyncio.DatagramProtocol):
         self._last_camera_subject = -1
         self._last_venue_size = -1
         self._last_song_section = -1
+        self._last_bonus = False
+        self._bonus_run = 0
+        self._beat_run = 0
+        self._keyframe_run = 0
+        if self._stuck:
+            self._stuck = ()
+            self.tracker.stuck_inputs = []
         self.engine.on_cue(CueByte.NO_CUE)
         self.engine.on_strobe(StrobeSpeed.OFF)
         self.tracker.on_cue(CueByte.NO_CUE)

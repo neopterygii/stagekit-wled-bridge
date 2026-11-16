@@ -186,6 +186,18 @@ def test_strobe_frames_are_reproducible():
 # never runs, and a chart-driven step is still never quantised onto the beat. If
 # default_keyframes ever moves for this, the grid has leaked into the chart path
 # and a syncopated chart is being flattened.
+#
+# Three moved when one-shot inputs gained a stuck-run guard (2026-11-17):
+# malformed_stream, repeated_beats and star_power_run — exactly the three
+# synthetic fixtures that put a STRONG beat on *every* datagram. After
+# STUCK_ONESHOT_RUN consecutive datagrams the protocol now stops forwarding the
+# beat, so the per-packet beat flash they used to render is gone. That is the
+# guard doing its job on repeated_beats, which exists to model a stuck beat
+# byte; the other two only had the beat on every packet out of convenience.
+# The ten that held still send beats at musical spacing, as does every real
+# capture checked (longest run 1 in ~21,600 v5 datagrams). The same three were
+# re-derived in PRE_FADE_DIGESTS and PRE_STRICTNESS_DIGESTS: this is a protocol
+# change, not a setting, so no knob reaches the old behaviour.
 GOLDEN_DIGESTS = {
     "authored_venue": "049a1300fd60b72abd77854ddd928f7a3e4ccddca098a4977ba2baddb56e6ce4",
     "default_keyframes": "5f0ecd51e0e21a2d9920ae8d991a574ce411649e1bf5a4f5408936da70c1411f",
@@ -196,12 +208,12 @@ GOLDEN_DIGESTS = {
     # "future/unknown version" packet (version byte 99) now parses at the v5
     # offsets rather than v4's, so its tail bytes land differently. The only
     # fixture that moved — the other layouts are byte-identical to before.
-    "malformed_stream": "430da77faab9069b409f7bb2706a5bb6069250fe00c8805f0d29b83ca0966364",
+    "malformed_stream": "d58d14f9d73b4aa1c311bc55cff40addcb7e6f644394ef0bb471a52809f71361",
     "rapid_cue_changes": "13ae859d67fe02b0cf2f0578bccc5e64dac7a4a986c4fb13fc65a42d36d9afca",
-    "repeated_beats": "fe551d135dccdf5a8450f85923020b6a33f7b25f19fe0872b44d30387482b86f",
+    "repeated_beats": "cb9ff26ff3962d1ed519902fecc61af20dfecb77d40217a7988271968837d2ef",
     "song_lifecycle": "8c1defed9da772e4bb5c3a65320f113f68049d2cca308ec981ee58c0319238b3",
     "spotlight_cues": "0be8dd4ca3c8ad52274900a6e52214053388f6e324a87d5d94093fb2fbe87bea",
-    "star_power_run": "ce056eedb3c03ea341af7e792cd43986889e0fcec42b38d37cc7da9b75251eb5",
+    "star_power_run": "f718abc941f0fb6e79333802248423643e297799122dc46ea076fc0c4209ff5f",
     "strobe_and_blackout": "5f3ced65f5eabf053adfa8c1e4457472c8b845043ff65a1e4dedb676eba6b60f",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
@@ -244,14 +256,14 @@ PRE_FADE_DIGESTS = {
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
     "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "01ae1e7dbb2024cb39dbf4faef0085ad0c6f15e09206940f3d66d250de401cea",
+    "malformed_stream": "81fa30a7dd8a569fa186882ec1bf3bf1ca8a7416df846289ccb97b0cdc8133c4",
     # No history — this fixture arrived with the fade change. It is what the
     # rollback renders today, kept for coverage, not as a pre-change capture.
     "rapid_cue_changes": "d05280b1f20322ffb45a485ea9b6958b5202af64221855da7d0caad3e4e6a184",
-    "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
+    "repeated_beats": "b8a15c27ad28821b24873367d21405c58c495a90442d3ae8792e6f603cf647d6",
     "song_lifecycle": "1d2f73fabe3cae22e0cbb92243e832211d1bb1dcb9b9467a6005c0cdff2e8e64",
     "spotlight_cues": "601167d268e4bd8287956cd575f3f67337b71e9e3ba321a9c6e12eeab9c2315e",
-    "star_power_run": "1410de93e6d6851cb352aa4203c9e6a662e3dc72c38084d29972de777ee4da59",
+    "star_power_run": "25a696016e6822457f75d6745d24dbb65ccb9f73a95cfbecb1955750d1d71ceb",
     "strobe_and_blackout": "57d049adc9ee05dc3b4abdcbf4767f2800820d662b44acfa3973def3c5938b57",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
@@ -295,12 +307,12 @@ PRE_STRICTNESS_DIGESTS = {
     "default_keyframes": "0ffd67b9f826409ff5d3d2debc9193b55cce205883c54715b53f9e8012ec278b",
     "keyframe_starved": "8d69d94a77b825e2bfd45c2f25f18697b2aef8c205724e7acad717d553557119",
     "dropped_beats": "f69ebadf8228983448e94159dfd472114ad92e88d5e47b674fe5d29ebbd1f252",
-    "malformed_stream": "01ae1e7dbb2024cb39dbf4faef0085ad0c6f15e09206940f3d66d250de401cea",
+    "malformed_stream": "81fa30a7dd8a569fa186882ec1bf3bf1ca8a7416df846289ccb97b0cdc8133c4",
     "rapid_cue_changes": "af9891dad3b1d53ec33e97b99675f061c725ea9640c996256e6b90cf93ff82c0",
-    "repeated_beats": "52f90374499073a6da0eab0587b05058c775366efe1a4ad10adc15db7b002c1b",
+    "repeated_beats": "b8a15c27ad28821b24873367d21405c58c495a90442d3ae8792e6f603cf647d6",
     "song_lifecycle": "e9e757da80439ab659f573ce7b25a90f9feb7dbb5957e8d8bf2b7a06a97c5c76",
     "spotlight_cues": "2e1ccd76e29b9936e0cc369c27359be84f3b404d8cf67dfcb8b0d12d6475535f",
-    "star_power_run": "c64cf03b7273438f7f95512261355f6ce250edcebb0712646258782d3bc90424",
+    "star_power_run": "d77912505d2ca8583e9273d9745659a8c0439ece66666647587954ff6e92cb01",
     "strobe_and_blackout": "57d049adc9ee05dc3b4abdcbf4767f2800820d662b44acfa3973def3c5938b57",
     "warm_beats": "730b8cfe9840c28aefbbdad1bbda4b3f8776ad20909a303f7b7b403facafe478",
 }
