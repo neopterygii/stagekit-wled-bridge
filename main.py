@@ -51,6 +51,15 @@ log = logging.getLogger(__name__)
 
 RECENT_DATAGRAMS = 2700   # ~30 s of YARG's ~90 datagrams/s, kept for anomaly evidence
 LEVEL_RING = 256          # frames of brightness history; the status loop reads ~6 per tick
+# Frames the output delay can hold. settings.OUTPUT_DELAY_MS_MAX (500 ms) at the
+# fastest frame rate (60 fps) spans 31 frames; the rest is margin for jitter.
+DELAY_RING = 40
+# A frame counts as old enough this much before its due time, so that a delay
+# that is a whole number of frame periods (100 ms at 60 fps) is not pushed one
+# frame later by float rounding in the timestamps.
+DELAY_TOLERANCE_S = 0.0005
+CALIBRATION_FLASH_S = 0.060   # white flash length in calibration mode
+CALIBRATION_MAX_S = 600.0     # calibration mode switches itself off after this
 
 # Consecutive datagrams a one-shot input (bonus, a real beat, a keyframe) may
 # read "set" before it is judged stuck rather than real. Datagrams are ~11 ms
@@ -897,6 +906,26 @@ class RenderThread(threading.Thread):
         self._fade_duration = 0.0
         self._last_cue_change_at = 0.0
 
+        # Output delay ("alignment trim"). Frames wait here between rendering
+        # and the DDP send when settings.output_delay_ms is above 0; at 0 the
+        # ring is never touched. Preallocated: `_delay_tail` is the oldest
+        # frame held, which is also the one being sent once it is old enough.
+        self._delay_bufs = [bytearray(LED_COUNT * 3) for _ in range(DELAY_RING)]
+        self._delay_ts = array('d', bytes(8 * DELAY_RING))
+        self._delay_tail = 0
+        self._delay_count = 0
+        # False until the first held frame has come due since the ring was
+        # last emptied. Until then there is nothing to show and black goes out.
+        self._delay_started = False
+
+        # Calibration mode (the `calibration` effect toggle): when it was first
+        # seen on, for the automatic switch-off, and the white frame at the
+        # brightness it was last built for.
+        self._calibration_since: float | None = None
+        self.calibrating = False
+        self._cal_level = -1
+        self._cal_white = self._black
+
         # Live dashboard preview (VISION Phase 7). Captured only while someone
         # is watching (tracker.has_subscribers) and throttled to ~11 Hz — the
         # render loop runs faster than the dashboard needs, so we don't pay the
@@ -989,6 +1018,53 @@ class RenderThread(threading.Thread):
 
         log.info("Render thread stopped")
 
+    def _delay_flush(self):
+        """Forget every held frame, so the next one out starts from nothing."""
+        self._delay_count = 0
+        self._delay_started = False
+
+    def _delayed(self, pixel_data, now: float, delay_s: float):
+        """Hold `pixel_data` and return the frame that is due at `now`.
+
+        The frame returned is the newest one rendered at or before
+        `now - delay_s`. Until one is that old — the first `delay_s` after the
+        ring was emptied — black is returned. After that, if the delay has just
+        been raised and no held frame is old enough any more, the frame already
+        showing is repeated rather than dropping to black, so dragging the
+        slider does not flicker the strip. That frame is younger than the new
+        delay, so nothing older than the delay plus one frame period ever goes
+        out.
+
+        If more than DELAY_RING frames arrive within the delay (a frame rate
+        above 60), the oldest is dropped and the light is late by less than
+        asked.
+        """
+        cap = DELAY_RING
+        ts = self._delay_ts
+        tail = self._delay_tail
+        count = self._delay_count
+        if count == cap:
+            # Full before anything came due: the oldest frame is lost, so the
+            # next oldest is as late as this ring can make it. Show that.
+            tail = (tail + 1) % cap
+            count -= 1
+            self._delay_started = True
+        head = (tail + count) % cap
+        self._delay_bufs[head][:] = pixel_data
+        ts[head] = now
+        count += 1
+        cutoff = now - delay_s + DELAY_TOLERANCE_S
+        while count > 1 and ts[(tail + 1) % cap] <= cutoff:
+            tail = (tail + 1) % cap
+            count -= 1
+        self._delay_tail = tail
+        self._delay_count = count
+        if ts[tail] <= cutoff:
+            self._delay_started = True
+        elif not self._delay_started:
+            return self._black
+        return self._delay_bufs[tail]
+
     def render_frame(self, now: float, fps: int) -> bytes:
         """Render one frame, send it over DDP, and return the pixels that went out.
 
@@ -1028,6 +1104,22 @@ class RenderThread(threading.Thread):
         # source of a dashboard that showed a moving wash while the strip sat
         # dark. Everything below the gate is skipped, and the preview says why.
         live = self._wled_power.output_enabled
+
+        # Calibration mode times out on the clock, not on frames sent, so it
+        # also expires while the strip is idle between songs.
+        calibrating = self._settings.effect_enabled("calibration")
+        if not calibrating:
+            self._calibration_since = None
+        elif self._calibration_since is None:
+            self._calibration_since = now
+        elif now - self._calibration_since >= CALIBRATION_MAX_S:
+            self._settings.set_effect("calibration", False)
+            self._calibration_since = None
+            calibrating = False
+            log.info("Calibration flash switched off after %d minutes",
+                     CALIBRATION_MAX_S // 60)
+        self.calibrating = calibrating
+
         if live and not self._was_live:
             # Entering live output. Zero the cross-fade source: the last frame
             # we sent may be an hour old, and fading the first cue of a new
@@ -1038,6 +1130,8 @@ class RenderThread(threading.Thread):
             self._fade_duration = 0.0
         self._was_live = live
         if not live:
+            # Nothing held may survive into the next song.
+            self._delay_flush()
             self._frames_idle += 1
             self._preview_source = self._wled_power.mode
             self._preview_strip = []
@@ -1075,7 +1169,8 @@ class RenderThread(threading.Thread):
         self._settings.apply_effect_toggles(effects)
 
         # Brightness baked into mapper output (Phase 2)
-        brightness = self._settings.brightness / 255.0
+        brightness_level = self._settings.brightness
+        brightness = brightness_level / 255.0
 
         # Live-preview gate: only capture when the dashboard is open and the
         # throttle interval has elapsed, so the mapper does the per-layer
@@ -1137,6 +1232,30 @@ class RenderThread(threading.Thread):
             n = len(pixel_data)
             self._last_sent[:n] = pixel_data
 
+        # Calibration mode: the stage look above is still rendered, so the
+        # engine and the cross-fade carry on underneath, but what goes out is
+        # a white flash on each counted beat from YARG and black otherwise.
+        if calibrating:
+            beat_at = self._engine.last_beat_at
+            if beat_at > 0.0 and 0.0 <= now - beat_at < CALIBRATION_FLASH_S:
+                if brightness_level != self._cal_level:
+                    self._cal_white = bytes([brightness_level]) * (LED_COUNT * 3)
+                    self._cal_level = brightness_level
+                pixel_data = self._cal_white
+            else:
+                pixel_data = self._black
+
+        # Output delay. Read once per frame, so a slider move applies from the
+        # next frame. At 0 the ring is bypassed: same path and same bytes as
+        # before the setting existed. From here on `pixel_data` is the frame
+        # that goes out, which is what the level ring, the preview and the
+        # return value describe.
+        delay_ms = self._settings.output_delay_ms
+        if delay_ms > 0:
+            pixel_data = self._delayed(pixel_data, now, delay_ms / 1000.0)
+        elif self._delay_count:
+            self._delay_flush()
+
         # Send DDP every frame while we are driving the strip (no dedup —
         # WiFi can drop UDP packets, so always resend like LedFx does). The
         # gate was checked above; reaching here means it was open.
@@ -1158,7 +1277,10 @@ class RenderThread(threading.Thread):
         if want_preview:
             self._preview_strip = LEDMapper.downsample_rgb(
                 pixel_data, MAPPED_REGION, PREVIEW_CELLS)
-            self._preview_layers = self._mapper.layer_preview()
+            # The layer rows are the mapper's, for the frame just rendered:
+            # with an output delay they lead the strip row by that delay, and
+            # in calibration mode they are not on the strip at all.
+            self._preview_layers = None if calibrating else self._mapper.layer_preview()
             self._last_preview_at = now
 
         return pixel_data
@@ -1457,6 +1579,10 @@ def wire_anomalies(tracker, protocol, wled_api, capture_dir, anomaly_dir, loop,
             state["n"] = 0
         n, levels = render_thread.frame_levels_since(state["n"])
         state["n"] = n
+        if render_thread.calibrating:
+            # A strip flashing white on black by request is not a black strip
+            # or a flicker. No levels means no verdict on what the strip shows.
+            levels = []
         snaps.append({"t": round(clock(), 3),
                       "snap": {k: v for k, v in data.items()
                                if k not in ("settings", "preview", "anomalies", "stagekit")}})

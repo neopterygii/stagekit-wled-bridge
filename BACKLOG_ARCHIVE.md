@@ -83,6 +83,112 @@ a one-line pointer under *Recently closed*.
 
 ---
 
+## DONE 2026-11-16 `feature` — W3: lighting alignment trim (output delay and calibration flash)
+
+Workstream 3 of the reliability push, open since July. The backlog fixed the
+default (0 ms) but not the mechanism, and did not say that the bridge can only
+delay light: it cannot send a frame before YARG has sent the data for it.
+
+### What was built
+
+- **`output_delay_ms`** in `settings.py`: an integer from 0 to 500, default 0,
+  persisted, in `snapshot()`, accepted by `POST /api/settings`. Out-of-range
+  values are clamped, as `cue_fade_ms` does.
+- **Dashboard.** An "Output Delay (ms)" slider under *Timing & output*, next
+  to Cue Fade, in 5 ms steps.
+- **The delay itself**, in `RenderThread.render_frame`. After the frame is
+  final (mapper, strobe, cross-fade) and before the DDP send, it is copied
+  into a ring of 40 preallocated buffers with its timestamp. The frame sent is
+  the newest one rendered at or before `now - delay`.
+  - At 0 ms the ring is not touched: the mapper's own buffer is sent, as
+    before.
+  - For the first `delay` after the ring is emptied there is nothing due, and
+    black is sent.
+  - The ring is emptied whenever output is not live, and when the delay is set
+    back to 0, so a song never starts with frames from the last one.
+  - The setting is read once per frame. A change applies from the next frame.
+- **What the delayed frame feeds.** The brightness ring the anomaly detectors
+  read, the dashboard's strip preview and `render_frame`'s return value all
+  describe the frame sent. The cross-fade source (`_last_sent`) stays the
+  frame rendered, because the fade is composed before the delay.
+- **Calibration flash.** A `calibration` effect toggle, off by default. While
+  it is on and output is live, the strip shows a full-strip white flash of
+  60 ms at the current brightness on every MEASURE and STRONG beat from YARG,
+  and black otherwise. The stage look is still rendered underneath, so the
+  engine carries on and the look is intact when the flash is turned off. The
+  flash passes through the delay like any frame, which is what makes it a
+  measurement of the delay.
+  - It switches itself off 10 minutes after it was turned on, on the clock, so
+    it also expires while the strip is idle.
+  - It is not restored from `settings.json`: a restart always comes up with it
+    off (`"persist": False` in the toggle registry).
+  - While it is on, the status hook passes no frame levels to the anomaly
+    detectors, so a strip flashing white on black by request is not logged as
+    `black_strip` or `flicker`.
+- **Replay** pins `output_delay_ms` to 0 and `calibration` off. No golden
+  digest moved in any of the three tables.
+- **`CueEngine.last_beat_at`**, a read-only property over the beat time the
+  engine already kept, for the flash.
+
+### Two places it departs from the brief
+
+- **Raising the delay mid-song repeats the frame on show; it does not go
+  black.** The brief said to send black while nothing is old enough. Done
+  literally, every slider step upward would blank the strip for a frame or
+  more while the operator is trying to watch it. Black is sent only when
+  nothing has been shown since the ring was emptied. The repeated frame is
+  younger than the new delay, so nothing stale goes out.
+- **"Never older than 500 ms" holds to within one frame period.** The newest
+  frame at or before `now - 500 ms` is between 500 ms and 500 ms plus one frame
+  period old (516.7 ms at 60 fps, 525 ms at 40). The test asserts that bound.
+
+### What it does not do
+
+- It cannot advance the light. If the strip is late against the game, this
+  setting cannot help; that is a latency to remove elsewhere.
+- It does not set itself. The operator judges the flash against the song by
+  eye and ear.
+- The preview's per-layer rows are the mapper's, for the frame just rendered.
+  With a delay they lead the strip row by that delay. In calibration mode they
+  are left empty.
+- The beat readout and zone indicators on the dashboard are not delayed.
+- A frame rate above 60 with a delay long enough to need more than 40 frames
+  gets less delay than asked (the oldest held frame is shown). `VALID_FPS`
+  tops out at 60, so this needs a `TARGET_FPS` set by hand.
+- The calibration flash is full white on the whole strip at the brightness
+  setting. Current limiting is WLED's, as for any frame.
+- Whether a trim is needed at all on this rig is not established. Nothing
+  measured so far says the strip leads the game.
+
+### Evidence
+
+- 905 tests pass (868 before, 37 new): 36 in `tests/test_output_delay.py` and
+  one in `tests/test_anomaly_wiring.py`.
+  - At 0 ms, 200 frames: the object returned is the mapper's own buffer and the
+    ring stays empty.
+  - At 100 ms and 60 fps, frame N goes out exactly 6 frames after it was
+    rendered, for 300 frames. Also 4 frames at 40 fps, 5 frames for 110 ms at
+    40 fps, and 30 frames for 500 ms at 60 fps.
+  - 500 ms fits the ring at every rate in `VALID_FPS`.
+  - Idle then live again: nothing is sent while idle, then six black frames,
+    then the frames rendered after the return and none from before it.
+  - 6,000 frames at each of 25, 40 and 60 fps with the delay changed every 37
+    frames: every frame sent is in order and at most 500 ms plus one frame
+    period old.
+  - Calibration: white at the brightness setting for the 60 ms after a MEASURE
+    or STRONG beat, black otherwise, nothing on WEAK, delayed by the delay,
+    off after 10 minutes live or idle.
+- `render_frame` cost, 10,000 frames at 40 fps on the devbox with the real
+  mapper and 120 LEDs, median of five runs: **547.4 µs** per frame at 0 ms and
+  **550.5 µs** at 200 ms. The difference is within the spread between runs
+  (545.5 to 554.7 µs).
+- The dashboard tests ran the new slider's handlers in Node with no change to
+  the stub.
+- Not checked: anything on the rig. The running container is still
+  `v1.1.0 · b733c27`. Judging the flash against a song is the operator's step.
+
+---
+
 ## DONE 2026-11-16 `hardening` — The dashboard's JavaScript had no automated check
 
 `status_server.STATUS_HTML` is one Python string holding the dashboard's HTML,

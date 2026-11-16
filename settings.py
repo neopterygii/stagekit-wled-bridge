@@ -50,6 +50,11 @@ CUE_FADE_MS_OVERRIDES = {
 # usable; it exists so a bad API call can't park the strip in a fade forever.
 CUE_FADE_MS_MAX = 1000
 
+# Upper bound of the output delay ("alignment trim"), in milliseconds. The
+# render thread preallocates its frame ring for this much history, so raising
+# it means raising main.DELAY_RING too.
+OUTPUT_DELAY_MS_MAX = 500
+
 # ── Color palettes ─────────────────────────────────────────────────
 # Each palette maps the 4 zone names to (R, G, B) tuples.
 # "red" zone doesn't have to be red — it's just the Stage Kit zone ID.
@@ -309,6 +314,15 @@ EFFECT_TOGGLES = {
         "description": "Fold the strip into a left–right symmetric look (max of each half).",
         "key": "mirror", "off": False, "default": False,
     },
+    # Not a look: a measuring aid for the output delay. Consumed by the render
+    # thread (key None), which replaces the whole frame while it is on and
+    # switches it back off after main.CALIBRATION_MAX_S. `persist: False` keeps
+    # a restart from coming back up in it.
+    "calibration": {
+        "label": "Calibration Flash",
+        "description": "Replace the stage look with a white flash on every beat, to set Output Delay against a real song. Turns itself off after 10 minutes.",
+        "key": None, "off": None, "default": False, "persist": False,
+    },
 }
 
 # ── Idle look ──────────────────────────────────────────────────────
@@ -367,6 +381,14 @@ DEFAULT_SETTINGS = {
     # CUE_FADE_MS_OVERRIDES ignore this and use their own duration. 0 makes
     # every non-overridden cue snap; 250 was the old hardcoded value.
     "cue_fade_ms": 120,
+    # Output delay ("alignment trim") in milliseconds, 0-OUTPUT_DELAY_MS_MAX.
+    # Every frame is held this long between rendering and the DDP send. 0 is
+    # the default and bypasses the delay entirely: YARG emits venue events
+    # against GameManager.SongTime, which already models its own audio latency,
+    # so this is only a trim for whatever is left (display, speakers). It can
+    # only make the light later; the bridge cannot send a frame before YARG
+    # has sent the data for it.
+    "output_delay_ms": 0,
     # Each toggle defaults on unless its registry row opts out with default:False.
     "effects": {tid: meta.get("default", True) for tid, meta in EFFECT_TOGGLES.items()},
     # What the strip shows when the bridge owns it but is not sending frames.
@@ -468,12 +490,17 @@ class BridgeSettings:
             self._data["palette_strictness"] = max(0.0, min(1.0, float(stored["palette_strictness"])))
         if isinstance(stored.get("cue_fade_ms"), (int, float)):
             self._data["cue_fade_ms"] = max(0, min(CUE_FADE_MS_MAX, int(stored["cue_fade_ms"])))
+        if isinstance(stored.get("output_delay_ms"), (int, float)):
+            self._data["output_delay_ms"] = max(
+                0, min(OUTPUT_DELAY_MS_MAX, int(stored["output_delay_ms"])))
         stored_idle = stored.get("idle")
         if isinstance(stored_idle, dict):
             self._data["idle"] = _clean_idle(stored_idle, self._data["idle"])
         stored_effects = stored.get("effects")
         if isinstance(stored_effects, dict):
-            for tid in EFFECT_TOGGLES:
+            for tid, meta in EFFECT_TOGGLES.items():
+                if not meta.get("persist", True):
+                    continue    # always starts at its default
                 if isinstance(stored_effects.get(tid), bool):
                     self._data["effects"][tid] = stored_effects[tid]
 
@@ -592,6 +619,18 @@ class BridgeSettings:
             self._data["cue_fade_ms"] = value
             self._save()
 
+    @property
+    def output_delay_ms(self) -> int:
+        with self._lock:
+            return self._data["output_delay_ms"]
+
+    @output_delay_ms.setter
+    def output_delay_ms(self, value: int):
+        value = max(0, min(OUTPUT_DELAY_MS_MAX, int(value)))
+        with self._lock:
+            self._data["output_delay_ms"] = value
+            self._save()
+
     def fade_seconds_for_cue(self, cue: int | None) -> float:
         """Cross-fade duration in seconds for an incoming cue byte.
 
@@ -707,6 +746,8 @@ class BridgeSettings:
                 "palette_strictness": self._data["palette_strictness"],
                 "cue_fade_ms": self._data["cue_fade_ms"],
                 "cue_fade_ms_max": CUE_FADE_MS_MAX,
+                "output_delay_ms": self._data["output_delay_ms"],
+                "output_delay_ms_max": OUTPUT_DELAY_MS_MAX,
                 "effects": dict(self._data["effects"]),
                 "idle": dict(self._data["idle"]),
                 "idle_modes": list(IDLE_MODES),

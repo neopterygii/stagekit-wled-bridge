@@ -1047,6 +1047,11 @@ class CueEngine:
                 self._advance_clock(now)
         # WEAK: event already set; no flash/glitch and no oscillator update.
 
+    @property
+    def last_beat_at(self) -> float:
+        """Engine-clock time of the last counted MEASURE or STRONG beat; 0.0 before any."""
+        return self._beat_at
+
     def _advance_clock(self, now: float):
         """Re-align the free-running beat clock on a real beat.
 

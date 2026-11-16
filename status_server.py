@@ -774,6 +774,11 @@ STATUS_HTML = """\
       <div class="ctl-head"><span class="label">Cue Fade</span><span class="ctl-val" id="cue-fade-ms">120 ms</span></div>
       <input type="range" id="cue-fade-slider" min="0" max="250" value="120" step="5">
     </div>
+    <div class="ctl" id="output-delay-card"
+         title="Holds every frame this long before it is sent, to line the strip up with the game's picture and sound. It can only make the light later. Leave it at 0 unless the strip is visibly early: turn on Calibration Flash under Effects, play a song, and raise this until the flash lands on the beat.">
+      <div class="ctl-head"><span class="label">Output Delay (ms)</span><span class="ctl-val" id="output-delay-ms">0 ms</span></div>
+      <input type="range" id="output-delay-slider" min="0" max="500" value="0" step="5">
+    </div>
     <div class="ctl" id="fps-card">
       <div class="ctl-head"><span class="label">Target FPS</span><span class="ctl-val" id="fps-val">40</span></div>
       <div class="btn-grid" id="fps-btns"></div>
@@ -1154,6 +1159,8 @@ const paletteStrictness = wireIntensitySlider(
   'palette-strictness-slider', 'palette-strictness-pct', 'palette_strictness');
 const cueFade = wireIntensitySlider(
   'cue-fade-slider', 'cue-fade-ms', 'cue_fade_ms', 1, ' ms');
+const outputDelay = wireIntensitySlider(
+  'output-delay-slider', 'output-delay-ms', 'output_delay_ms', 1, ' ms');
 
 // ── Idle look editor ─────────────────────────────────────────────
 // The effect and palette lists come from the device itself (/api/wled), not
@@ -1357,7 +1364,8 @@ function updateSettings(s) {
   for (const [knob, key] of [[venueIntensity, 'venue_intensity'],
                              [sectionIntensity, 'section_intensity'],
                              [paletteStrictness, 'palette_strictness'],
-                             [cueFade, 'cue_fade_ms']]) {
+                             [cueFade, 'cue_fade_ms'],
+                             [outputDelay, 'output_delay_ms']]) {
     if (typeof s[key] === 'number' && !knob.isDragging()) {
       const pct = Math.round(s[key] * knob.scale);
       if (parseInt(knob.slider.value) !== pct) knob.slider.value = pct;
@@ -2130,6 +2138,14 @@ class StatusServer:
                     changed.append(f"cue_fade_ms={self.settings.cue_fade_ms}")
             except (ValueError, TypeError):
                 return 400, "Invalid cue_fade_ms value"
+        if "output_delay_ms" in body:
+            try:
+                old_od = self.settings.output_delay_ms
+                self.settings.output_delay_ms = int(body["output_delay_ms"])
+                if self.settings.output_delay_ms != old_od:
+                    changed.append(f"output_delay_ms={self.settings.output_delay_ms}")
+            except (ValueError, TypeError):
+                return 400, "Invalid output_delay_ms value"
         if "effects" in body:
             updates = body["effects"]
             if not isinstance(updates, dict):

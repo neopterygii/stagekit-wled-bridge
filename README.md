@@ -258,7 +258,7 @@ what you can change below it.
 - **Look** — brightness, colour palette (with preview), palette strictness
   (how tightly the reactivity layers follow the palette; 0% = their original
   fixed colours), blur
-- **Timing & output** — cue fade, target FPS, LED direction
+- **Timing & output** — cue fade, output delay (0–500 ms, to line the strip up with the game; see Calibration Flash under the effect toggles), target FPS, LED direction
 - **Venue response** — venue sparkle, section bias
 - **Effect layers**, **Idle look** (what the strip shows between songs) and
   **Test patterns**

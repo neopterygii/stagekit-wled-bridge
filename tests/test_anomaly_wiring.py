@@ -27,6 +27,7 @@ class FakeRender:
     frame_levels_since = RenderThread.frame_levels_since
     last_frame = RenderThread.last_frame
     failed = False
+    calibrating = False
 
     def render_stats(self):
         return {"alive": True, "fatal_error": None}
@@ -111,6 +112,25 @@ def test_hook_detects_from_frames_and_writes_replayable_evidence(tmp_path, monke
     assert statuses and "settings" not in json.loads(statuses[-1])["snap"]
     day_log = list((tmp_path / "anomalies").glob("*.jsonl"))
     assert day_log and "black_strip" in day_log[0].read_text()
+
+
+def test_calibration_flash_is_not_reported_as_a_black_strip(tmp_path, monkeypatch):
+    """The same six seconds of black frames, with calibration mode on: no verdict."""
+    clock = Clock()
+    tracker, render, log, loop = _wired(tmp_path, monkeypatch, clock)
+    render.calibrating = True
+    try:
+        for i in range(60):
+            clock.t += 0.1
+            for _ in range(6):
+                render.send(0.0)
+            tracker.on_snapshot(snap(i / 10, cue="CHORUS", live=False) | {"output_live": True})
+        loop.run_until_complete(asyncio.sleep(0.2))
+    finally:
+        loop.close()
+    kinds = {e["kind"] for e in log.since(0)}
+    assert "song_start" in kinds                    # the detector did run
+    assert not kinds & {"black_strip", "flicker", "frozen_strip", "long_blackout"}
 
 
 def test_broadcast_loop_survives_a_failing_hook():
