@@ -365,6 +365,10 @@ class Detector:
             bad.append(f"scene id {snap.get('scene_id')}")
         if playing and not 30 <= bpm <= 400:
             bad.append(f"bpm {bpm}")
+        # One-shot inputs set on every datagram: the protocol is already ignoring them, and this
+        # is the only sign of a layout shift when the early fields (cue, scene, bpm) still read right.
+        for name in snap.get("stuck_inputs") or ():
+            bad.append(f"{name} stuck on")
         self.cond(t, "parser_garbage", connected and bool(bad), 1.0,
                   "datagram reads garbage: " + ", ".join(bad))
 

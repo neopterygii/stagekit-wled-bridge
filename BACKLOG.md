@@ -48,6 +48,11 @@ In order:
 
 ### Recently closed
 
+- ~~A stuck one-shot input could pin an overlay on~~ — built 2026-11-17;
+  [write-up](#done-2026-11-17-bugfix--one-shot-inputs-were-not-guarded-against-a-stuck-value).
+  Option 3 of the parser item below. Bounds the next layout shift; does not
+  prevent it. Three synthetic golden digests moved.
+
 - ~~The dashboard showed bitmasks, not the pattern~~ — requested and built
   2026-11-02; [write-up](#done-2026-11-02-feature--the-dashboard-showed-zone-bitmasks-not-the-pattern).
   A Stage Kit pod visualizer that replays every mask change instead of sampling
@@ -130,6 +135,57 @@ In order:
 Blocking none of the above: the replay harness is **merged to `main`
 (2026-07-29)**, so anything here can lean on it — a recorded passage replayed
 before/after beats remembering last night's show.
+
+---
+
+## DONE 2026-11-17 `bugfix` — One-shot inputs were not guarded against a stuck value
+
+**Found:** 2026-08-23 as option 3 of the parser item below; built 2026-11-17
+from the 2026-11-16 bridge review (finding F1).
+
+`main.py` called `engine.on_bonus()` on every datagram whose `bonus_effect`
+read true, and forwarded every beat and keyframe byte as it arrived. That is
+harmless while the parser reads the right bytes and is exactly how the v5
+layout shift turned the strip solid white: a byte with a non-zero fallback
+landed under a one-shot field and re-armed its effect ~88 times a second.
+
+### What was built
+
+- **Bonus is rising-edge gated.** `on_bonus()` fires on False→True only.
+- **A stuck-run guard on all three one-shots.** `bonus_effect`, a real beat
+  (`MEASURE`/`STRONG` — `WEAK` is YARG's "no beat" filler and is not counted)
+  and keyframe `NEXT` each carry a consecutive-datagram run length. At
+  `STUCK_ONESHOT_RUN` (8) the input stops reaching the engine until a datagram
+  arrives without it. Real beats are ≥150 ms apart against an 11 ms datagram
+  spacing; the bar is 8 rather than 2 because YARG queues these events and a
+  hitch can legitimately release a few back to back.
+- **The dashboard can now see this class of fault.** The stuck names are
+  published as `stuck_inputs` on the status snapshot (on change only — the
+  steady state allocates nothing), logged once per episode, and folded into the
+  existing `parser_garbage` anomaly. That closes the gap the v5 write-up
+  called out: the early fields the dashboard is built from stayed correct, so
+  nothing said "wrong".
+- `release_latched_state()` clears the edge detector, the runs and the list.
+
+### Evidence that 8 is safe
+
+Every real capture on Tower was checked — the v5 diagnosis capture and eight
+anomaly evidence captures, ~21,600 v5 datagrams carrying 238 real beats. The
+longest consecutive run of a beat, a keyframe or a bonus was **1**.
+
+### Golden digests: three moved, and which three is the evidence
+
+`malformed_stream`, `repeated_beats` and `star_power_run` — exactly the three
+synthetic fixtures that put a `STRONG` beat on *every* datagram. The per-packet
+beat flash they rendered is gone after the eighth. `repeated_beats` exists to
+model a stuck beat byte, so that is the guard working; the other two carried the
+beat on every packet only for convenience. The ten fixtures with musically
+spaced beats held still. All three tables were re-derived for those three
+fixtures: this is a protocol change, not a setting, so no knob reaches the old
+behaviour.
+
+**Verification:** 742 tests green, up from 730 — 12 new in
+`tests/test_oneshot_inputs.py`. Options 1 and 2 of the parser item remain open.
 
 ---
 
@@ -590,7 +646,9 @@ hardcodes the same offsets (`UdpIntake.Enums.cs`, `ByteIndexName.StrobeState =
    menu/score-screen case where most bytes are zero. If built, it must log which
    layout it chose, loudly and once, and never be the only signal.
 
-**Recommended:** 3 first (an afternoon, bounds the damage), then 1, then 2.
+**Option 3 is done (2026-11-17)** — see the write-up near the top of this file.
+
+**Recommended:** ~~3 first (an afternoon, bounds the damage)~~, then 1, then 2.
 Doing 1 without 2 leaves us reading the wrong bytes confidently; doing 2 without
 1 means CI tells us to go do the hand-surgery again.
 
