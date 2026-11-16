@@ -33,6 +33,9 @@ CONNECTED_TIMEOUT = 3.0
 # Choosing a pattern again restarts the allowance.
 TEST_PATTERN_MAX_S = 600.0
 
+# Largest POST body read. Every control request is a few dozen bytes of JSON.
+MAX_POST_BODY = 4096
+
 
 # Reverse lookup: cue byte value → name
 _CUE_NAMES = {v: k for k, v in vars(CueByte).items() if isinstance(v, int)}
@@ -1852,6 +1855,28 @@ def _current_task():
         return None
 
 
+def _same_origin(origin, host) -> bool:
+    """Whether a POST may change state: its Origin, if any, names this server.
+
+    The control endpoints have no authentication, and a browser will send a
+    cross-site POST without asking first as long as the page keeps to a
+    "simple" content type. So any web page open on a LAN machine could change
+    settings or start a test pattern. Browsers attach `Origin` to every
+    cross-site POST; requiring it to match `Host` turns those away. A request
+    with no Origin (curl, a script, the party watcher) is not a browser acting
+    for a third party and is let through.
+
+    This does not authenticate anyone, and does not stop DNS rebinding, where
+    Origin and Host agree by construction.
+    """
+    if origin is None:
+        return True
+    if not host:
+        return False
+    _scheme, sep, authority = origin.partition("://")
+    return bool(sep) and authority.lower() == host.lower()
+
+
 class StatusServer:
     """Async HTTP server serving the status page, SSE stream, and test controls."""
 
@@ -1872,6 +1897,13 @@ class StatusServer:
         self.on_yarg_takeover = on_yarg_takeover
         self._clock = clock
         self._test_deadline = 0.0
+        # POST path -> handler taking the JSON body, returning (status, message).
+        self._post_routes = {
+            '/api/test': self._handle_test_action,
+            '/api/power': self._handle_power_action,
+            '/api/settings': self._handle_settings_action,
+            '/api/capture': self._handle_capture_action,
+        }
         self._beat_task: asyncio.Task | None = None
 
     async def start(self):
@@ -2144,15 +2176,21 @@ class StatusServer:
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            # Read headers, capture Content-Length
+            # Keep only the headers something below reads.
             content_length = 0
+            host = origin = None
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=5.0)
                 if line in (b'\r\n', b'\n', b''):
                     break
-                header = line.decode('utf-8', errors='replace').strip().lower()
-                if header.startswith('content-length:'):
-                    content_length = int(header.split(':', 1)[1].strip())
+                name, _, value = line.decode('utf-8', errors='replace').partition(':')
+                name, value = name.strip().lower(), value.strip()
+                if name == 'content-length':
+                    content_length = int(value)
+                elif name == 'host':
+                    host = value
+                elif name == 'origin':
+                    origin = value
 
             parts = request_line.decode('utf-8', errors='replace').strip().split()
             if len(parts) < 2:
@@ -2175,39 +2213,15 @@ class StatusServer:
                 healthy = not (render_thread and render_thread.failed)
                 await self._send_response(
                     writer, 200 if healthy else 503, 'application/json', body)
-            elif path == '/api/test' and method == 'POST':
-                raw = b''
-                if content_length > 0:
-                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
-                try:
-                    req_body = json.loads(raw) if raw else {}
-                except (json.JSONDecodeError, ValueError):
-                    req_body = {}
-                status, msg = self._handle_test_action(req_body)
-                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
-                await self._send_response(writer, status, 'application/json', resp)
-            elif path == '/api/power' and method == 'POST':
-                raw = b''
-                if content_length > 0:
-                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
-                try:
-                    req_body = json.loads(raw) if raw else {}
-                except (json.JSONDecodeError, ValueError):
-                    req_body = {}
-                status, msg = self._handle_power_action(req_body)
-                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
-                await self._send_response(writer, status, 'application/json', resp)
-            elif path == '/api/settings' and method == 'POST':
-                raw = b''
-                if content_length > 0:
-                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
-                try:
-                    req_body = json.loads(raw) if raw else {}
-                except (json.JSONDecodeError, ValueError):
-                    req_body = {}
-                status, msg = self._handle_settings_action(req_body)
-                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
-                await self._send_response(writer, status, 'application/json', resp)
+            elif method == 'POST' and path in self._post_routes:
+                if not _same_origin(origin, host):
+                    log.warning("Refused cross-origin POST %s from %s", path, origin)
+                    await self._send_json_result(
+                        writer, 403, "Cross-origin requests are not accepted")
+                else:
+                    req_body = await self._read_json_body(reader, content_length)
+                    status, msg = self._post_routes[path](req_body)
+                    await self._send_json_result(writer, status, msg)
             elif path == '/api/settings' and method == 'GET':
                 body = json.dumps(self.settings.snapshot() if self.settings else {}).encode()
                 await self._send_response(writer, 200, 'application/json', body)
@@ -2218,17 +2232,6 @@ class StatusServer:
                 caps = self.wled_power.capabilities() if self.wled_power else {}
                 await self._send_response(writer, 200, 'application/json',
                                           json.dumps(caps).encode())
-            elif path == '/api/capture' and method == 'POST':
-                raw = b''
-                if content_length > 0:
-                    raw = await asyncio.wait_for(reader.readexactly(min(content_length, 4096)), timeout=5.0)
-                try:
-                    req_body = json.loads(raw) if raw else {}
-                except (json.JSONDecodeError, ValueError):
-                    req_body = {}
-                status, msg = self._handle_capture_action(req_body)
-                resp = json.dumps({"status": "ok" if status == 200 else "error", "message": msg}).encode()
-                await self._send_response(writer, status, 'application/json', resp)
             elif path == '/api/capture' and method == 'GET':
                 if self.capture is None:
                     body = json.dumps({"recording": False}).encode()
@@ -2250,6 +2253,23 @@ class StatusServer:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def _read_json_body(self, reader: asyncio.StreamReader, content_length: int) -> dict:
+        """The request body as a dict. Anything that is not a JSON object reads as {}."""
+        if content_length <= 0:
+            return {}
+        raw = await asyncio.wait_for(
+            reader.readexactly(min(content_length, MAX_POST_BODY)), timeout=5.0)
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    async def _send_json_result(self, writer: asyncio.StreamWriter, status: int, message: str):
+        resp = json.dumps({"status": "ok" if status == 200 else "error",
+                           "message": message}).encode()
+        await self._send_response(writer, status, 'application/json', resp)
 
     async def _send_response(self, writer: asyncio.StreamWriter, status: int, content_type: str, body: bytes):
         reason = HTTPStatus(status).phrase
@@ -2294,7 +2314,6 @@ class StatusServer:
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
             "Connection: keep-alive\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
             "\r\n"
         )
         writer.write(header.encode())
