@@ -1422,9 +1422,11 @@ function updateRender(r) {
   gap.textContent = 'gap ' + r.gap_ms_avg.toFixed(1) + '/' + r.gap_ms_max.toFixed(1) + 'ms';
   work.textContent = 'work ' + r.work_ms_avg.toFixed(1) + '/' + r.work_ms_max.toFixed(1) + 'ms';
 
-  const stall_text = r.stalls + ' stalls, ' + r.skipped + ' skips';
+  const restarts = r.restarts || 0;
+  const stall_text = r.stalls + ' stalls, ' + r.skipped + ' skips' +
+    (restarts ? ', ' + restarts + (restarts === 1 ? ' restart' : ' restarts') : '');
   stalls.textContent = stall_text;
-  stalls.style.color = (r.stalls > 0 || r.skipped > 0) ? 'var(--red)' : 'var(--dim)';
+  stalls.style.color = (r.stalls > 0 || r.skipped > 0 || restarts > 0) ? 'var(--red)' : 'var(--dim)';
 
   // Flag the card if gap max exceeds 2x target
   const card = document.getElementById('render-card');

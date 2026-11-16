@@ -912,6 +912,10 @@ class RenderThread(threading.Thread):
         # device's idle look, or nothing at all.
         self._preview_source = DeviceMode.OFF
         self._fatal_error: str | None = None
+        # How many times RenderSupervisor has replaced a crashed render thread
+        # since the process started. Carried on the thread so `render_stats`
+        # stays the one place the status snapshot reads from.
+        self.restarts = 0
 
     def run(self):
         try:
@@ -1225,6 +1229,7 @@ class RenderThread(threading.Thread):
         if not work:
             return {"fps": fps, "alive": self.is_alive(),
                     "fatal_error": self._fatal_error,
+                    "restarts": self.restarts,
                     "rendered": 0, "skipped": 0, "stalls": 0, "idle": self._frames_idle,
                     "work_ms_avg": 0.0, "work_ms_max": 0.0,
                     "gap_ms_avg": 0.0, "gap_ms_max": 0.0,
@@ -1234,6 +1239,7 @@ class RenderThread(threading.Thread):
             "fps": fps,
             "alive": self.is_alive(),
             "fatal_error": self._fatal_error,
+            "restarts": self.restarts,
             "rendered": self._frames_rendered,
             "skipped": self._frames_skipped,
             "stalls": self._stall_count,
@@ -1275,13 +1281,128 @@ def _read_pids(root: str = "/sys/fs/cgroup") -> tuple[int, int] | None:
         return None
 
 
+# Seconds to wait before each successive restart of a crashed render thread;
+# the last value repeats.
+RENDER_RESTART_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+# Restarts that may fail in a row before the bridge gives up and exits.
+RENDER_MAX_FAILED_RESTARTS = 5
+# A restarted thread that survives this long counts as recovered: the failure
+# streak and the backoff both start over.
+RENDER_STABLE_S = 60.0
+RENDER_POLL_S = 0.25
+
+
+class RenderSupervisor:
+    """Replaces the render thread when it dies, and gives up when that stops working.
+
+    `RenderThread.run` catches whatever its loop raises, blacks the strip out
+    and exits. Until this existed that was the end of the lights: the process
+    stayed up, the dashboard stayed up, and nothing reached the strip until
+    someone restarted the container. Docker's restart policy could not help,
+    because the process never exited.
+
+    The supervisor watches from the event loop. A dead thread is replaced with
+    a new `RenderThread` on a new `LEDMapper` (the mapper holds the per-frame
+    state most likely to be what broke); the engine, sender, settings and power
+    manager are shared with the rest of the bridge and are kept. If the
+    replacement dies too it waits longer each time, and after
+    `RENDER_MAX_FAILED_RESTARTS` replacements in a row have died it returns,
+    so `main()` can exit non-zero and hand the problem to the container
+    runtime. A replacement that runs clean for `RENDER_STABLE_S` clears the
+    streak.
+
+    `tracker.render_thread` always names the current thread, so everything
+    that reads render state through the tracker follows a restart without
+    being told.
+    """
+
+    def __init__(self, tracker, make_thread, sleep=asyncio.sleep,
+                 clock=time.monotonic):
+        self._tracker = tracker
+        self._make_thread = make_thread
+        self._sleep = sleep
+        self._clock = clock
+        self.thread = None
+        self.restarts = 0
+        self.failed_restarts = 0     # current streak
+        self.gave_up = False
+        self._stopping = False
+
+    def start(self):
+        self._launch()
+
+    def _launch(self):
+        thread = self._make_thread()
+        thread.restarts = self.restarts
+        self.thread = thread
+        self._tracker.render_thread = thread
+        thread.start()
+        self._started_at = self._clock()
+
+    def _dead(self) -> bool:
+        thread = self.thread
+        return thread.failed or not thread.is_alive()
+
+    async def watch(self):
+        """Run until the render thread cannot be kept alive. Returns only on giving up."""
+        while not self._stopping:
+            await self._sleep(RENDER_POLL_S)
+            if self._stopping:
+                return
+            if not self._dead():
+                if (self.failed_restarts
+                        and self._clock() - self._started_at >= RENDER_STABLE_S):
+                    log.info("Render thread stable for %.0fs after %d restart(s)",
+                             RENDER_STABLE_S, self.failed_restarts)
+                    self.failed_restarts = 0
+                continue
+
+            if self.failed_restarts >= RENDER_MAX_FAILED_RESTARTS:
+                self.gave_up = True
+                log.critical(
+                    "Render thread died after %d restarts in a row (%s); giving up",
+                    self.failed_restarts, self.thread._fatal_error or "exited")
+                return
+
+            delay = RENDER_RESTART_BACKOFF_S[
+                min(self.failed_restarts, len(RENDER_RESTART_BACKOFF_S) - 1)]
+            log.error("Render thread is dead (%s); restart %d of %d in %.0fs",
+                      self.thread._fatal_error or "exited without an error",
+                      self.failed_restarts + 1, RENDER_MAX_FAILED_RESTARTS, delay)
+            await self._sleep(delay)
+            if self._stopping:
+                return
+            self.restarts += 1
+            self.failed_restarts += 1
+            try:
+                self._launch()
+            except Exception:
+                # Could not even build or start one (no thread to be had, say).
+                # The old dead thread is still `self.thread`, so the next pass
+                # sees it dead and counts this as one more failed restart.
+                log.exception("Could not start a replacement render thread")
+                self.thread.restarts = self.restarts
+
+    def stop(self, timeout: float = 2.0):
+        self._stopping = True
+        thread = self.thread
+        if thread is not None:
+            thread.stop()
+            if thread.is_alive():
+                thread.join(timeout=timeout)
+
+
 EVIDENCE_SNAPSHOTS = 200  # ~20 s of status snapshots kept beside each anomaly capture
 PIDS_EVERY = 60.0
 
 
-def wire_anomalies(tracker, render_thread, protocol, wled_api, capture_dir, anomaly_dir, loop,
+def wire_anomalies(tracker, protocol, wled_api, capture_dir, anomaly_dir, loop,
                    clock=time.time):
     """Build the bridge's AnomalyLog and hook it into the status loop. Returns the log.
+
+    The render thread is read through `tracker.render_thread` on every snapshot, never
+    captured: RenderSupervisor replaces it after a crash, and a captured reference would go on
+    reading the dead one's frozen ring.
 
     Everything runs on the event loop inside StatusTracker.broadcast_loop, which guards it, so
     the render thread pays only for its brightness ring. Evidence for each new episode is a
@@ -1294,7 +1415,7 @@ def wire_anomalies(tracker, render_thread, protocol, wled_api, capture_dir, anom
 
     capture_dir = Path(capture_dir)
     snaps: deque = deque(maxlen=EVIDENCE_SNAPSHOTS)
-    state = {"n": 0, "pids_at": float("-inf")}
+    state = {"n": 0, "pids_at": float("-inf"), "thread": None}
 
     def on_evidence(ev: dict) -> str:
         stamp = datetime.fromtimestamp(ev["t"]).strftime("%Y%m%d-%H%M%S")
@@ -1329,6 +1450,11 @@ def wire_anomalies(tracker, render_thread, protocol, wled_api, capture_dir, anom
                              on_evidence=on_evidence, clock=clock)
 
     def on_snapshot(data: dict):
+        render_thread = tracker.render_thread
+        if render_thread is not state["thread"]:
+            # A replacement thread counts its frames from zero.
+            state["thread"] = render_thread
+            state["n"] = 0
         n, levels = render_thread.frame_levels_since(state["n"])
         state["n"] = n
         snaps.append({"t": round(clock(), 3),
@@ -1348,7 +1474,8 @@ def wire_anomalies(tracker, render_thread, protocol, wled_api, capture_dir, anom
     return anomaly_log
 
 
-async def main():
+async def main() -> int:
+    """Run the bridge. Returns the process exit status."""
     idle_mins = IDLE_TIMEOUT // 60 if IDLE_TIMEOUT else 0
     # Version first, and in the log as well as on the dashboard: `docker logs`
     # is the one place the operator can read it without the status port being
@@ -1364,7 +1491,6 @@ async def main():
     log.info("  Status page: http://%s:%d/", STATUS_HOST, STATUS_PORT)
 
     engine = CueEngine()
-    mapper = LEDMapper(LED_COUNT)
     sender = DDPSender(WLED_HOST, WLED_DDP_PORT)
     wled_api = WLEDApi(WLED_HOST)
     tracker = StatusTracker()
@@ -1400,15 +1526,17 @@ async def main():
     # Drain any active capture's buffer to disk off the event loop
     capture_task = asyncio.create_task(capture.flush_loop())
 
-    # Start render thread (Phase 3: isolated from asyncio event loop)
-    render_thread = RenderThread(engine, mapper, sender, tracker, settings, wled_power)
-    render_thread.start()
-
-    # Provide render thread reference for status snapshots
-    tracker.render_thread = render_thread
+    # Start render thread (Phase 3: isolated from asyncio event loop), under a
+    # supervisor that replaces it if it dies. Each replacement gets a fresh
+    # mapper; `tracker.render_thread` always names the current one.
+    render = RenderSupervisor(
+        tracker,
+        lambda: RenderThread(engine, LEDMapper(LED_COUNT), sender, tracker,
+                             settings, wled_power))
+    render.start()
 
     if ANOMALY_DETECTION:
-        anomaly_log = wire_anomalies(tracker, render_thread, protocol, wled_api,
+        anomaly_log = wire_anomalies(tracker, protocol, wled_api,
                                      CAPTURE_DIR, ANOMALY_DIR, loop)
         log.info("  Anomaly detection: on (log %s, evidence %s/anomalies, bridge seen as %s)",
                  ANOMALY_DIR, CAPTURE_DIR, anomaly_log.det.bridge_ip or "unknown")
@@ -1428,13 +1556,23 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_signal)
 
-    await stop.wait()
+    # Wait for a signal, or for the supervisor to run out of restarts.
+    stop_task = asyncio.create_task(stop.wait())
+    render_task = asyncio.create_task(render.watch())
+    await asyncio.wait({stop_task, render_task}, return_when=asyncio.FIRST_COMPLETED)
+    stop_task.cancel()
+    render_task.cancel()
+    exit_status = 0
+    if render.gave_up:
+        # Exit non-zero so the container's restart policy takes over. The
+        # cleanup below still runs: the strip is left dark and off, not frozen.
+        log.critical("Exiting with status 1: the render thread cannot be kept alive")
+        exit_status = 1
 
     # Cleanup — stop the render thread first so it can't race with the
     # final all-black DDP send below, then send black before closing the
     # socket and turning the strip off.
-    render_thread.stop()
-    render_thread.join(timeout=2.0)
+    render.stop()
     broadcast_task.cancel()
     watchdog_task.cancel()
     capture_task.cancel()
@@ -1458,6 +1596,7 @@ async def main():
         log.debug("Final WLED power-off failed: %s", e)
 
     log.info("Goodbye.")
+    return exit_status
 
 
 def _configure_logging():
@@ -1472,4 +1611,4 @@ def _configure_logging():
 
 if __name__ == "__main__":
     _configure_logging()
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

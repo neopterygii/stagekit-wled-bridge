@@ -26,6 +26,13 @@ class FakeRender:
 
     frame_levels_since = RenderThread.frame_levels_since
     last_frame = RenderThread.last_frame
+    failed = False
+
+    def render_stats(self):
+        return {"alive": True, "fatal_error": None}
+
+    def preview_snapshot(self):
+        return None
 
     def __init__(self):
         self._levels = array('f', bytes(4 * LEVEL_RING))
@@ -76,7 +83,8 @@ def _wired(tmp_path, monkeypatch, clock=None):
     protocol = SimpleNamespace(recent=deque((i * 0.011, bytes([i % 256]) * 20) for i in range(300)))
     wled_api = SimpleNamespace(device_info=None)
     loop = asyncio.new_event_loop()
-    log = wire_anomalies(tracker, render, protocol, wled_api, str(tmp_path / "captures"),
+    tracker.render_thread = render
+    log = wire_anomalies(tracker, protocol, wled_api, str(tmp_path / "captures"),
                          str(tmp_path / "anomalies"), loop, clock=clock or Clock())
     return tracker, render, log, loop
 
@@ -146,3 +154,26 @@ def test_beats_received_counts_only_real_beats():
     for b in (0, 1, 0, 0, 2, 0):
         tracker.on_beat(b)
     assert tracker.snapshot()["beats_received"] == 2
+
+
+def test_hook_follows_a_replaced_render_thread(tmp_path, monkeypatch):
+    """After a supervisor restart the hook must read the new thread, from frame zero."""
+    clock = Clock()
+    tracker, old, log, loop = _wired(tmp_path, monkeypatch, clock)
+    seen = []
+    monkeypatch.setattr(log, "tick", lambda data, levels=None, **kw: seen.append(list(levels)))
+    try:
+        for _ in range(50):
+            old.send(9.0)
+        tracker.on_snapshot(snap(0.0))
+        assert seen[-1] == [9.0] * 50
+
+        new = FakeRender()
+        tracker.render_thread = new
+        for _ in range(4):
+            new.send(77.0)
+            old.send(9.0)          # the dead thread's ring must no longer be read
+        tracker.on_snapshot(snap(0.1))
+        assert seen[-1] == [77.0] * 4
+    finally:
+        loop.close()
