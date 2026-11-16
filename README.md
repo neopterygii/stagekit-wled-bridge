@@ -445,10 +445,10 @@ python -m replay.ddp_receiver --port 4048
 ```
 
 Replay is deterministic because the cue engine, mapper and render loop all take
-an injected clock, and the mapper's sparkle/glitch RNG takes a seed. One known
-gap: the keyframe- and beat-*event*-driven cues (`DEFAULT`, `WARM_MANUAL`,
-`COOL_MANUAL`, `STOMP`, `DISCHORD`) still step on asyncio events, so their motion
-doesn't advance under replay — see `BACKLOG.md`.
+an injected clock, and the mapper's sparkle/glitch RNG takes a seed. The
+keyframe- and beat-*event*-driven cues (`DEFAULT`, `WARM_MANUAL`,
+`COOL_MANUAL`, `STOMP`, `DISCHORD`) step from counters read by the engine tick,
+so replay animates them like any other cue.
 
 ### Test Packet Sender
 

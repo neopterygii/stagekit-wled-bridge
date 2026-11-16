@@ -26,7 +26,7 @@ SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "/data/settings.json")
 # The fade is not decoration: it removes a one-frame black blink between cues.
 # But it was measured as the single largest latency term in the whole pipeline
 # — ~120 ms of the 145-164 ms cue-change step, against ~23 ms for the entire
-# network and device path. See BACKLOG.md.
+# network and device path. See BACKLOG_ARCHIVE.md.
 #
 # Every cue not listed here uses `cue_fade_ms`. That deliberately includes
 # STROBE_OFF (a *return* to a lit look, where softness is still wanted),

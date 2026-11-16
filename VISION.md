@@ -23,8 +23,13 @@ out of scope here. Assume host-side rendering throughout.
 ## Where the truth lives
 
 - **The datagram** is built by YARG's `DataStreamController.SerializeAndSend()`
-  (`DATAGRAM_VERSION = 4`), broadcast to `255.255.255.255:36107` at ~88 Hz.
-  Layout is append-only across versions; we parse **by length**, not by version.
+  (`DATAGRAM_VERSION = 5`), broadcast to `255.255.255.255:36107` at ~88 Hz.
+  The layout is **not** append-only: v5 inserted a two-byte fog timer at offset
+  37 and moved every later field. We parse by the **version byte**, from one
+  table (`protocol/schema.py`) that holds every known version's layout. An
+  unknown newer version is read with the newest known layout and warned about
+  once in the log. A daily workflow (`tools/check_yarg_schema.py`) compares the
+  table with YARG's `dev` serialiser.
 - **YALCY** is the canonical receiver/decoder and the reference for what each cue
   *means*. **photonics-dmx**, **LedFx**, and **WLED** are technique sources.
 - `protocol/yarg_packet.py` is our decoder; `effects/cue_engine.py` turns signals
@@ -34,6 +39,11 @@ out of scope here. Assume host-side rendering throughout.
 ## Signal inventory → ideal strip translation
 
 Every field, and what it should drive. **Bold** = implemented today.
+
+Offsets in this table are datagram **v4**. In v5, fog state is still at 36,
+the new fog timer takes 37–38, and everything from StrobeState on is two bytes
+later (StrobeState 39, Beat 40, Keyframe 41, BonusEffect 42, camera cut 46–48,
+star power 49+). `protocol/schema.py` is authoritative.
 
 | Signal (offset) | Meaning | Ideal translation |
 |---|---|---|
@@ -180,7 +190,7 @@ Who does what best, and where it lands in our code:
   Adding a toggle is one registry row (label/description + the effects key it
   suppresses) — the render loop, persistence, and dashboard switches are
   generic, so new layers get a switch for free.
-- [ ] **8. Venue awareness: tempo-locked strobe + venue-size density + song-section
+- [x] **8. Venue awareness: tempo-locked strobe + venue-size density + song-section
   bias** *(merged to main)* — the three remaining
   parsed-but-unused / fixed-rate signals now shape the light. **Tempo-locked
   strobe**: strobe speeds map to note divisions (quarter/eighth/sixteenth/
@@ -221,10 +231,10 @@ repeatable, observable, and safe to evolve:
    that the image build now depends on. The Unraid template tracks `:latest`;
    rollback is a template edit to `:1.0.0`.
 2. **Full-path replay and capture harness.** *(Built — see `replay/`,
-   `tests/test_replay.py`, `tests/test_capture.py`. Remaining gap: the
-   keyframe/beat-**event**-driven cues still step on asyncio and so don't animate
-   under replay; that covers the library's most common cues, and is tracked in
-   `BACKLOG.md`. Determinism required injecting a clock into `CueEngine` and
+   `tests/test_replay.py`, `tests/test_capture.py`. The one gap it shipped
+   with, the keyframe/beat-**event**-driven cues stepping on asyncio, was
+   closed 2026-07-29: they now step from counters read by `engine.tick()` and
+   are covered by replay. Determinism required injecting a clock into `CueEngine` and
    `LEDMapper` and seeding the mapper's sparkle/glitch RNG; frames are pinned by
    golden sampled digests at a fixed synthetic epoch — not 0.0, which collides
    with the engine's "not yet happened" sentinels.)*
@@ -246,19 +256,21 @@ repeatable, observable, and safe to evolve:
    Use a headless DDP receiver (the WLED Simulator is a candidate) in CI.
    Official RB3/YARG songs can still produce useful live captures even when
    their `.sng`/`.yargsong` sources are encrypted.
-3. **Lighting alignment trim.** Add a persisted, dashboard-adjustable delay in
+3. **Lighting alignment trim.** *(Not started.)* Add a persisted, dashboard-adjustable delay in
    milliseconds plus a calibration pattern. Default to **0 ms**: YARG emits
    venue events against `GameManager.SongTime`, which already incorporates its
    audio calibration and modeled playback latency, so copying the in-game audio
    calibration into the bridge would likely compensate twice. The bridge value
    is an additional trim for display, network, controller, and human perception.
-4. **Game-state output, without surrendering lighting control.** Keep all cue
+4. **Game-state output, without surrendering lighting control.** *(Not
+   started.)* Keep all cue
    interpretation and WLED/DMX control in this bridge. Expand its status model
    and optionally publish the resulting read-only state over MQTT (connection,
    scene, paused/in-song, cue, section, BPM, performers, star power, and WLED
    health). Song title/artist require a separate YARG metadata input or upstream
    datagram extension; do not infer them from lighting packets.
-5. **WLED controller backup and recovery.** The controller was upgraded from
+5. **WLED controller backup and recovery.** *(Backup and procedure done
+   2026-11-16; operator steps at the device remain.)* The controller was upgraded from
    the Athom 0.14.4 image to stock WLED 16.0.1 outside this plan (found
    2026-11-02), so there is no upgrade left to qualify. What remains is being
    able to get back to today's working state: a dated GET-only backup, the
@@ -403,5 +415,27 @@ heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
   exists so effect work aims at the cues real charts actually contain
   (`tests/test_venue_*.py`).
 - Roadmap phases 0–8 are all **merged to main**, released as **`v1.0.0`**, and
-  deployed. Test suite: 271 tests, run in CI before the image is built.
-- **Not yet started:** everything under "Current focus — next push" above.
+  deployed.
+- **Since `v1.0.0` (merged, not part of the phased roadmap):**
+  - *Replay and capture* — the harness in `replay/`, with every cue pattern
+    counter-driven so replay can judge it.
+  - *Strip ownership* — a three-mode ownership machine, an asserted WLED live
+    baseline, and an operator-chosen idle look; the dashboard preview shows
+    the strip, not the render buffer; a held cue is released when its sender
+    goes away.
+  - *Cue motion* — multi-spot spotlights that pulse to the beat, in-phase
+    launches for beat-locked cues, a beat-grid keyframe fallback, and a much
+    shorter cue crossfade (`cue_fade_ms`).
+  - *Observability* — build identity on the dashboard, the Stage Kit pod
+    visualizer, and anomaly detection with replayable evidence
+    (`anomalies.py`, `/api/anomalies`).
+  - *Hardening (2026-11-16)* — a schema-table datagram parser with a daily
+    upstream drift check, a guard on stuck one-shot inputs, a render-thread
+    supervisor that restarts a crashed thread or exits non-zero, test patterns
+    that end on their own and refuse to start over a live song, and
+    same-origin checks on the control endpoints.
+- Test suite: 834 tests as of 2026-11-16, run in CI before the image is built.
+- **Current focus, as of 2026-11-16:** workstreams 1 and 2 are done.
+  Workstream 5 has its backup and written procedure; the steps that need hands
+  on the controller are open. Workstreams 3 (alignment trim) and 4 (read-only
+  state / MQTT) are not started. `BACKLOG.md` has the order.

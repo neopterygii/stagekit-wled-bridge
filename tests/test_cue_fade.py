@@ -16,7 +16,7 @@ duration is latched at cue-change time rather than re-read every frame, and
 that the two strobe interactions still hold.
 
 `test_rapid_cue_changes_still_converge` is the measurement that answered
-BACKLOG.md's open question about fades compounding.
+BACKLOG_ARCHIVE.md's question about fades compounding.
 
 Run: python -m pytest tests/test_cue_fade.py -v
 """
@@ -204,7 +204,7 @@ def test_strobe_blackout_does_not_become_the_fade_source():
     assert max(b.render._last_sent) > 0
 
 
-# ── the compounding question (BACKLOG.md) ───────────────────────
+# ── the compounding question (BACKLOG_ARCHIVE.md) ───────────────────────
 
 def test_rapid_cue_changes_still_converge():
     """Do fades compound into a permanent smear when cues change fast?
@@ -275,4 +275,4 @@ def test_fades_do_compound_when_the_dwell_is_shorter_than_the_fade():
                      if _mean_diff(f, s) == 0.0)
         assert landed == 0, (
             f"cue_fade_ms={base} now lands on target during rapid changes — "
-            "the compounding limitation is fixed; update this test and BACKLOG.md")
+            "the compounding limitation is fixed; update this test and BACKLOG_ARCHIVE.md")

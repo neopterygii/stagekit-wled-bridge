@@ -344,7 +344,7 @@ def rapid_cue_changes():
     itself a blend — so a stream that changes cue faster than the fade duration
     could in principle never reach any cue's real colour, and would read as a
     permanent smear rather than as clean transitions. That was an open question
-    in BACKLOG.md; `tests/test_cue_fade.py` answers it against this fixture.
+    in BACKLOG_ARCHIVE.md; `tests/test_cue_fade.py` answers it against this fixture.
 
     Deliberately built from cues that use the *base* fade — the blackout/flare/
     strobe cues snap, so they would prove nothing here. 80 ms per leg is well
