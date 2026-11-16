@@ -434,7 +434,7 @@ heaviest frame mix at LED_COUNT=120 shows **no regression** (~2.9k render/s,
     supervisor that restarts a crashed thread or exits non-zero, test patterns
     that end on their own and refuse to start over a live song, and
     same-origin checks on the control endpoints.
-- Test suite: 854 tests as of 2026-11-16, run in CI before the image is built.
+- Test suite: 868 tests as of 2026-11-16, run in CI before the image is built.
 - **Current focus, as of 2026-11-16:** workstreams 1 and 2 are done.
   Workstream 5 has its backup and written procedure; the steps that need hands
   on the controller are open. Workstreams 3 (alignment trim) and 4 (read-only

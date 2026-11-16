@@ -445,6 +445,12 @@ python -m pytest tests/ -q
 
 CI runs the same command and the container image is only built if it passes.
 
+`tests/test_dashboard_js.py` runs the dashboard's embedded JavaScript in Node
+against stand-in browser objects (`tests/fixtures/dashboard_stub.js`). Without
+`node` on `PATH` those tests are skipped and the rest of the suite still runs;
+on CI a missing `node` is a failure, not a skip. The stand-ins are not a
+browser: layout, CSS and real rendering are still checked by eye.
+
 ### Capture and Replay
 
 The bridge can record the YARG datagrams it receives and play them back through
