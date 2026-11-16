@@ -63,6 +63,11 @@ says what would reopen it.
 
 ### Recently closed
 
+- ~~The version said 1.1.0 for three months and nothing checked it~~ — built 2026-11-16;
+  [write-up](BACKLOG_ARCHIVE.md#done-2026-11-16-hardening--the-version-said-110-for-three-months-and-nothing-checked-it).
+  `__version__` is 1.2.0, `CHANGELOG.md` has the draft notes, and CI refuses a
+  `v*` tag that disagrees with either. **The tag itself is not made**: dating
+  the changelog entry and pushing `v1.2.0` is the operator's call.
 - ~~The docs described a project three months older than the code~~ —
   refreshed 2026-11-16;
   [write-up](BACKLOG_ARCHIVE.md#done-2026-11-16-docs--the-docs-described-a-project-three-months-older-than-the-code).

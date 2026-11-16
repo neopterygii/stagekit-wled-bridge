@@ -83,6 +83,54 @@ a one-line pointer under *Recently closed*.
 
 ---
 
+## DONE 2026-11-16 `hardening` — The version said 1.1.0 for three months and nothing checked it
+
+`__version__` was set to 1.1.0 on 2026-08-26 and no `v1.1.0` tag was ever made.
+Fifty commits after `v1.0.0`, every image still reported
+`v1.1.0`, told apart only by commit. Nothing compared a tag with the source: a
+`v*` tag build passes `BUILD_VERSION` from the tag, which overrides
+`__version__`, so a tag pushed without the bump would have produced an image
+named correctly from source that named it wrongly, and the next `:latest` would
+have gone back to the old name.
+
+### What was built
+
+- `__version__ = "1.2.0"`.
+- `CHANGELOG.md`: a `1.2.0 — draft` entry (the seven changes of 2026-11-16,
+  with an upgrade section), a `1.1.0 — never tagged` entry saying what those
+  images were, and a short 1.0.0 entry.
+- `tools/check_release_tag.py`: given a tag, fails unless the tag is
+  `vX.Y.Z`, equals `__version__`, and the newest changelog entry is that
+  version with a date rather than `draft`. Without a tag it compares
+  `version.py` with the changelog only. Stdlib, no network.
+- CI (`docker.yml`): the `test` job runs the check on `refs/tags/v*`. The
+  image build needs that job, so a mismatched tag builds nothing.
+- `tests/test_release_check.py` (20 tests), including one that the committed
+  tree is consistent and one that the workflow still calls the script in the
+  job the build depends on.
+- README: a *Releasing* section under *Versioning*.
+
+### What it does not do
+
+- **It does not tag.** `git tag v1.2.0` today would fail the check, because the
+  changelog entry says `draft`. That is deliberate: the date goes in when the
+  release is cut.
+- It does not check that the tagged commit is on `main`, or that CI was green
+  on it before the tag.
+- It does not create a GitHub release; the changelog entry is the release
+  note.
+- `1.1.0` stays untagged. Tagging it retroactively would publish a `:1.1.0`
+  image for a commit chosen after the fact.
+
+### Evidence
+
+- `python tools/check_release_tag.py` → consistent;
+  `python tools/check_release_tag.py v1.2.0` → exit 1, "marked 'draft'".
+- Suite 834 → 854 passing. No golden digest moved; no runtime file changed
+  apart from the version constant.
+
+---
+
 ## DONE 2026-11-16 `docs` — The docs described a project three months older than the code
 
 **Raised:** 2026-11-16 by the bridge review (finding F9).

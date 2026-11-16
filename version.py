@@ -22,10 +22,12 @@ import os
 import subprocess
 from pathlib import Path
 
-# Human-readable release name. Bump on release and tag the commit to match —
-# CI's BUILD_VERSION overrides it when building from a `v*` tag, so a forgotten
-# bump shows up as a mismatch here rather than silently shipping a wrong name.
-__version__ = "1.1.0"
+# Human-readable release name. Bump on release and tag the commit to match.
+# CI's BUILD_VERSION overrides it when building from a `v*` tag, which used to
+# hide a forgotten bump; `tools/check_release_tag.py` now fails a tag build
+# whose tag, this constant and CHANGELOG.md disagree. README "Releasing" has
+# the steps.
+__version__ = "1.2.0"
 
 _GIT_DESCRIBE_TIMEOUT = 2.0
 
