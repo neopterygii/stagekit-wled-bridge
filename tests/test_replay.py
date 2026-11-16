@@ -187,7 +187,7 @@ def test_strobe_frames_are_reproducible():
 # default_keyframes ever moves for this, the grid has leaked into the chart path
 # and a syncopated chart is being flattened.
 #
-# Three moved when one-shot inputs gained a stuck-run guard (2026-11-17):
+# Three moved when one-shot inputs gained a stuck-run guard (2026-11-16):
 # malformed_stream, repeated_beats and star_power_run — exactly the three
 # synthetic fixtures that put a STRONG beat on *every* datagram. After
 # STUCK_ONESHOT_RUN consecutive datagrams the protocol now stops forwarding the
