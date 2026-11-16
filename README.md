@@ -284,6 +284,8 @@ The dashboard includes a **Test Patterns** panel for triggering cues directly fr
 - Toggle **strobe** at different speeds (Slow, Medium, Fast, Fastest)
 - **Stop Test** button appears only when a test pattern is running
 - WLED is automatically powered on when a test pattern is triggered
+- A pattern stops by itself after 10 minutes; choosing a pattern again restarts the 10 minutes
+- While YARG is sending, the test controls are refused (HTTP 409) and the panel says so. A pattern that is running when YARG starts sending stops within half a second and YARG's lighting takes over
 
 This is especially useful for verifying your WLED/LED setup without running YARG.
 

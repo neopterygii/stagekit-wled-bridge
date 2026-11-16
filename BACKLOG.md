@@ -44,6 +44,11 @@ In order:
 
 ### Recently closed
 
+- ~~Test patterns ran forever and could be started over a live song~~ — built
+  2026-11-16;
+  [write-up](#done-2026-11-16-bugfix--a-dashboard-test-pattern-ran-until-someone-stopped-it-and-could-run-over-a-live-song).
+  A pattern now ends after 10 minutes or when YARG starts sending, and the
+  test controls answer 409 while YARG is connected. No golden digest moved.
 - ~~A crashed render thread stayed dead~~ — built 2026-11-16;
   [write-up](#done-2026-11-16-bugfix--a-crashed-render-thread-left-the-strip-dark-until-someone-restarted-the-container).
   The bridge now replaces the thread itself and exits non-zero if it cannot.
@@ -142,6 +147,59 @@ In order:
 Blocking none of the above: the replay harness is **merged to `main`
 (2026-07-29)**, so anything here can lean on it — a recorded passage replayed
 before/after beats remembering last night's show.
+
+---
+
+## DONE 2026-11-16 `bugfix` — A dashboard test pattern ran until someone stopped it, and could run over a live song
+
+**Found and built:** 2026-11-16, from the bridge review (finding F5).
+
+`StatusServer._run_test_beats` looped until cancelled, and each beat counted
+as activity for the idle timeout. A pattern started and then forgotten (a
+closed tab, a phone put down) kept the strip live and WLED powered with no
+end. Nothing checked for YARG either: a pattern could be started during a
+song, and one already running kept writing synthetic beats, keyframes and its
+own cue into the engine YARG was driving.
+
+**What was built**
+
+- `TEST_PATTERN_MAX_S = 600`. The beat loop ends the test when the allowance
+  runs out. Choosing a pattern restarts it; a BPM change does not.
+- `/api/test` answers 409 for `pattern`, `strobe` and `bpm` while
+  `tracker.connected` is true. `stop` is always accepted.
+- The beat loop checks `tracker.connected` before every sub-beat (at most
+  0.5 s apart) and ends the test when YARG is sending. It then calls
+  `on_yarg_takeover`, which `main()` wires to
+  `YARGProtocol.release_latched_state`. That clears the engine and the
+  protocol's change detectors together, so YARG's next datagram re-sends its
+  cue even if the same cue byte had already arrived before the test noticed.
+- `test_ended` on the status snapshot is `"timeout"`, `"yarg"`, or empty
+  (running, or stopped by the operator). The Test Patterns panel shows the
+  reason, and shows the server's message when a request is refused. A cue or
+  strobe button is highlighted only after the server accepts the request.
+- The synthetic keyframe call was nested under `if self.wled_power:`, so a
+  server built without a power manager sent beats but no keyframes. It now
+  depends only on the engine.
+
+**What it does not do**
+
+- A strobe started from the panel with no pattern running has no beat loop,
+  so neither the time limit nor the takeover applies to it. It only reaches
+  the strip while something else is keeping the output live.
+- For up to one sub-beat after YARG's first datagram, synthetic beats and
+  YARG's can both reach the engine.
+- The 10 minutes is a constant, not a setting.
+
+**Evidence**
+
+- `tests/test_test_patterns.py` (13 tests): the limit with an injected clock,
+  the allowance restart, 409 for each refused action, the takeover callback,
+  the real `release_latched_state` handover with a cue already latched, and
+  keyframes without a power manager.
+- 797 tests pass. `render_frame`, the engine and the mapper are untouched and
+  no golden digest moved.
+- The dashboard script passes `node --check`. The panel was not exercised in
+  a browser or against the rig.
 
 ---
 
