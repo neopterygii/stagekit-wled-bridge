@@ -10,14 +10,14 @@ a subset (see **Status** at the end).
 The bridge streams **host-computed raw RGB** to WLED over **DDP**. In realtime
 mode WLED displays exactly the pixels we send and its **on-device engine is
 bypassed** — segments, palette morphing, blend modes, `fadeToBlackBy`,
-transitions: none of it runs. Our device is on firmware **0.14.4** (ESP32, 120
+transitions: none of it runs. Our device is on firmware **16.0.1** (ESP32, 120
 LEDs, single segment, RGB), but the firmware version barely matters while we use
 DDP.
 
 **Consequence:** every "borrow this from WLED" idea below must be **reimplemented
 host-side in `effects/mapper.py`** — we cannot delegate it to the controller. A
 future *hybrid* path (drive WLED segments/palettes via its JSON API instead of
-DDP) is possible and 0.14.4 supports it, but it is a different architecture and
+DDP) is possible and the firmware supports it, but it is a different architecture and
 out of scope here. Assume host-side rendering throughout.
 
 ## Where the truth lives
@@ -258,16 +258,16 @@ repeatable, observable, and safe to evolve:
    scene, paused/in-song, cue, section, BPM, performers, star power, and WLED
    health). Song title/artist require a separate YARG metadata input or upstream
    datagram extension; do not infer them from lighting packets.
-5. **High-priority WLED firmware qualification.** Treat the live Athom device as
-   irreplaceable until recovery is proven. Before OTA: export `cfg.json`,
-   `presets.json`, `/json/cfg`, `/json/info`, and the current state; archive the
-   exact known-good 0.14.4/vendor image; document USB/serial recovery; and verify
-   the target binary on spare equivalent hardware when available. Pin and test
-   the device-specific invariants: ESP32/4 MB with 983 KB filesystem, APA102
-   type 51 on data/clock GPIO 18/5 at 5 MHz, 120 pixels, 3 A limiter, IR GPIO 25,
-   relay GPIO 2, button GPIO 0, AudioReactive configuration, DDP :4048, and
-   realtime timeout/brightness behavior. After upgrade, run a bridge replay and
-   visual color/order/strobe/power-cycle checks before accepting it.
+5. **WLED controller backup and recovery.** The controller was upgraded from
+   the Athom 0.14.4 image to stock WLED 16.0.1 outside this plan (found
+   2026-11-02), so there is no upgrade left to qualify. What remains is being
+   able to get back to today's working state: a dated GET-only backup, the
+   matching release image kept to hand, and a USB/serial reflash that has
+   actually been tried once. The procedure is in `WLED_SETUP.md`; the open
+   part is in `BACKLOG.md` under W5. Device invariants to re-check after any
+   reflash: APA102 type 51 on data/clock GPIO 18/5 at 5 MHz, 120 pixels, 3 A
+   limiter, IR GPIO 25, relay GPIO 2, button GPIO 0, 983 KB filesystem,
+   realtime timeout 2500 ms with realtime gamma correction disabled.
 
 ### Deferred until multi-output test hardware exists
 

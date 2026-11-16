@@ -147,7 +147,7 @@ the grace period).
 
 Note the idle look appears a couple of seconds *after* the last frame: WLED
 holds the final DDP frame until its own realtime timeout lapses (`if.live.timeout`,
-2.5 s by default).
+2.5 s as set up in [WLED_SETUP.md](WLED_SETUP.md)).
 
 **Adoption.** A strip powered on by anything else — a reboot, the WLED app, a
 button press — is claimed by the bridge on its next 30 s probe and given the
@@ -341,7 +341,9 @@ See [WLED_SETUP.md](WLED_SETUP.md) for detailed WLED configuration instructions.
 **Key requirements:**
 - LED type: SK9822 (APA102-compatible) with Data + Clock pins
 - LED count: match your `LED_COUNT` setting
-- "Receive UDP realtime" must be checked (enables DDP automatically in WLED 0.14.x)
+- "Receive UDP realtime" must be checked (there is no separate DDP switch)
+- Realtime timeout **2500 ms** — never 65000, which WLED treats as "never time out"
+- Back up the controller before changing it; the setup guide has the procedure
 
 ## Supported Cues
 
@@ -527,7 +529,7 @@ work can be aimed at what real charts contain. See `VISION.md`.
 Built for and tested with:
 - **LEDs:** BTF-LIGHTING SK9822 (APA102-compatible), 60 LEDs/m, 2× 1m strips daisy-chained (120 total)
 - **Housing:** 1m aluminum channels with frosted diffusers
-- **Controller:** ESP32 running WLED 0.14.4 "Hoshi"
+- **Controller:** ESP32 running WLED 16.0.1 "Niji" (first built against 0.14.4 "Hoshi")
 - **Protocol:** DDP over WiFi (UDP port 4048)
 
 ## Acknowledgments
