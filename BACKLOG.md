@@ -44,6 +44,9 @@ In order:
 
 ### Recently closed
 
+- ~~Cross-site POSTs to the control endpoints were accepted~~ — built
+  2026-11-16;
+  [write-up](#done-2026-11-16-hardening--any-web-page-on-the-lan-could-drive-the-bridges-controls).
 - ~~Test patterns ran forever and could be started over a live song~~ — built
   2026-11-16;
   [write-up](#done-2026-11-16-bugfix--a-dashboard-test-pattern-ran-until-someone-stopped-it-and-could-run-over-a-live-song).
@@ -147,6 +150,59 @@ In order:
 Blocking none of the above: the replay harness is **merged to `main`
 (2026-07-29)**, so anything here can lean on it — a recorded passage replayed
 before/after beats remembering last night's show.
+
+---
+
+## DONE 2026-11-16 `hardening` — Any web page on the LAN could drive the bridge's controls
+
+The four control endpoints (`/api/test`, `/api/power`, `/api/settings`,
+`/api/capture`) have no authentication, which the README says and which is
+acceptable on a home network. What it did not say is that they also accepted a
+`POST` from any website: a browser sends a cross-site `POST` with a plain
+content type without asking first, so a page open on any LAN machine could
+change settings, switch the strip off or start a test pattern. The event
+stream additionally sent `Access-Control-Allow-Origin: *`, letting any page
+read live status.
+
+### What was built
+
+- **Origin check.** A `POST` to a control endpoint that carries an `Origin`
+  header is accepted only when that origin's host and port equal the `Host`
+  header. Anything else, including `Origin: null`, gets `403` with the usual
+  JSON error body, never reaches the handler, and is logged at WARNING with
+  the path and origin. A request with no `Origin` (curl, scripts, the party
+  watcher) is accepted as before.
+- **One POST path.** The four copy-pasted route blocks are now a route table
+  (`StatusServer._post_routes`) served by one body reader and one JSON reply
+  helper. A body that is valid JSON but not an object now reads as `{}`, so
+  the handler answers with its own JSON error; before, it raised and the
+  client got a bare `400 Bad Request`.
+- **No wildcard CORS on `/events`.** The dashboard is same-origin and never
+  needed it.
+- README: the web UI note now describes the check and the reverse-proxy
+  requirement (pass `Host` through).
+
+### What it does not do
+
+- It is not authentication. Anyone on the LAN with curl can still change
+  everything.
+- It does not stop DNS rebinding, where `Origin` and `Host` agree by
+  construction. That needs a `Host` allow-list, which needs configuration
+  this bridge does not have.
+- `GET` endpoints are unchanged. A cross-site page can trigger them but
+  cannot read the reply, and none changes state.
+- A body over 4096 bytes is still truncated and read as `{}` rather than
+  refused with `413`.
+
+### Evidence
+
+`tests/test_status_http.py` (37 tests) drives the real server over a loopback
+socket: cross-origin refusal and same-origin acceptance on all four paths,
+no-Origin acceptance, `Origin: null`, the WARNING log, the origin comparison
+table, non-object and empty bodies, 404s, GET routes, a bad Content-Length,
+the absence of the CORS header, and a check that every `POST` the dashboard
+script makes has a route. Suite: 834 passing; no golden digest moved. Not
+exercised in a browser or against the running container.
 
 ---
 

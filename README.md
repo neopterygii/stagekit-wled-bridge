@@ -54,6 +54,14 @@ volumes:
 > authentication. Anyone on your LAN can change brightness, palette, FPS,
 > trigger test patterns, and toggle WLED power. Fine for a home network;
 > don't expose port 8080 to the public internet.
+>
+> The one guard is against other websites: a `POST` whose `Origin` header
+> names a different host than the one it was sent to is refused with `403`,
+> so a page open in a browser on your LAN cannot drive the bridge behind
+> your back. Requests with no `Origin` (curl, scripts) are accepted as
+> before. If you put the dashboard behind a reverse proxy, the proxy must
+> pass the original `Host` header through or the dashboard's own controls
+> will be refused.
 
 ```bash
 docker compose up -d
