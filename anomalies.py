@@ -56,7 +56,7 @@ FLASHY_CUES = {"STROBE_FASTEST", "STROBE_FAST", "STROBE_MEDIUM", "STROBE_SLOW", 
 # kind -> (level, class, what it most likely means / where a fix would go)
 KINDS = {
     "bridge_down": ("ALERT", "bridge", "bridge status stream silent: container stopped or wedged"),
-    "render_dead": ("ALERT", "bridge", "render thread dead; nothing reaches the strip until restart"),
+    "render_dead": ("ALERT", "bridge", "render thread dead; nothing reaches the strip until the bridge restarts it"),
     "dark_playing": ("ALERT", "bridge", "song playing but no DDP frames leaving the bridge "
                      "(output gate shut; the PID-exhaustion bug looked exactly like this)"),
     "parser_garbage": ("ALERT", "yarg", "datagram fields out of range: YARG layout probably "

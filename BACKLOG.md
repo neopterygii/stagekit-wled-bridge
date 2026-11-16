@@ -44,6 +44,12 @@ In order:
 
 ### Recently closed
 
+- ~~A crashed render thread stayed dead~~ — built 2026-11-16;
+  [write-up](#done-2026-11-16-bugfix--a-crashed-render-thread-left-the-strip-dark-until-someone-restarted-the-container).
+  The bridge now replaces the thread itself and exits non-zero if it cannot.
+  The exit only helps a container that has a restart policy. No golden digest
+  moved.
+
 - ~~Version-proof the datagram parser~~ — built 2026-11-16;
   [write-up](#done-2026-11-16-refactor--the-datagram-parser-hardcodes-absolute-offsets-so-any-yarg-field-insertion-silently-renders-wrong-lighting).
   The layout is one table (`protocol/schema.py`) and a daily workflow compares
@@ -138,6 +144,60 @@ Blocking none of the above: the replay harness is **merged to `main`
 before/after beats remembering last night's show.
 
 ---
+
+## DONE 2026-11-16 `bugfix` — A crashed render thread left the strip dark until someone restarted the container
+
+**Found and built:** 2026-11-16, from the bridge review (finding F4).
+
+`RenderThread.run` catches whatever its loop raises, records it, sends one
+black frame and returns. Nothing started another. The process stayed up, the
+dashboard stayed up and `/api/status` answered 503, but no frame reached the
+strip again until the container was restarted by hand. Docker's restart policy
+could not act, because the process never exited; the image's `HEALTHCHECK`
+only marks the container unhealthy, which restarts nothing.
+
+**What was built**
+
+- `main.RenderSupervisor` watches the render thread from the event loop
+  (every 0.25 s). When the thread has failed or is no longer alive it builds a
+  new `RenderThread` on a new `LEDMapper` and starts it. The engine, DDP
+  sender, settings and power manager are shared with the rest of the bridge
+  and are kept.
+- Backoff before each replacement: 1, 2, 4, 8, 16, then 30 s
+  (`RENDER_RESTART_BACKOFF_S`). A replacement that runs for 60 s
+  (`RENDER_STABLE_S`) clears the streak and the backoff.
+- After five replacements in a row have died
+  (`RENDER_MAX_FAILED_RESTARTS`) the supervisor gives up. `main()` then runs
+  its normal cleanup (black frame, WLED off) and the process exits with
+  status 1.
+- `tracker.render_thread` always names the current thread. `wire_anomalies`
+  used to close over the first thread, so after a restart it would have gone
+  on reading the dead thread's frozen brightness ring and raised false
+  `frozen`/`black` anomalies; it now reads through the tracker on every
+  snapshot and restarts its frame count when the thread changes.
+- `render.restarts` in the status snapshot counts replacements since the
+  process started, and the Output chain shows it in red when non-zero.
+  `/api/status` returns 200 again once a replacement is running.
+
+**What it does not do**
+
+- It does not fix whatever raised. A fault that follows the shared engine
+  state (rather than the mapper) will kill each replacement too, and the
+  bridge will exit after about 31 s of backoff.
+- The exit only brings the lights back if the container has a restart policy.
+  `docker-compose.yml` has `restart: unless-stopped`; the container on Tower
+  reported `RestartPolicy: no` on 2026-11-16, so there a give-up leaves the
+  container stopped until it is started by hand.
+- A render thread that is alive but stalled (not raising) is not restarted.
+  That is still only visible as stalls and the `frozen` anomaly.
+
+**Evidence:** `tests/test_runtime_boundaries.py` (replacement, a thread that
+exits without an error, the 1/2/4/8/16 backoff then give-up, the streak
+clearing after a stable run, a replacement that cannot be started, stop, a
+real `RenderThread` replaced with a fresh mapper, and `main()` returning 1
+after cleanup and 0 on a signal); `tests/test_anomaly_wiring.py`
+(`test_hook_follows_a_replaced_render_thread`). Suite: 784 passing. No
+golden digest moved; `render_frame` is untouched.
 
 ## DONE 2026-11-16 `bugfix` — One-shot inputs were not guarded against a stuck value
 

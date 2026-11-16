@@ -223,6 +223,13 @@ what you can change below it.
 - **Health** — the built-in anomaly detection (see below): "All clear", or what
   is wrong right now (red border for ALERT, amber for WARN), today's counts, and
   tonight's log with each event's evidence file
+  - A crashed render thread is replaced automatically (new thread, new
+    mapper) after 1 s, then 2, 4, 8 and 16 s if the replacement dies too. The
+    Output chain shows the restart count. After five replacements in a row
+    have died the bridge blacks the strip out, powers it off and exits with
+    status 1, so run the container with a restart policy
+    (`restart: unless-stopped` in compose, `--restart unless-stopped` in the
+    Unraid template's *Extra Parameters*); without one it stays stopped.
 - **Now** — YARG connection and current cue, with BPM, beat, song section,
   strobe and star power beneath them
 - **Output chain** — packets/sec from YARG → render timing → DDP frames → WLED
